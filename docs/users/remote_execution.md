@@ -110,6 +110,10 @@ If the server capabilities do not advertise enabled action-cache updates, Buck2
 skips local-result cache uploads instead of issuing an unsupported
 `UpdateActionResult` RPC. When an upload path asks to upload only missing blobs,
 Buck2 checks CAS first and skips blobs that the server already has. Buck2 also
+validates uploaded bytes against the digest advertised for local cache uploads
+where the RE protocol path exposes the uploaded content to Buck2 before sending
+it. Buck2 rejects size or digest mismatches locally rather than writing a
+corrupt CAS blob or action-cache result. Buck2 also
 rejects malformed `BatchUpdateBlobs` replies and `BatchReadBlobs` replies where
 the returned digests do not match the requested batch, so batch cache operations
 require a successful response for every requested digest. `FindMissingBlobs`
