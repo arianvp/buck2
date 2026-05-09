@@ -3989,11 +3989,21 @@ impl REClient {
 
     pub async fn extend_digest_ttl(
         &self,
-        _metadata: &RemoteExecutionMetadata,
-        _request: ExtendDigestsTtlRequest,
+        metadata: &RemoteExecutionMetadata,
+        request: ExtendDigestsTtlRequest,
     ) -> anyhow::Result<TDigest> {
-        // TODO(arr)
-        Err(anyhow::anyhow!("Not implemented (RE extend_digest_ttl)"))
+        let response = self
+            .get_digests_ttl(
+                metadata,
+                GetDigestsTtlRequest {
+                    digests: request.digests.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to refresh CAS TTLs with FindMissingBlobs")?;
+        validate_extend_digests_ttl_response(&request.digests, response)?;
+        Ok(TDigest::default())
     }
 
     pub fn get_execution_client(&self) -> &Self {
@@ -4188,6 +4198,34 @@ fn digests_with_ttl_for_requested_digests(
             })
         })
         .collect()
+}
+
+fn validate_extend_digests_ttl_response(
+    requested_digests: &[TDigest],
+    response: GetDigestsTtlResponse,
+) -> anyhow::Result<()> {
+    let response_count = response.digests_with_ttl.len();
+    anyhow::ensure!(
+        requested_digests.len() == response_count,
+        "Invalid CAS TTL refresh response: expected {} digests, got {}",
+        requested_digests.len(),
+        response_count,
+    );
+
+    let missing_digests = response
+        .digests_with_ttl
+        .into_iter()
+        .filter(|digest_ttl| digest_ttl.ttl <= 0)
+        .map(|digest_ttl| digest_ttl.digest.to_string())
+        .collect::<Vec<_>>();
+
+    anyhow::ensure!(
+        missing_digests.is_empty(),
+        "Cannot refresh CAS TTL for missing digests: {}",
+        missing_digests.join(", ")
+    );
+
+    Ok(())
 }
 
 fn digest_name(digest: &Digest) -> String {
@@ -6750,6 +6788,37 @@ mod tests {
         assert_eq!(digests_with_ttl[2].ttl, 17);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_validate_extend_digests_ttl_response_rejects_missing() {
+        let digest = test_digest("aa", 1);
+
+        let error = validate_extend_digests_ttl_response(
+            &[digest.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![DigestWithTtl { digest, ttl: 0 }],
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot refresh CAS TTL for missing digests")
+        );
+    }
+
+    #[test]
+    fn test_validate_extend_digests_ttl_response_accepts_present() -> anyhow::Result<()> {
+        let digest = test_digest("aa", 1);
+
+        validate_extend_digests_ttl_response(
+            &[digest.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![DigestWithTtl { digest, ttl: 17 }],
+            },
+        )
     }
 
     #[test]
