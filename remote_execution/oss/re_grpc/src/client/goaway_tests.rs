@@ -12,7 +12,7 @@
 //! recycle connections. A rejected request was not processed and can be sent
 //! again. tonic fails it instead, with `INTERNAL` or `UNAVAILABLE`, so these
 //! uploads rely on the `retry_grpc_request` around each upload RPC, as in
-//! `REClient::upload`.
+//! `upload_direct`.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -237,7 +237,7 @@ fn upload_request(blob: Vec<u8>) -> UploadRequest {
     }
 }
 
-/// Uploads like `REClient::upload`, retrying each BatchUpdateBlobs and
+/// Uploads like `REClient::upload_direct`, retrying each BatchUpdateBlobs and
 /// ByteStream.Write call.
 async fn upload(
     request: UploadRequest,
