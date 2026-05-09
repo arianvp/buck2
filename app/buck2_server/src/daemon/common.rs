@@ -280,6 +280,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 }
             }
             Executor::RemoteEnabled(remote_options) => {
+                let cache_policy = remote_options.remote_cache_policy();
                 // NOTE: While we now have a legit flag for this, we keep the env var. This has been used
                 // in remediating prod incidents in the past, and this is the kind of thing that can easily
                 // become tribal knowledge. Keeping this does not hurt us.
@@ -287,9 +288,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                     buck2_env!("BUCK2_TEST_DISABLE_CACHING", type=bool, applicability=testing)?
                         .unwrap_or(self.skip_cache_read);
 
-                let disable_caching = disable_caching
-                    || (!remote_options.remote_cache_enabled
-                        && !remote_options.remote_dep_file_cache_enabled);
+                let disable_caching = disable_caching || !cache_policy.any_lookup_enabled();
 
                 // This is for test only as in real life, it would be silly to only use the remote dep file cache and not the regular cache
                 // This will only do anything if cache is not disabled and remote dep file cache is enabled
@@ -307,7 +306,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 } else if disable_caching {
                     None
                 } else if let CacheUploadBehavior::Enabled { max_bytes } =
-                    remote_options.cache_upload_behavior
+                    cache_policy.upload_behavior
                 {
                     Some(max_bytes)
                 } else {
@@ -337,7 +336,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                     }
 
                     let remote_dep_file_cache_checker: Arc<dyn PreparedCommandOptionalExecutor> =
-                        if remote_options.remote_dep_file_cache_enabled {
+                        if cache_policy.dep_file_cache_enabled {
                             Arc::new(RemoteDepFileCacheChecker {
                                 artifact_fs: artifact_fs.dupe(),
                                 materializer: self.materializer.dupe(),
@@ -346,6 +345,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                                 invocation_re_use_case: self.invocation_re_use_case,
                                 re_action_key: remote_options.re_action_key.clone(),
                                 upload_all_actions: self.upload_all_actions,
+                                remote_cache_unavailable_fallback: cache_policy.unavailable_fallback,
                                 knobs: self.executor_global_knobs.dupe(),
                                 paranoid: self.paranoid.dupe(),
                                 output_trees_download_config: self.output_trees_download_config.dupe(),
@@ -366,6 +366,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                                 invocation_re_use_case: self.invocation_re_use_case,
                                 re_action_key: remote_options.re_action_key.clone(),
                                 upload_all_actions: self.upload_all_actions,
+                                remote_cache_unavailable_fallback: cache_policy.unavailable_fallback,
                                 knobs: self.executor_global_knobs.dupe(),
                                 paranoid: self.paranoid.dupe(),
                                 output_trees_download_config: self.output_trees_download_config.dupe(),
@@ -539,6 +540,7 @@ pub fn get_default_executor_config(host_platform: HostPlatformOverride) -> Comma
             re_action_key: None,
             cache_upload_behavior: CacheUploadBehavior::Disabled,
             remote_cache_enabled: true,
+            remote_cache_unavailable_fallback: false,
             remote_dep_file_cache_enabled: false,
             dependencies: vec![],
             gang_workers: vec![],
