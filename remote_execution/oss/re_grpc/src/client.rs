@@ -298,6 +298,22 @@ fn validate_downloaded_blob(
     validate_downloaded_blob_hash(digest, data, selected_digest_function)
 }
 
+fn should_validate_upload_hash(digest: &TDigest) -> bool {
+    matches!(digest.hash.len(), 40 | 64) && digest.hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_upload_blob(
+    digest: &TDigest,
+    data: &[u8],
+    selected_digest_function: Option<digest_function::Value>,
+) -> anyhow::Result<()> {
+    validate_downloaded_blob_size(digest, data.len())?;
+    if should_validate_upload_hash(digest) {
+        validate_downloaded_blob_hash(digest, data, selected_digest_function)?;
+    }
+    Ok(())
+}
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
@@ -3077,6 +3093,49 @@ where
     })
 }
 
+/// Checks the size and hash of an uncompressed ByteStream upload while it is read.
+struct UploadValidator {
+    digest: TDigest,
+    hash_validators: Option<BlobHashValidators>,
+    size: usize,
+}
+
+impl UploadValidator {
+    fn new(
+        digest: TDigest,
+        request_digest_function_config: DigestFunctionConfig,
+    ) -> anyhow::Result<Self> {
+        let hash_validators = if should_validate_upload_hash(&digest) {
+            Some(BlobHashValidators::new(
+                &digest.hash,
+                request_digest_function_config.for_hash(&digest.hash),
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            digest,
+            hash_validators,
+            size: 0,
+        })
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.size += data.len();
+        if let Some(hash_validators) = &mut self.hash_validators {
+            hash_validators.update(data);
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        validate_downloaded_blob_size(&self.digest, self.size)?;
+        if let Some(hash_validators) = self.hash_validators {
+            hash_validators.finish(&self.digest)?;
+        }
+        Ok(())
+    }
+}
+
 async fn read_segment(
     reader: &mut (impl AsyncRead + Unpin),
     max_len: usize,
@@ -3091,12 +3150,16 @@ async fn bytestream_write<Byt>(
     size_in_bytes: i64,
     mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>>,
     max_total_batch_size: usize,
+    mut validator: Option<UploadValidator>,
     bystream_fut: impl Fn(ReceiverStream<WriteRequest>) -> Byt,
 ) -> anyhow::Result<()>
 where
     Byt: Future<Output = anyhow::Result<WriteResponse>>,
 {
     let mut data = read_segment(&mut reader, max_total_batch_size).await?;
+    if let Some(validator) = &mut validator {
+        validator.update(&data);
+    }
     if data.is_empty() {
         // As an optimization, we can silently skip uploading empty blobs
         return Ok(());
@@ -3111,6 +3174,14 @@ where
                 // Read one segment ahead so that finish_write is set on the last data segment.
                 let next = read_segment(&mut reader, max_total_batch_size).await?;
                 let finish_write = next.is_empty();
+                if let Some(validator) = &mut validator {
+                    validator.update(&next);
+                }
+                if finish_write && let Some(validator) = validator.take() {
+                    // End the stream without finish_write, so the server doesn't commit the
+                    // blob under a digest it doesn't have.
+                    validator.finish().map_err(io::Error::other)?;
+                }
                 let len = data.len() as i64;
                 let request = WriteRequest {
                     resource_name: resource_name.clone(),
@@ -3223,7 +3294,16 @@ where
     // Adapt the given bystream_fut to take in an AsyncBufRead and the blob size
     let bystream_fut = |resource_name: String,
                         size_in_bytes: i64,
-                        reader: Box<dyn AsyncBufRead + Unpin + Send>| async move {
+                        reader: Box<dyn AsyncBufRead + Unpin + Send>,
+                        expected_digest: TDigest| async move {
+        let validator = if bystream_compressor.is_none() {
+            Some(UploadValidator::new(
+                expected_digest,
+                request_digest_function_config,
+            )?)
+        } else {
+            None
+        };
         let reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
             None => Pin::new(Box::new(reader)),
             Some(Compressor::Zstd) => Pin::new(Box::new(ZstdEncoder::new(reader))),
@@ -3235,6 +3315,7 @@ where
             size_in_bytes,
             reader,
             max_total_batch_size,
+            validator,
             bystream_fut,
         )
         .await
@@ -3265,6 +3346,7 @@ where
                     resource_name.clone(),
                     size,
                     Box::new(Cursor::new(data.clone())),
+                    blob.digest.clone(),
                 )
                 .await?;
                 Ok(vec![hash.clone()])
@@ -3279,6 +3361,7 @@ where
         let hash = file.digest.hash.clone();
         let size = file.digest.size_in_bytes;
         let name = file.name.clone();
+        let file_digest = file.digest.clone();
         if size < max_total_batch_size as i64 {
             batched_blob_updates.push(BatchUploadRequest::File(file));
             continue;
@@ -3298,7 +3381,13 @@ where
                     .await
                     .with_context(|| format!("Opening `{name}` for reading failed"))?;
 
-                bystream_fut(resource_name.clone(), size, Box::new(BufReader::new(file))).await?;
+                bystream_fut(
+                    resource_name.clone(),
+                    size,
+                    Box::new(BufReader::new(file)),
+                    file_digest.clone(),
+                )
+                .await?;
                 Ok(vec![hash.clone()])
             })
             .await
@@ -3319,6 +3408,11 @@ where
             for blob in batch {
                 match blob {
                     BatchUploadRequest::Blob(blob) => {
+                        validate_upload_blob(
+                            &blob.digest,
+                            &blob.blob,
+                            request_digest_function_config.for_hash(&blob.digest.hash),
+                        )?;
                         re_request.requests.push(Request {
                             digest: Some(tdigest_to(&blob.digest)),
                             data: blob.blob.clone(),
@@ -3332,6 +3426,11 @@ where
                             .with_context(|| format!("Opening {} for reading failed", file.name))?;
                         let mut data = vec![];
                         fin.read_to_end(&mut data).await?;
+                        validate_upload_blob(
+                            &file.digest,
+                            &data,
+                            request_digest_function_config.for_hash(&file.digest.hash),
+                        )?;
 
                         re_request.requests.push(Request {
                             digest: Some(tdigest_to(&file.digest)),
@@ -5772,6 +5871,7 @@ mod tests {
             25,
             Box::pin(reader),
             10,
+            None,
             |write_reqs| async move {
                 let write_reqs: Vec<_> = write_reqs.collect().await;
                 assert_eq!(write_reqs.len(), 2);
@@ -6256,6 +6356,33 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("foo", getter).unwrap(), "foo");
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bytestream_write_rejects_data_that_does_not_match_the_digest() {
+        let data = vec![1u8; 25];
+        let digest = TDigest {
+            hash: hex::encode(Sha256::digest(vec![2u8; 25])),
+            size_in_bytes: 25,
+            ..Default::default()
+        };
+        let validator = UploadValidator::new(digest, DigestFunctionConfig::default()).unwrap();
+
+        let err = bytestream_write(
+            "name".to_owned(),
+            25,
+            Box::pin(Cursor::new(data)),
+            10,
+            Some(validator),
+            |write_reqs| async move {
+                let write_reqs: Vec<_> = write_reqs.collect().await;
+                assert!(write_reqs.iter().all(|r| !r.finish_write));
+                anyhow::Ok(WriteResponse { committed_size: -1 })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("ash"), "{err:#}");
     }
 }
 
