@@ -15,6 +15,9 @@
 //! directory it alone owns. Buck2 daemons on the same machine point their CAS traffic at it and,
 //! given the directory, materialize outputs by reflinking those files instead of receiving bytes
 //! over gRPC. One store, one downloader, one eviction policy, any number of isolation dirs.
+//!
+//! Run without an upstream it is a complete standalone cache backend (CAS plus action cache) for
+//! local builds that should share their outputs across isolation dirs without any remote.
 
 pub mod digest;
 pub mod server;
@@ -27,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
 use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_server::CapabilitiesServer;
 use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorageServer;
 use re_grpc_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -128,6 +132,7 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
+        .add_service(ActionCacheServer::new(cas.clone()))
         .add_service(CapabilitiesServer::new(cas));
     let server = tokio::spawn(router.serve_with_incoming_shutdown(incoming, async {
         let _ignored = shutdown_rx.await;

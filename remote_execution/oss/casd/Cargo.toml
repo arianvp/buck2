@@ -21,6 +21,7 @@ buck2_re_configuration.workspace = true
 clap.workspace = true
 futures.workspace = true
 hex.workspace = true
+prost.workspace = true
 re_grpc_proto.workspace = true
 remote_execution.workspace = true
 sha1.workspace = true

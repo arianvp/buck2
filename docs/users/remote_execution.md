@@ -128,10 +128,22 @@ only once every clone is gone too. Without a cap nothing is ever removed.
 Hits and misses are reported in the `local_cache_hits_files` and related fields
 of the invocation record.
 
-Without `--upstream` the daemon is a standalone CAS, which is handy for tests
-and for a purely local setup. Its other flags mirror the `[buck2_re_client]`
-keys for TLS certificates, HTTP headers and the instance name used upstream;
-see `buck2-casd --help`.
+Without `--upstream` the daemon is a standalone CAS and action cache: point
+`engine_address`, `action_cache_address` and `cas_shared_cache_address` all at
+it and local builds share their outputs across checkouts and daemon restarts
+with no remote at all. With an upstream it serves CAS traffic only, and the
+action cache stays with the remote. Its other flags mirror the
+`[buck2_re_client]` keys for TLS certificates, HTTP headers and the instance
+name used upstream; see `buck2-casd --help`.
+
+One thing this does not change: an action's digest includes its output paths,
+and those contain the isolation directory (`buck-out/<isolation-dir>/...`), so
+two isolation directories never get action cache hits from each other. What
+they do share is content: any blob one of them uploads or fetches, such as an
+identical output produced by both, is stored once in the daemon and cloned into
+each `buck-out` on demand. Action cache hits, and with them full materialization
+from the daemon's directory, happen across checkouts of the same repository,
+after `buck2 clean`, and across daemon restarts.
 
 ## RE platform configuration
 

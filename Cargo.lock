@@ -1202,6 +1202,7 @@ dependencies = [
  "clap",
  "futures 0.3.34",
  "hex",
+ "prost",
  "re_grpc_proto",
  "remote_execution",
  "sha1",
