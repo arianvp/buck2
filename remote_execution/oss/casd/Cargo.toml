@@ -6,7 +6,6 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "A machine-local content-addressed storage daemon that fronts a remote CAS and shares its blobs with every buck2 daemon on the host"
 
 [[bin]]
 name = "buck2-casd"

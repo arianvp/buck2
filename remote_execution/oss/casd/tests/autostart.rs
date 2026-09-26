@@ -10,6 +10,9 @@
 
 //! The buck2 gRPC client starting the real `buck2-casd` binary on demand.
 
+// Unix sockets and signals throughout.
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use buck2_casd::Config;

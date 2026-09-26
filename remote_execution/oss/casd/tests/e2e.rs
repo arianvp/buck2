@@ -32,12 +32,12 @@ use remote_execution::RemoteExecutionMetadata;
 use remote_execution::TDigest;
 use remote_execution::UploadRequest;
 
-/// Origins listen on their default Unix socket; proxies on a loopback port, so both kinds of
-/// listener and both kinds of client connection are exercised.
+/// Origins listen on their default Unix socket (where there are Unix sockets); proxies on a
+/// loopback port, so both kinds of listener and both kinds of client connection are exercised.
 async fn daemon(dir: &Path, upstream: Option<&Running>, max_size_bytes: Option<u64>) -> Running {
     buck2_casd::start(Config {
         dir: dir.to_owned(),
-        listen: if upstream.is_some() {
+        listen: if upstream.is_some() || !cfg!(unix) {
             Listen::Loopback(0)
         } else {
             Listen::default_for(dir)

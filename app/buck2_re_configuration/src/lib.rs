@@ -85,15 +85,29 @@ pub enum CopyPolicy {
 impl FromStr for CopyPolicy {
     type Err = buck2_error::Error;
 
+    /// Unknown values mean `Copy`; `cas_shared_cache_copy_policy_v2` relies on that. The
+    /// open-source `cas_shared_cache_copy_policy` key is parsed strictly instead, see
+    /// [`CopyPolicy::parse_strict`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "hybrid" => Ok(CopyPolicy::Hybrid),
             "reflink" => Ok(CopyPolicy::Reflink),
+            _ => Ok(CopyPolicy::Copy),
+        }
+    }
+}
+
+impl CopyPolicy {
+    /// Like `from_str`, but a typo is an error rather than a silent `Copy`.
+    pub fn parse_strict(s: &str) -> buck2_error::Result<Self> {
+        match s.trim() {
+            "hybrid" => Ok(CopyPolicy::Hybrid),
+            "reflink" => Ok(CopyPolicy::Reflink),
             "copy" => Ok(CopyPolicy::Copy),
-            _ => Err(buck2_error::buck2_error!(
+            other => Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
                 "Invalid copy policy `{}` (expected `copy`, `reflink` or `hybrid`)",
-                s
+                other
             )),
         }
     }
@@ -671,10 +685,13 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "cas_shared_cache_address",
             })?,
-            cas_shared_cache_copy_policy: legacy_config.parse(BuckconfigKeyRef {
-                section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "cas_shared_cache_copy_policy",
-            })?,
+            cas_shared_cache_copy_policy: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache_copy_policy",
+                })?
+                .map(|s| CopyPolicy::parse_strict(&s))
+                .transpose()?,
             cas_shared_cache_mode: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "cas_shared_cache_mode",
