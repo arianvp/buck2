@@ -53,44 +53,85 @@ digest_algorithms = BLAKE3
 Every buck2 daemon keeps its outputs under `buck-out/<isolation-dir>`, so two
 daemons with different [isolation directories](../../concepts/isolation_dir.md),
 or two checkouts of the same repository, each download and store their own copy
-of every blob they need. Configuring a local CAS cache gives them one shared
-store instead:
+of every blob they need. `buck2-casd`, a machine-local CAS daemon that ships
+with buck2, removes that duplication. It is the open-source counterpart of the
+shared CAS daemon buck2 uses at Meta and takes the same configuration keys.
+
+The daemon speaks the remote execution API's CAS and ByteStream services. Buck2
+sends all CAS traffic to it; it passes misses and uploads through to the real
+CAS and keeps every blob it has seen as a raw, read-only file in a directory it
+alone owns. Given that directory, buck2 materializes outputs by cloning those
+files instead of receiving bytes over gRPC. On btrfs, XFS and APFS the clone is
+a reflink, so the data exists once on disk however many daemons use it. One
+store, one downloader, one eviction policy, any number of isolation dirs.
+
+Run the daemon once per machine:
+
+```sh
+$ buck2-casd --dir /var/cache/buck2-casd \
+    --listen 127.0.0.1:9092 \
+    --upstream grpc://cas.example.com:443 --upstream-tls \
+    --max-size-bytes 53687091200 \
+    --digest-function sha256
+```
+
+Then point buck2 at it:
 
 ```ini
 [buck2_re_client]
-cas_local_cache = $HOME/.cache/buck2/cas
-cas_local_cache_max_size_bytes = 21474836480
+engine_address = grpc://re.example.com:443
+action_cache_address = grpc://re.example.com:443
+tls = true
+cas_shared_cache = /var/cache/buck2-casd
+cas_shared_cache_address = 9092
 ```
 
-- `cas_local_cache` - absolute path of a directory shared by every daemon on the
-  machine that is configured with the same value. Blobs are downloaded into it
-  once and then cloned into whichever `buck-out` needs them. Environment
-  variables in `$VAR` form are substituted. Unset disables the cache.
-- `cas_local_cache_copy_policy` - how blobs leave the cache. `hybrid` (the
-  default) makes a copy-on-write clone where the filesystem supports it and
-  falls back to a plain copy otherwise; `reflink` fails instead of falling back;
-  `copy` always copies.
-- `cas_local_cache_max_size_bytes` - size cap for the cache. Once it is
-  exceeded, least recently used blobs are removed in the background until the
-  cache is a tenth below the cap. Unset means nothing is ever removed.
+- `cas_shared_cache` - the daemon's `--dir`. Blobs found there are cloned into
+  `buck-out`; buck2 never writes to it. Environment variables in `$VAR` form are
+  substituted. Unset disables directory access.
+- `cas_shared_cache_address` - where the daemon listens, as a port number or a
+  `grpc://host:port` URL. When set, all CAS traffic goes to the daemon in place
+  of `cas_address`, without TLS, so the daemon must be on the same machine.
+  Engine and action cache traffic still goes to the addresses configured for
+  them.
+- `cas_shared_cache_copy_policy` - how blobs are cloned out of the directory.
+  `hybrid` (the default) reflinks where the filesystem supports it and copies
+  otherwise; `reflink` fails instead of falling back; `copy` always copies.
+- `cas_shared_cache_mode` - `local_without_sync` (the default) clones from the
+  directory and only fetches over gRPC when the daemon does not have a blob yet;
+  `remote` never reads the directory and only talks gRPC to the daemon.
 
-Disk space is only shared when the clone is a reflink, which needs the cache and
-`buck-out` to be on the same btrfs, XFS or APFS filesystem. On other
-filesystems, or across filesystems, buck2 still copies out of the cache, so
-several daemons save the network fetch but not the disk. With the `hybrid`
-policy the daemon logs a warning the first time it has to fall back.
+On a miss buck2 asks the daemon for the first byte of the blob, which makes the
+daemon fetch and store all of it, and then clones it from the directory, so
+even the first daemon to need a blob gets a shared copy rather than a private
+one. If the blob still is not in the directory, buck2 falls back to receiving it
+over gRPC.
 
-Files buck2 uploads to the CAS (sources and locally built outputs) are added to
-the cache as well when they can be reflinked, so a second daemon that gets an
-action cache hit for the same action materializes the outputs without a
-download. Under the `copy` policy uploads are never added.
+Disk space is only shared when the clone is a reflink, which needs the daemon's
+directory and `buck-out` to be on the same btrfs, XFS or APFS filesystem. On
+other filesystems, or across filesystems, buck2 copies out of the directory: the
+daemons still share the network fetch and the daemon's store, but not the
+extents in `buck-out`. With the `hybrid` policy the buck2 daemon logs a warning
+the first time it has to fall back. The daemon and the buck2 daemons must run
+as users that can read each other's files.
 
-Sizes counted against the cap are nominal: a blob that has been reflinked into
-a `buck-out` shares its extents with that copy, and removing it from the cache
-frees the space only once every clone is gone too. Any number of daemons can
-use one cache at the same time; blobs appear through an atomic rename, so no
-coordinating process is needed. Hits and misses are reported in the
-`local_cache_hits_files` and related fields of the invocation record.
+Files buck2 uploads (sources and locally built outputs) pass through the daemon
+too, so a second buck2 daemon that gets an action cache hit for the same action
+clones the outputs without a download. The daemon verifies the hash of every
+blob it stores, whether it came from a client or from upstream.
+
+Eviction is the daemon's job. With `--max-size-bytes` it removes least recently
+used blobs in the background once the store exceeds the cap; a clone by buck2
+counts as a use. Sizes are nominal: a blob reflinked into a `buck-out` shares
+its extents with that clone, and removing it from the store frees the space
+only once every clone is gone too. Without a cap nothing is ever removed.
+Hits and misses are reported in the `local_cache_hits_files` and related fields
+of the invocation record.
+
+Without `--upstream` the daemon is a standalone CAS, which is handy for tests
+and for a purely local setup. Its other flags mirror the `[buck2_re_client]`
+keys for TLS certificates, HTTP headers and the instance name used upstream;
+see `buck2-casd --help`.
 
 ## RE platform configuration
 

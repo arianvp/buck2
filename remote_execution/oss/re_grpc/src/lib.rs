@@ -12,11 +12,11 @@ mod client;
 mod digest;
 mod error;
 mod grpc;
-mod local_cache;
 mod metadata;
 mod pool;
 mod request;
 mod response;
+mod shared_cache;
 mod stats;
 
 use std::sync::Arc;
@@ -27,10 +27,10 @@ use std::sync::atomic::Ordering;
 pub use client::*;
 pub use error::*;
 pub use grpc::*;
-pub use local_cache::LocalCasCache;
 pub use metadata::*;
 pub use request::*;
 pub use response::*;
+pub use shared_cache::SharedCasCache;
 
 /// The global version of the network stats full of atomics
 #[derive(Default, Debug)]

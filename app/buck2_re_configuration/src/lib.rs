@@ -492,18 +492,24 @@ pub struct Buck2OssReConfiguration {
     pub max_connections: Option<usize>,
     /// Maximum concurrent streams per connection.
     pub max_concurrency_per_connection: Option<usize>,
-    /// Absolute path of a machine-local, content-addressed blob cache shared by every daemon
-    /// (any isolation dir, any checkout) configured with the same path. Blobs fetched from the
-    /// CAS are stored here once and cloned into `buck-out` on demand. Unset disables the cache.
+    /// Directory of the machine-local CAS daemon (`buck2-casd --dir`). Blobs the daemon holds
+    /// are cloned into `buck-out` straight from this directory instead of being received over
+    /// gRPC, so every buck2 daemon on the host (any isolation dir, any checkout) shares one copy.
+    /// Buck2 only ever reads from it. Unset disables directory access.
     ///
     /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
     /// will be substituted before using the value.
-    pub cas_local_cache: Option<String>,
-    /// How blobs leave the local cache for `buck-out`. Defaults to `hybrid`.
-    pub cas_local_cache_copy_policy: Option<CopyPolicy>,
-    /// Upper bound on the local cache's size. Least recently used blobs are removed in the
-    /// background once it is exceeded. Unset means the cache is never pruned.
-    pub cas_local_cache_max_size_bytes: Option<u64>,
+    pub cas_shared_cache: Option<String>,
+    /// Where the machine-local CAS daemon listens: a port number or a `grpc://host:port` URL.
+    /// When set, all CAS traffic (`cas_address`) goes to the daemon instead, which passes misses
+    /// and uploads through to the real CAS.
+    pub cas_shared_cache_address: Option<String>,
+    /// How blobs are cloned out of the shared cache directory. Defaults to `hybrid`.
+    pub cas_shared_cache_copy_policy: Option<CopyPolicy>,
+    /// `local_without_sync` (default) clones blobs from the directory; `remote` never touches
+    /// the directory and only talks gRPC to the daemon. `local_with_sync` is accepted and behaves
+    /// like `local_without_sync`, since the daemon owns synchronization.
+    pub cas_shared_cache_mode: Option<CASdMode>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -641,17 +647,21 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrency_per_connection",
             })?,
-            cas_local_cache: legacy_config.parse(BuckconfigKeyRef {
+            cas_shared_cache: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "cas_local_cache",
+                property: "cas_shared_cache",
             })?,
-            cas_local_cache_copy_policy: legacy_config.parse(BuckconfigKeyRef {
+            cas_shared_cache_address: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "cas_local_cache_copy_policy",
+                property: "cas_shared_cache_address",
             })?,
-            cas_local_cache_max_size_bytes: legacy_config.parse(BuckconfigKeyRef {
+            cas_shared_cache_copy_policy: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "cas_local_cache_max_size_bytes",
+                property: "cas_shared_cache_copy_policy",
+            })?,
+            cas_shared_cache_mode: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_mode",
             })?,
         })
     }

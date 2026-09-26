@@ -179,13 +179,19 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
 fn create_endpoint(
     config: &ChannelConfig,
     address: &str,
+    tls: bool,
 ) -> Result<tonic::transport::Endpoint, anyhow::Error> {
     let address = substitute_env_vars(address).context("Invalid address")?;
     let uri = address.parse().context("Invalid address")?;
-    let uri = prepare_uri(uri, config.tls_config.is_some()).context("Invalid URI")?;
+    let tls_config = if tls {
+        config.tls_config.as_ref()
+    } else {
+        None
+    };
+    let uri = prepare_uri(uri, tls_config.is_some()).context("Invalid URI")?;
 
     let mut endpoint = Channel::builder(uri);
-    if let Some(tls_config) = &config.tls_config {
+    if let Some(tls_config) = tls_config {
         endpoint = endpoint.tls_config(tls_config.clone())?;
     }
 
@@ -217,7 +223,7 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
 }
 
 pub fn create_channel(config: &ChannelConfig, address: &str) -> Result<Channel, anyhow::Error> {
-    let endpoint = create_endpoint(config, address)?;
+    let endpoint = create_endpoint(config, address, true)?;
     Ok(channel_from_endpoint(&endpoint))
 }
 
@@ -446,6 +452,18 @@ impl ChannelPool {
 
     /// Get a pooled channel for the given address
     pub async fn get(&self, address: &str) -> anyhow::Result<PooledChannel> {
+        self.get_impl(address, true).await
+    }
+
+    /// Get a pooled channel for the given address without TLS, whatever the pool's TLS
+    /// configuration. Used for the machine-local CAS daemon on loopback, which must stay
+    /// reachable when the remote services require TLS. An address is either always plaintext or
+    /// never, so the cache key remains the address alone.
+    pub async fn get_plaintext(&self, address: &str) -> anyhow::Result<PooledChannel> {
+        self.get_impl(address, false).await
+    }
+
+    async fn get_impl(&self, address: &str, tls: bool) -> anyhow::Result<PooledChannel> {
         use std::collections::hash_map::Entry;
 
         let host_pool = {
@@ -454,7 +472,7 @@ impl ChannelPool {
             match pools.entry(address.to_owned()) {
                 Entry::Occupied(e) => Arc::clone(e.get()),
                 Entry::Vacant(e) => {
-                    let endpoint = create_endpoint(&self.channel_config, address)
+                    let endpoint = create_endpoint(&self.channel_config, address, tls)
                         .with_context(|| format!("Failed to create endpoint for {}", address))?;
                     let host_pool = HostPool::new(
                         endpoint,
