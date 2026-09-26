@@ -48,6 +48,50 @@ something else, this can be configured in `.buckconfig` as follows:
 digest_algorithms = BLAKE3
 ```
 
+## Sharing downloaded blobs between daemons
+
+Every buck2 daemon keeps its outputs under `buck-out/<isolation-dir>`, so two
+daemons with different [isolation directories](../../concepts/isolation_dir.md),
+or two checkouts of the same repository, each download and store their own copy
+of every blob they need. Configuring a local CAS cache gives them one shared
+store instead:
+
+```ini
+[buck2_re_client]
+cas_local_cache = $HOME/.cache/buck2/cas
+cas_local_cache_max_size_bytes = 21474836480
+```
+
+- `cas_local_cache` - absolute path of a directory shared by every daemon on the
+  machine that is configured with the same value. Blobs are downloaded into it
+  once and then cloned into whichever `buck-out` needs them. Environment
+  variables in `$VAR` form are substituted. Unset disables the cache.
+- `cas_local_cache_copy_policy` - how blobs leave the cache. `hybrid` (the
+  default) makes a copy-on-write clone where the filesystem supports it and
+  falls back to a plain copy otherwise; `reflink` fails instead of falling back;
+  `copy` always copies.
+- `cas_local_cache_max_size_bytes` - size cap for the cache. Once it is
+  exceeded, least recently used blobs are removed in the background until the
+  cache is a tenth below the cap. Unset means nothing is ever removed.
+
+Disk space is only shared when the clone is a reflink, which needs the cache and
+`buck-out` to be on the same btrfs, XFS or APFS filesystem. On other
+filesystems, or across filesystems, buck2 still copies out of the cache, so
+several daemons save the network fetch but not the disk. With the `hybrid`
+policy the daemon logs a warning the first time it has to fall back.
+
+Files buck2 uploads to the CAS (sources and locally built outputs) are added to
+the cache as well when they can be reflinked, so a second daemon that gets an
+action cache hit for the same action materializes the outputs without a
+download. Under the `copy` policy uploads are never added.
+
+Sizes counted against the cap are nominal: a blob that has been reflinked into
+a `buck-out` shares its extents with that copy, and removing it from the cache
+frees the space only once every clone is gone too. Any number of daemons can
+use one cache at the same time; blobs appear through an atomic rename, so no
+coordinating process is needed. Hits and misses are reported in the
+`local_cache_hits_files` and related fields of the invocation record.
+
 ## RE platform configuration
 
 Next, your build will need an

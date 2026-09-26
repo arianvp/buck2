@@ -13,6 +13,8 @@ use std::env::VarError;
 use std::io;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -28,6 +30,7 @@ use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
+use buck2_re_configuration::CopyPolicy;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
 use futures::Stream;
@@ -92,6 +95,8 @@ use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
 use crate::error::*;
+use crate::local_cache::LocalCacheCounters;
+use crate::local_cache::LocalCasCache;
 use crate::metadata::*;
 use crate::pool::ChannelConfig;
 use crate::pool::ChannelPool;
@@ -328,6 +333,22 @@ impl REClientBuilder {
         };
         let pool = ChannelPool::new(pool_config, channel_config);
 
+        let local_cache = match &opts.cas_local_cache {
+            Some(path) => {
+                let path = substitute_env_vars(path)?;
+                Some(
+                    LocalCasCache::new(
+                        PathBuf::from(path),
+                        opts.cas_local_cache_copy_policy
+                            .unwrap_or(CopyPolicy::Hybrid),
+                        opts.cas_local_cache_max_size_bytes,
+                    )
+                    .context("Error opening the local CAS cache")?,
+                )
+            }
+            None => None,
+        };
+
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
@@ -346,6 +367,7 @@ impl REClientBuilder {
             cas_address,
             engine_address.clone(),
             action_cache_address,
+            local_cache,
         ))
     }
 
@@ -492,6 +514,7 @@ pub struct REClient {
     cas_address: String,
     engine_address: String,
     action_cache_address: String,
+    local_cache: Option<LocalCasCache>,
 }
 
 impl Drop for REClient {
@@ -665,6 +688,7 @@ impl REClient {
         cas_address: String,
         engine_address: String,
         action_cache_address: String,
+        local_cache: Option<LocalCasCache>,
     ) -> Self {
         REClient {
             runtime_opts,
@@ -682,6 +706,7 @@ impl REClient {
             cas_address,
             engine_address,
             action_cache_address,
+            local_cache,
         }
     }
 
@@ -886,6 +911,7 @@ impl REClient {
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             self.runtime_opts.max_concurrent_uploads_per_action,
+            self.local_cache.as_ref(),
             |re_request| async move {
                 let resp = self
                     .cas_client()
@@ -949,6 +975,7 @@ impl REClient {
             request,
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
+            self.local_cache.as_ref(),
             |re_request| async move {
                 let resp = self
                     .cas_client()
@@ -1318,6 +1345,7 @@ async fn download_impl<Byt, BytRet, Cas>(
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
+    local_cache: Option<&LocalCasCache>,
     cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
@@ -1388,7 +1416,14 @@ where
     };
 
     let inlined_digests = request.inlined_digests.unwrap_or_default();
-    let file_digests = request.file_digests.unwrap_or_default();
+    let counters = LocalCacheCounters::default();
+    // Serve whatever the local cache already has before asking the remote for anything.
+    let file_digests = match local_cache {
+        Some(cache) => {
+            serve_from_local_cache(cache, request.file_digests.unwrap_or_default(), &counters).await
+        }
+        None => request.file_digests.unwrap_or_default(),
+    };
 
     let mut curr_size = 0;
     let mut requests = vec![];
@@ -1475,7 +1510,68 @@ where
         })
     }
 
-    let writes = file_digests.iter().map(|req| async {
+    // With a local cache, non-empty blobs go through the store and are cloned out of it, once per
+    // distinct digest. Everything else is written straight to its destination as before.
+    let (cached_files, direct_files): (Vec<_>, Vec<_>) = file_digests
+        .into_iter()
+        .partition(|req| local_cache.is_some() && req.named_digest.digest.size_in_bytes > 0);
+    let mut by_digest: HashMap<TDigest, Vec<(String, bool)>> = HashMap::new();
+    for req in cached_files {
+        by_digest
+            .entry(req.named_digest.digest)
+            .or_default()
+            .push((req.named_digest.name, req.is_executable));
+    }
+    let counters = &counters;
+    let get = &get;
+    let cache_writes = by_digest.iter().map(|(digest, destinations)| async move {
+        let cache = local_cache.context("cached_files is non-empty without a cache")?;
+        retry(|| async {
+            if digest.size_in_bytes < max_total_batch_size as i64 {
+                let data = get(digest)?;
+                cache.insert_from_bytes(digest, &data).await?;
+            } else {
+                let tmp_path = cache.new_tmp_path();
+                let written = async {
+                    let mut reader = bystream_fut(digest.clone()).await?;
+                    let mut file = tokio::fs::File::create(&tmp_path)
+                        .await
+                        .with_context(|| format!("Error creating `{}`", tmp_path.display()))?;
+                    tokio::io::copy(&mut reader, &mut file)
+                        .await
+                        .with_context(|| format!("Error writing chunk of: {digest}"))?;
+                    file.flush().await.context("Error flushing")?;
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(e) = written {
+                    let _ignored = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+                cache.commit(digest, tmp_path).await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .with_context(|| format!("Error downloading digest `{digest}` into the local CAS cache"))?;
+
+        for (name, is_executable) in destinations {
+            let materialized = cache
+                .materialize(digest, Path::new(name), *is_executable)
+                .await
+                .with_context(|| format!("Error materializing `{digest}` to `{name}`"))?;
+            if !materialized {
+                return Err(anyhow::anyhow!(
+                    "Digest `{digest}` vanished from the local CAS cache before it could be \
+                     materialized to `{name}`"
+                ));
+            }
+            counters.miss(digest.size_in_bytes);
+        }
+        anyhow::Ok(())
+    });
+
+    let writes = direct_files.iter().map(|req| async {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -1521,13 +1617,70 @@ where
         })
     });
 
-    buck2_util::future::try_join_all(writes).await?;
+    futures::future::try_join(
+        buck2_util::future::try_join_all(writes),
+        buck2_util::future::try_join_all(cache_writes),
+    )
+    .await?;
 
     Ok(DownloadResponse {
         inlined_blobs: Some(inlined_blobs),
         directories: None,
-        local_cache_stats: Default::default(),
+        local_cache_stats: counters.take_stats(),
     })
+}
+
+/// Materializes every file the local cache can serve and returns the ones it cannot.
+///
+/// A cache that fails to serve a blob is treated as a miss: the blob is then downloaded into the
+/// cache and materialized from there, which surfaces any persistent problem with the cache.
+async fn serve_from_local_cache(
+    cache: &LocalCasCache,
+    files: Vec<NamedDigestWithPermissions>,
+    counters: &LocalCacheCounters,
+) -> Vec<NamedDigestWithPermissions> {
+    let outcomes = futures::future::join_all(files.into_iter().map(|req| async move {
+        let digest = &req.named_digest.digest;
+        if digest.size_in_bytes == 0 {
+            return (req, false);
+        }
+        let hit = match cache
+            .materialize(digest, Path::new(&req.named_digest.name), req.is_executable)
+            .await
+        {
+            Ok(hit) => hit,
+            Err(e) => {
+                tracing::warn!(
+                    "Local CAS cache failed to materialize `{}` to `{}`, downloading instead: {:#}",
+                    digest,
+                    req.named_digest.name,
+                    e
+                );
+                false
+            }
+        };
+        (req, hit)
+    }))
+    .await;
+
+    let mut misses = Vec::new();
+    for (req, hit) in outcomes {
+        if hit {
+            counters.hit(req.named_digest.digest.size_in_bytes);
+        } else {
+            misses.push(req);
+        }
+    }
+    misses
+}
+
+/// Adds a file that is being uploaded to the local cache, if there is one. Never fails an upload.
+async fn populate_local_cache(cache: Option<&LocalCasCache>, digest: &TDigest, path: &str) {
+    if let Some(cache) = cache {
+        if let Err(e) = cache.insert_from_path(digest, Path::new(path)).await {
+            tracing::warn!("Failed to add `{}` to the local CAS cache: {:#}", path, e);
+        }
+    }
 }
 
 async fn upload_impl<Byt, Cas>(
@@ -1536,6 +1689,7 @@ async fn upload_impl<Byt, Cas>(
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
+    local_cache: Option<&LocalCasCache>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
@@ -1653,6 +1807,7 @@ where
         let hash = file.digest.hash.clone();
         let size = file.digest.size_in_bytes;
         let name = file.name.clone();
+        let digest = file.digest.clone();
         if size < max_total_batch_size as i64 {
             batched_blob_updates.push(BatchUploadRequest::File(file));
             continue;
@@ -1666,6 +1821,7 @@ where
         );
 
         let fut = async move {
+            populate_local_cache(local_cache, &digest, &name).await;
             retry(|| async {
                 let file = tokio::fs::File::open(&name)
                     .await
@@ -1705,6 +1861,7 @@ where
                             .with_context(|| format!("Opening {} for reading failed", file.name))?;
                         let mut data = vec![];
                         fin.read_to_end(&mut data).await?;
+                        populate_local_cache(local_cache, &file.digest, &file.name).await;
 
                         re_request.requests.push(Request {
                             digest: Some(tdigest_to(file.digest.clone())),
@@ -1949,6 +2106,7 @@ mod tests {
             req,
             None,
             10000,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2056,6 +2214,7 @@ mod tests {
             req,
             None,
             10, // kept small to simulate a large file download
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2138,6 +2297,7 @@ mod tests {
             req,
             None,
             100000,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2225,6 +2385,7 @@ mod tests {
             req,
             None,
             7,
+            None,
             |req| {
                 counter.fetch_add(1, Ordering::Relaxed);
                 let res = BatchReadBlobsResponse {
@@ -2294,6 +2455,7 @@ mod tests {
             req,
             None,
             10, // intentionally small value to keep data in the test blobs small
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2350,6 +2512,7 @@ mod tests {
             req,
             None,
             100000,
+            None,
             |req| {
                 let res = res.clone();
                 async move {
@@ -2389,6 +2552,7 @@ mod tests {
             req,
             None,
             0,
+            None,
             |_req| async { panic!("not called") },
             |req| async move {
                 assert_eq!(req.resource_name, "instance/blobs/aa/0");
@@ -2459,6 +2623,7 @@ mod tests {
             req,
             None,
             10000,
+            None,
             None,
             |req| {
                 let res = res.clone();
@@ -2544,6 +2709,7 @@ mod tests {
             None,
             10, // kept small to simulate a large file upload
             None,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2619,6 +2785,7 @@ mod tests {
             None,
             10, // kept small to simulate a large inlined upload
             None,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2680,6 +2847,7 @@ mod tests {
             req,
             None,
             10,
+            None,
             None,
             |_req| async move {
                 panic!("This should not be called as there are no blobs to upload in batch");
@@ -2743,6 +2911,7 @@ mod tests {
             None,
             3,
             None,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2790,6 +2959,7 @@ mod tests {
                     compressor,
                     0, // max_total_batch_size=0 forces bytestream API
                     None,
+                    None,
                     |_req| async move {
                         panic!("Not called");
                     },
@@ -2814,6 +2984,7 @@ mod tests {
                     },
                     compressor,
                     1024, // forces the batch API
+                    None,
                     None,
                     |_req| async move {
                         panic!("Not called");
@@ -2862,6 +3033,7 @@ mod tests {
             None,
             1,
             None,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2909,6 +3081,7 @@ mod tests {
             Some(Compressor::Zstd),
             1,
             None,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2924,6 +3097,310 @@ mod tests {
         )
         .await?;
 
+        Ok(())
+    }
+
+    fn cache_for(work: &tempfile::TempDir) -> LocalCasCache {
+        LocalCasCache::new(work.path().join("cas"), CopyPolicy::Hybrid, None).unwrap()
+    }
+
+    fn named(path: &str, digest: &TDigest, is_executable: bool) -> NamedDigestWithPermissions {
+        NamedDigestWithPermissions {
+            named_digest: NamedDigest {
+                name: path.to_owned(),
+                digest: digest.clone(),
+                ..Default::default()
+            },
+            is_executable,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_with_local_cache_populates_then_serves() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let cache = cache_for(&work);
+        let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+
+        let digest1 = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let digest2 = TDigest {
+            hash: "bb".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let res = BatchReadBlobsResponse {
+            responses: vec![
+                batch_read_blobs_response::Response {
+                    digest: Some(tdigest_to(digest1.clone())),
+                    data: vec![1, 2, 3],
+                    ..Default::default()
+                },
+                batch_read_blobs_response::Response {
+                    digest: Some(tdigest_to(digest2.clone())),
+                    data: vec![4, 5, 6],
+                    ..Default::default()
+                },
+            ],
+        };
+        let upstream_calls = std::sync::atomic::AtomicUsize::new(0);
+        let upstream_calls = &upstream_calls;
+        let cas_f = |req: BatchReadBlobsRequest| {
+            let res = res.clone();
+            async move {
+                upstream_calls.fetch_add(req.digests.len(), Ordering::Relaxed);
+                Ok(res)
+            }
+        };
+        let bystream = |_digest| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) };
+
+        // First download: everything is a miss and lands in the cache.
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![
+                    named(&path("one"), &digest1, true),
+                    named(&path("two"), &digest2, false),
+                ]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            cas_f,
+            bystream,
+        )
+        .await?;
+        assert_eq!(upstream_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(response.local_cache_stats.misses_files, 2);
+        assert_eq!(response.local_cache_stats.misses_bytes, 6);
+        assert_eq!(response.local_cache_stats.hits_files, 0);
+        assert_eq!(tokio::fs::read(path("one")).await?, vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(path("two")).await?, vec![4, 5, 6]);
+        assert!(work.path().join("cas/blobs/aa/aa-3").exists());
+        assert!(work.path().join("cas/blobs/bb/bb-3").exists());
+
+        // Second download of the same digests to new paths: served entirely locally, including
+        // the same digest requested twice.
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![
+                    named(&path("three"), &digest1, false),
+                    named(&path("four"), &digest2, true),
+                    named(&path("five"), &digest2, false),
+                ]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            cas_f,
+            bystream,
+        )
+        .await?;
+        assert_eq!(
+            upstream_calls.load(Ordering::Relaxed),
+            2,
+            "upstream must not be asked again"
+        );
+        assert_eq!(response.local_cache_stats.hits_files, 3);
+        assert_eq!(response.local_cache_stats.hits_bytes, 9);
+        assert_eq!(response.local_cache_stats.misses_files, 0);
+        assert_eq!(response.local_cache_stats.total_cache_lookup_attempts, 3);
+        assert_eq!(tokio::fs::read(path("three")).await?, vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(path("four")).await?, vec![4, 5, 6]);
+        assert_eq!(tokio::fs::read(path("five")).await?, vec![4, 5, 6]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |name: &str| std::fs::metadata(path(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("one"), 0o755);
+            assert_eq!(mode("two"), 0o644);
+            assert_eq!(mode("three"), 0o644);
+            assert_eq!(mode("four"), 0o755);
+            assert_eq!(mode("five"), 0o644);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_with_local_cache_fetches_shared_digest_once() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let cache = cache_for(&work);
+        let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+        let digest = TDigest {
+            hash: "cc".to_owned(),
+            size_in_bytes: 2,
+            ..Default::default()
+        };
+        let res = BatchReadBlobsResponse {
+            responses: vec![batch_read_blobs_response::Response {
+                digest: Some(tdigest_to(digest.clone())),
+                data: vec![7, 8],
+                ..Default::default()
+            }],
+        };
+        let inserted_before = std::fs::read_dir(work.path().join("cas/tmp"))?.count();
+        download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![
+                    named(&path("a"), &digest, false),
+                    named(&path("b"), &digest, false),
+                ]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| {
+                let res = res.clone();
+                async move { Ok(res) }
+            },
+            |_digest| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(path("a")).await?, vec![7, 8]);
+        assert_eq!(tokio::fs::read(path("b")).await?, vec![7, 8]);
+        // One blob in the store, and no temporary files left behind.
+        assert_eq!(
+            std::fs::read_dir(work.path().join("cas/blobs/cc"))?.count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(work.path().join("cas/tmp"))?.count(),
+            inserted_before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_large_with_local_cache() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let cache = cache_for(&work);
+        let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+        let blob_data: Vec<u8> = (0..18).collect();
+        let digest = TDigest {
+            hash: "dd".to_owned(),
+            size_in_bytes: blob_data.len() as i64,
+            ..Default::default()
+        };
+        let read_response1 = ReadResponse {
+            data: blob_data[..10].to_vec(),
+        };
+        let read_response2 = ReadResponse {
+            data: blob_data[10..].to_vec(),
+        };
+        let bystream_calls = std::sync::atomic::AtomicUsize::new(0);
+        let bystream_calls = &bystream_calls;
+        let bystream = |req: ReadRequest| {
+            let read_response1 = read_response1.clone();
+            let read_response2 = read_response2.clone();
+            async move {
+                bystream_calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.resource_name, "blobs/dd/18");
+                anyhow::Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(read_response1),
+                    Ok(read_response2),
+                ])))
+            }
+        };
+        let cas_f = |_req| async move { anyhow::Ok(BatchReadBlobsResponse::default()) };
+
+        for (name, expected_calls) in [("big1", 1), ("big2", 1)] {
+            let response = download_impl(
+                &InstanceName(None),
+                DownloadRequest {
+                    file_digests: Some(vec![named(&path(name), &digest, false)]),
+                    ..Default::default()
+                },
+                None,
+                10, // force the bytestream path
+                Some(&cache),
+                cas_f,
+                bystream,
+            )
+            .await?;
+            assert_eq!(tokio::fs::read(path(name)).await?, blob_data);
+            assert_eq!(bystream_calls.load(Ordering::Relaxed), expected_calls);
+            assert_eq!(response.local_cache_stats.total_cache_lookup_attempts, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_with_local_cache_rejects_wrong_size() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let cache = cache_for(&work);
+        let path = work.path().join("out").to_str().unwrap().to_owned();
+        let digest = TDigest {
+            hash: "ee".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let res = BatchReadBlobsResponse {
+            responses: vec![batch_read_blobs_response::Response {
+                digest: Some(tdigest_to(digest.clone())),
+                data: vec![1, 2], // one byte short
+                ..Default::default()
+            }],
+        };
+        let err = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![named(&path, &digest, false)]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| {
+                let res = res.clone();
+                async move { Ok(res) }
+            },
+            |_digest| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await
+        .err()
+        .expect("a short blob must be rejected");
+        assert!(format!("{err:#}").contains("expected 3"), "{err:#}");
+        assert!(!work.path().join("out").exists());
+        assert!(!work.path().join("cas/blobs/ee/ee-3").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_empty_with_local_cache() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let cache = cache_for(&work);
+        let path = work.path().join("empty").to_str().unwrap().to_owned();
+        let digest = TDigest {
+            hash: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_owned(),
+            size_in_bytes: 0,
+            ..Default::default()
+        };
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![named(&path, &digest, true)]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| async move { anyhow::Ok(BatchReadBlobsResponse::default()) },
+            |_digest| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&path).await?, Vec::<u8>::new());
+        assert_eq!(response.local_cache_stats.total_cache_lookup_attempts, 0);
+        assert_eq!(std::fs::read_dir(work.path().join("cas/blobs"))?.count(), 0);
         Ok(())
     }
 
@@ -2979,6 +3456,7 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         Some(Compressor::Zstd),
         1,
         None,
+        None,
         |_req| async move {
             panic!("Not called");
         },
@@ -3025,6 +3503,7 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         },
         Some(Compressor::Zstd),
         10,
+        None,
         |_req| async { panic!("not called") },
         |_req| async move {
             Ok(Box::pin(futures::stream::iter(

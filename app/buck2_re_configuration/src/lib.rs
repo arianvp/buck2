@@ -71,10 +71,14 @@ impl FromStr for CASdMode {
     }
 }
 
-#[derive(Clone, Debug, Allocative)]
+/// How a blob held in a local CAS cache is materialized into `buck-out`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Allocative)]
 pub enum CopyPolicy {
+    /// Always write a full copy.
     Copy,
+    /// Always make a copy-on-write clone; fail if the filesystem cannot.
     Reflink,
+    /// Make a copy-on-write clone where the filesystem supports it, otherwise copy.
     Hybrid,
 }
 
@@ -85,7 +89,12 @@ impl FromStr for CopyPolicy {
         match s {
             "hybrid" => Ok(CopyPolicy::Hybrid),
             "reflink" => Ok(CopyPolicy::Reflink),
-            _ => Ok(CopyPolicy::Copy),
+            "copy" => Ok(CopyPolicy::Copy),
+            _ => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Invalid copy policy `{}` (expected `copy`, `reflink` or `hybrid`)",
+                s
+            )),
         }
     }
 }
@@ -483,6 +492,18 @@ pub struct Buck2OssReConfiguration {
     pub max_connections: Option<usize>,
     /// Maximum concurrent streams per connection.
     pub max_concurrency_per_connection: Option<usize>,
+    /// Absolute path of a machine-local, content-addressed blob cache shared by every daemon
+    /// (any isolation dir, any checkout) configured with the same path. Blobs fetched from the
+    /// CAS are stored here once and cloned into `buck-out` on demand. Unset disables the cache.
+    ///
+    /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
+    /// will be substituted before using the value.
+    pub cas_local_cache: Option<String>,
+    /// How blobs leave the local cache for `buck-out`. Defaults to `hybrid`.
+    pub cas_local_cache_copy_policy: Option<CopyPolicy>,
+    /// Upper bound on the local cache's size. Least recently used blobs are removed in the
+    /// background once it is exceeded. Unset means the cache is never pruned.
+    pub cas_local_cache_max_size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -619,6 +640,18 @@ impl Buck2OssReConfiguration {
             max_concurrency_per_connection: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrency_per_connection",
+            })?,
+            cas_local_cache: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_local_cache",
+            })?,
+            cas_local_cache_copy_policy: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_local_cache_copy_policy",
+            })?,
+            cas_local_cache_max_size_bytes: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_local_cache_max_size_bytes",
             })?,
         })
     }

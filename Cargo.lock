@@ -7527,6 +7527,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "lru",
  "prost",
  "prost-types",
