@@ -123,7 +123,7 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
                     file_digests: Some(vec![NamedDigestWithPermissions {
                         named_digest: NamedDigest {
                             name: out.to_str().unwrap().to_owned(),
-                            digest,
+                            digest: digest.clone(),
                             ..Default::default()
                         },
                         is_executable: false,
@@ -139,21 +139,121 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
             pid_contents,
             "not restarted"
         );
-        anyhow::Ok(())
+
+        // Stop the daemon under the live clients, as `buck2 killall` or a crash would. It takes
+        // its socket file with it, and the next call that needs the daemon (an upload; a
+        // download of a blob the directory already holds never touches it) starts a new one.
+        cleanup();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while casd_dir.join(DEFAULT_SOCKET_NAME).exists() {
+            assert!(std::time::Instant::now() < deadline, "daemon did not exit");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!pid_file.exists(), "pid file removed on exit");
+        let more = b"after a restart".to_vec();
+        let more_digest = TDigest {
+            hash: DigestFunction::Sha256.hash_bytes(&more),
+            size_in_bytes: more.len() as i64,
+            ..Default::default()
+        };
+        again
+            .upload(
+                &RemoteExecutionMetadata::default(),
+                UploadRequest {
+                    inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
+                        digest: more_digest.clone(),
+                        blob: more.clone(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            origin
+                .store
+                .lookup_for_test(&more_digest.hash, more_digest.size_in_bytes)
+                .await?,
+            "the upload went through a new daemon to the origin"
+        );
+        let new_pid: u32 = std::fs::read_to_string(&pid_file)?
+            .lines()
+            .next()
+            .unwrap()
+            .parse()?;
+        assert_ne!(new_pid, pid, "a new daemon was started");
+
+        // Now kill it outright, as `buck2 killall` does. The stale socket file stays, so the
+        // client only notices through its periodic probe; the upload after that must still go
+        // through a third daemon.
+        // SAFETY: a pid the new daemon just wrote.
+        unsafe { libc_kill_signal(new_pid as i32, 9) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while unsafe { libc_kill_signal(new_pid as i32, 0) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "daemon did not die");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            casd_dir.join(DEFAULT_SOCKET_NAME).exists(),
+            "SIGKILL leaves the socket"
+        );
+        tokio::time::sleep(Duration::from_secs(6)).await; // longer than the probe interval
+        let third = b"after a hard kill".to_vec();
+        let third_digest = TDigest {
+            hash: DigestFunction::Sha256.hash_bytes(&third),
+            size_in_bytes: third.len() as i64,
+            ..Default::default()
+        };
+        again
+            .upload(
+                &RemoteExecutionMetadata::default(),
+                UploadRequest {
+                    inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
+                        digest: third_digest.clone(),
+                        blob: third.clone(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            origin
+                .store
+                .lookup_for_test(&third_digest.hash, third_digest.size_in_bytes)
+                .await?
+        );
+        let new_pid: u32 = std::fs::read_to_string(&pid_file)?
+            .lines()
+            .next()
+            .unwrap()
+            .parse()?;
+        anyhow::Ok(new_pid)
     }
     .await;
 
+    // Whatever happened, leave no daemon behind.
     cleanup();
+    if let Ok(new_pid) = &outcome {
+        #[cfg(unix)]
+        // SAFETY: as above, a pid the new daemon just wrote.
+        unsafe {
+            libc_kill(*new_pid as i32);
+        }
+    }
     origin.shutdown().await?;
-    outcome
+    outcome.map(|_| ())
 }
 
 #[cfg(unix)]
 unsafe fn libc_kill(pid: i32) {
+    unsafe { libc_kill_signal(pid, 15) };
+}
+
+#[cfg(unix)]
+unsafe fn libc_kill_signal(pid: i32, sig: i32) -> i32 {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    unsafe {
-        kill(pid, 15);
-    }
+    unsafe { kill(pid, sig) }
 }

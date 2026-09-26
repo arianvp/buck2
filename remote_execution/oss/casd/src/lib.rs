@@ -121,31 +121,54 @@ pub struct Config {
 pub struct Running {
     pub address: Address,
     pub store: Arc<Store>,
+    dir: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
     evictor: JoinHandle<()>,
 }
 
+/// How long a stopping daemon lets in-flight requests finish before it exits anyway.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Running {
-    /// Stops serving and waits for in-flight requests to finish.
+    /// Stops serving: removes the socket and pid files at once, so that nothing points at a
+    /// daemon that is going away (buck2 clients take a missing socket file as the cue to start
+    /// a new one), then gives in-flight requests [`DRAIN_TIMEOUT`] to finish. Idle client
+    /// connections do not hold it up.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.remove_files();
         if let Some(tx) = self.shutdown.take() {
             let _ignored = tx.send(());
         }
         self.evictor.abort();
-        (&mut self.server)
-            .await
-            .context("Server task panicked")?
-            .context("Server failed")
+        match tokio::time::timeout(DRAIN_TIMEOUT, &mut self.server).await {
+            Ok(joined) => joined
+                .context("Server task panicked")?
+                .context("Server failed"),
+            Err(_) => {
+                tracing::warn!("Requests still in flight after {DRAIN_TIMEOUT:?}; exiting anyway");
+                self.server.abort();
+                Ok(())
+            }
+        }
     }
 
-    /// Waits until the server exits on its own.
+    /// Waits until the server exits on its own, then removes the socket and pid files.
     pub async fn wait(mut self) -> anyhow::Result<()> {
         self.evictor.abort();
-        (&mut self.server)
+        let result = (&mut self.server)
             .await
-            .context("Server task panicked")?
-            .context("Server failed")
+            .context("Server task panicked")
+            .and_then(|r| r.context("Server failed"));
+        self.remove_files();
+        result
+    }
+
+    fn remove_files(&self) {
+        if let Address::Unix(path) = &self.address {
+            let _ignored = std::fs::remove_file(path);
+        }
+        let _ignored = std::fs::remove_file(self.dir.join(PID_FILE_NAME));
     }
 }
 
@@ -218,6 +241,7 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
     Ok(Running {
         address,
         store,
+        dir: config.dir.clone(),
         shutdown: Some(shutdown_tx),
         server,
         evictor,

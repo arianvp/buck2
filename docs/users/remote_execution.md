@@ -87,9 +87,16 @@ through the environment, not the command line. The daemon runs in its own
 session and outlives the buck2 daemon that started it; when several buck2
 daemons find it missing at once, a lock file in the directory makes one of them
 start it while the others wait for the socket. Its output goes to
-`buck2-casd.log` and its pid to `buck2-casd.pid`, both in the directory. To run
-it under a service manager instead, start it yourself and set
-`cas_shared_cache_autostart = false`:
+`buck2-casd.log` and its pid to `buck2-casd.pid`, both in the directory.
+
+The daemon then runs until `buck2 killall`, which stops it along with the buck2
+daemons, or a reboot. If it goes away under a running buck2 daemon (killed,
+crashed, or its directory removed) it takes its socket file with it, and the
+next CAS call starts a new one; a client mid-request may see that one request
+fail. The protocol between buck2 and the daemon is the remote execution API, so
+an older daemon keeps working with a newer buck2; to pick up a new daemon
+binary after upgrading buck2, run `buck2 killall`. To run it under a service
+manager instead, start it yourself and set `cas_shared_cache_autostart = false`:
 
 ```sh
 $ buck2-casd --dir /var/cache/buck2-casd \

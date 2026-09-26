@@ -323,14 +323,21 @@ fn spawn_detached(launch: &Launch) -> anyhow::Result<()> {
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    // The child is intentionally not waited on: it is meant to outlive us.
-    command.spawn().with_context(|| {
+    let mut child = command.spawn().with_context(|| {
         format!(
             "Error starting buck2-casd from `{}` (set `cas_shared_cache_binary` or disable \
              `cas_shared_cache_autostart`)",
             launch.binary.display()
         )
     })?;
+    // The daemon is meant to outlive us, so nothing waits for it, but a child that dies while we
+    // are still around must still be reaped or it lingers as a zombie.
+    std::thread::Builder::new()
+        .name("buck2-casd-reaper".to_owned())
+        .spawn(move || {
+            let _ignored = child.wait();
+        })
+        .context("Error spawning the buck2-casd reaper thread")?;
     Ok(())
 }
 

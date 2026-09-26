@@ -108,7 +108,24 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_termination_signal().await?;
     tracing::info!("Shutting down");
     running.shutdown().await
+}
+
+#[cfg(unix)]
+async fn wait_for_termination_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::SignalKind;
+    use tokio::signal::unix::signal;
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r?,
+        _ = term.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> anyhow::Result<()> {
+    Ok(tokio::signal::ctrl_c().await?)
 }

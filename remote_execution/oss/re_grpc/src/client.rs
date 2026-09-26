@@ -356,6 +356,7 @@ impl REClientBuilder {
         };
         let pool = ChannelPool::new(pool_config, channel_config);
 
+        let mut daemon_restart = None;
         if let (Some(address), Some(dir), true) = (
             &daemon_address,
             &shared_cache_dir,
@@ -364,6 +365,12 @@ impl REClientBuilder {
             crate::casd_autostart::ensure_running(opts, address, dir, substitute_env_vars)
                 .await
                 .context("Error auto-starting buck2-casd")?;
+            daemon_restart = Some(Arc::new(DaemonRestart {
+                opts: opts.clone(),
+                address: address.clone(),
+                dir: dir.clone(),
+                last_confirmed: Mutex::new(Instant::now()),
+            }));
         }
         let shared_cache = match shared_cache_dir {
             Some(dir) if !matches!(opts.cas_shared_cache_mode, Some(CASdMode::Remote)) => Some(
@@ -394,6 +401,7 @@ impl REClientBuilder {
             interceptor,
             cas_address,
             cas_plaintext,
+            daemon_restart,
             engine_address.clone(),
             action_cache_address,
             shared_cache,
@@ -543,10 +551,25 @@ pub struct REClient {
     cas_address: String,
     /// Whether `cas_address` is the machine-local CAS daemon, reached without TLS.
     cas_plaintext: bool,
+    /// How to bring the machine-local CAS daemon back if it disappears while this client lives
+    /// (it crashed, `buck2 killall` stopped it, or its directory was removed).
+    daemon_restart: Option<Arc<DaemonRestart>>,
     engine_address: String,
     action_cache_address: String,
     shared_cache: Option<SharedCasCache>,
 }
+
+struct DaemonRestart {
+    opts: Buck2OssReConfiguration,
+    address: DaemonAddress,
+    dir: PathBuf,
+    /// When the daemon was last confirmed to answer, so that a live client notices a daemon
+    /// that died without cleaning up (SIGKILL, a crash) without probing on every call.
+    last_confirmed: Mutex<Instant>,
+}
+
+/// How often a live client re-checks that the daemon still answers.
+const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Drop for REClient {
     fn drop(&mut self) {
@@ -718,6 +741,7 @@ impl REClient {
         interceptor: InjectHeadersInterceptor,
         cas_address: String,
         cas_plaintext: bool,
+        daemon_restart: Option<Arc<DaemonRestart>>,
         engine_address: String,
         action_cache_address: String,
         shared_cache: Option<SharedCasCache>,
@@ -737,6 +761,7 @@ impl REClient {
             interceptor,
             cas_address,
             cas_plaintext,
+            daemon_restart,
             engine_address,
             action_cache_address,
             shared_cache,
@@ -1145,6 +1170,27 @@ impl REClient {
 
     async fn cas_channel(&self) -> anyhow::Result<PooledChannel> {
         if self.cas_plaintext {
+            // A daemon that exited cleanly takes its socket file with it, which one stat per
+            // call notices at once. One killed outright (`buck2 killall`, a crash) leaves the
+            // file behind, so every few seconds the daemon is also asked to answer. Either way
+            // the same start logic runs, and the lazily reconnecting channel then finds the
+            // successor at the same path.
+            if let Some(restart) = &self.daemon_restart {
+                let socket_missing =
+                    matches!(&restart.address, DaemonAddress::Unix(path) if !path.exists());
+                let due = restart.last_confirmed.lock().unwrap().elapsed() >= DAEMON_PROBE_INTERVAL;
+                if socket_missing || due {
+                    crate::casd_autostart::ensure_running(
+                        &restart.opts,
+                        &restart.address,
+                        &restart.dir,
+                        substitute_env_vars,
+                    )
+                    .await
+                    .context("Error restarting buck2-casd")?;
+                    *restart.last_confirmed.lock().unwrap() = Instant::now();
+                }
+            }
             self.pool.get_plaintext(&self.cas_address).await
         } else {
             self.pool.get(&self.cas_address).await
