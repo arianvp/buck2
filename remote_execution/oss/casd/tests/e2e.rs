@@ -10,12 +10,12 @@
 
 //! End-to-end tests: real daemons on loopback, driven by the same gRPC client buck2 uses.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use buck2_casd::Config;
+use buck2_casd::Listen;
 use buck2_casd::Running;
 use buck2_casd::digest::DigestFunction;
 use buck2_casd::server::MAX_BATCH_TOTAL_SIZE_BYTES;
@@ -32,14 +32,20 @@ use remote_execution::RemoteExecutionMetadata;
 use remote_execution::TDigest;
 use remote_execution::UploadRequest;
 
-async fn daemon(dir: &Path, upstream: Option<SocketAddr>, max_size_bytes: Option<u64>) -> Running {
+/// Origins listen on their default Unix socket; proxies on a loopback port, so both kinds of
+/// listener and both kinds of client connection are exercised.
+async fn daemon(dir: &Path, upstream: Option<&Running>, max_size_bytes: Option<u64>) -> Running {
     buck2_casd::start(Config {
         dir: dir.to_owned(),
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: if upstream.is_some() {
+            Listen::Loopback(0)
+        } else {
+            Listen::default_for(dir)
+        },
         digest_function: DigestFunction::Sha256,
         max_size_bytes,
-        upstream: upstream.map(|addr| UpstreamConfig {
-            address: format!("grpc://{addr}"),
+        upstream: upstream.map(|origin| UpstreamConfig {
+            address: origin.address.to_string(),
             ..Default::default()
         }),
         eviction_interval: Duration::from_secs(3600),
@@ -48,8 +54,8 @@ async fn daemon(dir: &Path, upstream: Option<SocketAddr>, max_size_bytes: Option
     .expect("daemon starts")
 }
 
-async fn client(addr: SocketAddr) -> REClient {
-    let address = format!("grpc://{addr}");
+async fn client(daemon: &Running) -> REClient {
+    let address = daemon.address.to_string();
     REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
         cas_address: Some(address.clone()),
         engine_address: Some(address.clone()),
@@ -169,7 +175,7 @@ async fn standalone_roundtrip() -> anyhow::Result<()> {
     let work = tempfile::tempdir()?;
     let store_dir = work.path().join("store");
     let origin = daemon(&store_dir, None, None).await;
-    let client = client(origin.local_addr).await;
+    let client = client(&origin).await;
 
     let small = upload_inlined(&client, b"hello").await;
     let large_data = large_blob();
@@ -237,9 +243,9 @@ async fn proxy_passes_through() -> anyhow::Result<()> {
     let origin_dir = work.path().join("origin");
     let proxy_dir = work.path().join("proxy");
     let origin = daemon(&origin_dir, None, None).await;
-    let proxy = daemon(&proxy_dir, Some(origin.local_addr), None).await;
-    let origin_client = client(origin.local_addr).await;
-    let proxy_client = client(proxy.local_addr).await;
+    let proxy = daemon(&proxy_dir, Some(&origin), None).await;
+    let origin_client = client(&origin).await;
+    let proxy_client = client(&proxy).await;
 
     // Blobs uploaded at the origin are fetched through the proxy and land in its store.
     let small = upload_inlined(&origin_client, b"from origin").await;
@@ -285,7 +291,7 @@ async fn proxy_passes_through() -> anyhow::Result<()> {
     let fresh = upload_inlined(&origin_client, b"concurrent").await;
     let mut tasks = Vec::new();
     for i in 0..6 {
-        let proxy_client = client(proxy.local_addr).await;
+        let proxy_client = client(&proxy).await;
         let fresh = fresh.clone();
         let out = work.path().join(format!("concurrent_{i}"));
         tasks.push(tokio::spawn(async move {
@@ -317,7 +323,7 @@ async fn evicts_when_over_cap() -> anyhow::Result<()> {
     let work = tempfile::tempdir()?;
     let store_dir = work.path().join("store");
     let origin = daemon(&store_dir, None, Some(100)).await;
-    let client = client(origin.local_addr).await;
+    let client = client(&origin).await;
     for i in 0..10u8 {
         upload_inlined(&client, &[i; 20]).await;
     }

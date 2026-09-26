@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+mod casd_autostart;
 mod client;
 mod digest;
 mod error;

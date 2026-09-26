@@ -307,6 +307,12 @@ impl Store {
         result
     }
 
+    /// Whether a blob is present, for tests that only have the raw digest parts.
+    pub async fn lookup_for_test(&self, hash: &str, size: i64) -> anyhow::Result<bool> {
+        let digest = Digest::new(hash, size, self.digest_function)?;
+        Ok(self.lookup(&digest).await?.is_some())
+    }
+
     /// Whether the store is over its cap.
     pub fn over_cap(&self) -> bool {
         match self.max_size_bytes {

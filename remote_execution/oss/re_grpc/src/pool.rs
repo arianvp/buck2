@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::env::VarError;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -176,12 +177,29 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
 
 /// Create a configured endpoint for the given address. The endpoint can be
 /// reused to create multiple channels without re-processing TLS config.
-fn create_endpoint(
-    config: &ChannelConfig,
-    address: &str,
-    tls: bool,
-) -> Result<tonic::transport::Endpoint, anyhow::Error> {
+/// Where a channel connects to. A Unix socket target (`unix:///path`) is always plaintext and
+/// never leaves the machine; its endpoint only carries the HTTP/2 settings.
+#[derive(Clone)]
+struct Target {
+    endpoint: tonic::transport::Endpoint,
+    unix_socket: Option<Arc<PathBuf>>,
+}
+
+fn create_target(config: &ChannelConfig, address: &str, tls: bool) -> anyhow::Result<Target> {
     let address = substitute_env_vars(address).context("Invalid address")?;
+    if let Some(path) = address.strip_prefix("unix://") {
+        if !cfg!(unix) {
+            return Err(anyhow::anyhow!(
+                "Unix socket addresses are not supported on this platform: `{address}`"
+            ));
+        }
+        // The URI is only used for the `:authority` header; the connector ignores it.
+        let endpoint = Channel::builder(Uri::from_static("http://unix.invalid/"));
+        return Ok(Target {
+            endpoint: with_keepalive(endpoint, config),
+            unix_socket: Some(Arc::new(PathBuf::from(path))),
+        });
+    }
     let uri = address.parse().context("Invalid address")?;
     let tls_config = if tls {
         config.tls_config.as_ref()
@@ -194,37 +212,135 @@ fn create_endpoint(
     if let Some(tls_config) = tls_config {
         endpoint = endpoint.tls_config(tls_config.clone())?;
     }
+    Ok(Target {
+        endpoint: with_keepalive(endpoint, config),
+        unix_socket: None,
+    })
+}
 
-    // Configure gRPC keepalive settings (always enabled with sensible defaults)
-    endpoint = endpoint
+/// Configure gRPC keepalive settings (always enabled with sensible defaults).
+fn with_keepalive(
+    endpoint: tonic::transport::Endpoint,
+    config: &ChannelConfig,
+) -> tonic::transport::Endpoint {
+    endpoint
         .http2_keep_alive_interval(Duration::from_secs(
             config.grpc_keepalive_time_secs.unwrap_or(30),
         ))
         .keep_alive_timeout(Duration::from_secs(
             config.grpc_keepalive_timeout_secs.unwrap_or(10),
         ))
-        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true));
-
-    Ok(endpoint)
+        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true))
 }
 
-/// Create a lazy channel from an endpoint.
-fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
-    // Since we are creating the HttpConnector ourselves, any TCP
-    // settings (tcp_nodelay, tcp_keepalive, connect_timeout), need to
-    // be set here instead of on the endpoint
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    let connector = CountingConnector::new(http);
-
-    // We need to use a lazy channel so the pool isn't blocked waiting for new
-    // connection IO
-    endpoint.connect_with_connector_lazy(connector)
+/// Create a lazy channel to a target. Lazy, so the pool isn't blocked waiting for connection IO.
+fn channel_for(target: &Target) -> Channel {
+    match &target.unix_socket {
+        Some(path) => target
+            .endpoint
+            .connect_with_connector_lazy(CountingConnector::new(unix::UnixConnector::new(
+                Arc::clone(path),
+            ))),
+        None => {
+            // Since we are creating the HttpConnector ourselves, any TCP
+            // settings (tcp_nodelay, tcp_keepalive, connect_timeout), need to
+            // be set here instead of on the endpoint
+            let mut http = HttpConnector::new();
+            http.enforce_http(false);
+            target
+                .endpoint
+                .connect_with_connector_lazy(CountingConnector::new(http))
+        }
+    }
 }
 
 pub fn create_channel(config: &ChannelConfig, address: &str) -> Result<Channel, anyhow::Error> {
-    let endpoint = create_endpoint(config, address, true)?;
-    Ok(channel_from_endpoint(&endpoint))
+    let target = create_target(config, address, true)?;
+    Ok(channel_for(&target))
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Uri;
+    use tower::Service;
+
+    /// Dials one Unix socket, whatever URI it is asked for.
+    #[derive(Clone)]
+    pub struct UnixConnector {
+        path: Arc<PathBuf>,
+    }
+
+    impl UnixConnector {
+        pub fn new(path: Arc<PathBuf>) -> Self {
+            Self { path }
+        }
+    }
+
+    impl Service<Uri> for UnixConnector {
+        type Response = TokioIo<tokio::net::UnixStream>;
+        type Error = std::io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            let path = Arc::clone(&self.path);
+            Box::pin(
+                async move { Ok(TokioIo::new(tokio::net::UnixStream::connect(&*path).await?)) },
+            )
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod unix {
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Uri;
+    use tower::Service;
+
+    /// Never dialed off Unix: `create_target` rejects `unix://` addresses there.
+    #[derive(Clone)]
+    pub struct UnixConnector;
+
+    impl UnixConnector {
+        pub fn new(_path: Arc<PathBuf>) -> Self {
+            Self
+        }
+    }
+
+    impl Service<Uri> for UnixConnector {
+        type Response = TokioIo<tokio::net::TcpStream>;
+        type Error = std::io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            Box::pin(async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Unix sockets are not supported on this platform",
+                ))
+            })
+        }
+    }
 }
 
 /// A response body wrapper that holds a semaphore permit until the body is fully consumed or dropped.
@@ -366,21 +482,21 @@ impl HostPoolInner {
 /// Pool of channels for a single host
 struct HostPool {
     inner: Mutex<HostPoolInner>,
-    endpoint: tonic::transport::Endpoint,
+    target: Target,
     max_connections: usize,
     max_concurrency_per_connection: usize,
 }
 
 impl HostPool {
     fn new(
-        endpoint: tonic::transport::Endpoint,
+        target: Target,
         min_connections: usize,
         max_connections: usize,
         max_concurrency_per_connection: usize,
     ) -> Self {
         let channel_states: Vec<_> = (0..min_connections)
             .map(|_| {
-                let channel = channel_from_endpoint(&endpoint);
+                let channel = channel_for(&target);
                 PooledChannelState::new(channel, max_concurrency_per_connection)
             })
             .collect();
@@ -390,7 +506,7 @@ impl HostPool {
                 channels: channel_states,
                 next_index: 0,
             }),
-            endpoint,
+            target,
             max_connections,
             max_concurrency_per_connection,
         }
@@ -416,7 +532,7 @@ impl HostPool {
 
         // All channels at capacity - create new if allowed
         if num_channels < self.max_connections {
-            let channel = channel_from_endpoint(&self.endpoint);
+            let channel = channel_for(&self.target);
             let state = PooledChannelState::new(channel, self.max_concurrency_per_connection);
             let pooled = PooledChannel::new(state.channel.clone(), state.semaphore.clone());
             inner.channels.push(state);
@@ -456,9 +572,9 @@ impl ChannelPool {
     }
 
     /// Get a pooled channel for the given address without TLS, whatever the pool's TLS
-    /// configuration. Used for the machine-local CAS daemon on loopback, which must stay
-    /// reachable when the remote services require TLS. An address is either always plaintext or
-    /// never, so the cache key remains the address alone.
+    /// configuration. Used for the machine-local CAS daemon (a Unix socket or a loopback port),
+    /// which must stay reachable when the remote services require TLS. An address is either
+    /// always plaintext or never, so the cache key remains the address alone.
     pub async fn get_plaintext(&self, address: &str) -> anyhow::Result<PooledChannel> {
         self.get_impl(address, false).await
     }
@@ -472,10 +588,10 @@ impl ChannelPool {
             match pools.entry(address.to_owned()) {
                 Entry::Occupied(e) => Arc::clone(e.get()),
                 Entry::Vacant(e) => {
-                    let endpoint = create_endpoint(&self.channel_config, address, tls)
+                    let target = create_target(&self.channel_config, address, tls)
                         .with_context(|| format!("Failed to create endpoint for {}", address))?;
                     let host_pool = HostPool::new(
-                        endpoint,
+                        target,
                         self.config.min_connections,
                         self.config.max_connections,
                         self.config.max_concurrency_per_connection,

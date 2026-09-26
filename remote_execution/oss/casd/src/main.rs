@@ -8,11 +8,11 @@
  * above-listed licenses.
  */
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use buck2_casd::Config;
+use buck2_casd::Listen;
 use buck2_casd::digest::DigestFunction;
 use buck2_casd::upstream::UpstreamConfig;
 use clap::Parser;
@@ -28,9 +28,10 @@ struct Args {
     #[arg(long)]
     dir: PathBuf,
 
-    /// Address to listen on. Give the port to buck2 as `[buck2_re_client] cas_shared_cache_address`.
-    #[arg(long, default_value = "127.0.0.1:9092")]
-    listen: SocketAddr,
+    /// Where to listen: `unix://<path>` or a loopback port. Defaults to `buck2-casd.sock` inside
+    /// `--dir`, which is where buck2 looks unless `cas_shared_cache_address` says otherwise.
+    #[arg(long)]
+    listen: Option<Listen>,
 
     /// Hash function blobs are addressed by; must match `[buck2] digest_algorithms`.
     #[arg(long, default_value = "sha256")]
@@ -61,8 +62,14 @@ struct Args {
     #[arg(long)]
     upstream_tls_client_cert: Option<String>,
 
-    /// `Header: value` to add to every upstream request. Repeatable.
-    #[arg(long = "upstream-http-header")]
+    /// `Header: value` to add to every upstream request. Repeatable. Can also be given as a
+    /// comma-separated list in `BUCK2_CASD_UPSTREAM_HTTP_HEADERS`, which keeps secrets out of
+    /// the process's command line.
+    #[arg(
+        long = "upstream-http-header",
+        env = "BUCK2_CASD_UPSTREAM_HTTP_HEADERS",
+        value_delimiter = ','
+    )]
     upstream_http_headers: Vec<String>,
 
     /// Instance name for upstream requests.
@@ -88,9 +95,12 @@ async fn main() -> anyhow::Result<()> {
         http_headers: args.upstream_http_headers,
         instance_name: args.upstream_instance_name,
     });
+    let listen = args
+        .listen
+        .unwrap_or_else(|| Listen::default_for(&args.dir));
     let running = buck2_casd::start(Config {
         dir: args.dir,
-        listen: args.listen,
+        listen,
         digest_function: args.digest_function,
         max_size_bytes: args.max_size_bytes,
         upstream,

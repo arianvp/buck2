@@ -96,6 +96,7 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
+use crate::casd_autostart::DaemonAddress;
 use crate::error::*;
 use crate::metadata::*;
 use crate::pool::ChannelConfig;
@@ -319,9 +320,25 @@ impl REClientBuilder {
         };
 
         // Extract addresses. CAS traffic goes to the machine-local CAS daemon when one is
-        // configured; it is on loopback and never uses TLS.
-        let (cas_address, cas_plaintext) = match &opts.cas_shared_cache_address {
-            Some(address) => (shared_cache_address_url(address)?, true),
+        // configured; it is a Unix socket or a loopback port and never uses TLS.
+        let shared_cache_dir = match &opts.cas_shared_cache {
+            Some(path) => Some(PathBuf::from(
+                substitute_env_vars(path).context("Invalid `cas_shared_cache`")?,
+            )),
+            None => None,
+        };
+        let daemon_address =
+            if shared_cache_dir.is_some() || opts.cas_shared_cache_address.is_some() {
+                Some(DaemonAddress::resolve(
+                    opts.cas_shared_cache_address.as_ref(),
+                    shared_cache_dir.as_deref(),
+                    substitute_env_vars,
+                )?)
+            } else {
+                None
+            };
+        let (cas_address, cas_plaintext) = match &daemon_address {
+            Some(address) => (address.pool_address(), true),
             None => (opts.cas_address.clone().context("No CAS address")?, false),
         };
         let action_cache_address = opts
@@ -339,18 +356,24 @@ impl REClientBuilder {
         };
         let pool = ChannelPool::new(pool_config, channel_config);
 
-        let shared_cache = match &opts.cas_shared_cache {
-            Some(path) if !matches!(opts.cas_shared_cache_mode, Some(CASdMode::Remote)) => {
-                let path = substitute_env_vars(path)?;
-                Some(
-                    SharedCasCache::new(
-                        PathBuf::from(path),
-                        opts.cas_shared_cache_copy_policy
-                            .unwrap_or(CopyPolicy::Hybrid),
-                    )
-                    .context("Error opening the shared CAS cache directory")?,
+        if let (Some(address), Some(dir), true) = (
+            &daemon_address,
+            &shared_cache_dir,
+            opts.cas_shared_cache_autostart.unwrap_or(true),
+        ) {
+            crate::casd_autostart::ensure_running(opts, address, dir, substitute_env_vars)
+                .await
+                .context("Error auto-starting buck2-casd")?;
+        }
+        let shared_cache = match shared_cache_dir {
+            Some(dir) if !matches!(opts.cas_shared_cache_mode, Some(CASdMode::Remote)) => Some(
+                SharedCasCache::new(
+                    dir,
+                    opts.cas_shared_cache_copy_policy
+                        .unwrap_or(CopyPolicy::Hybrid),
                 )
-            }
+                .context("Error opening the shared CAS cache directory")?,
+            ),
             _ => None,
         };
 
@@ -1690,21 +1713,6 @@ async fn warm_shared_cache<Byt, BytRet>(
         }
     }))
     .await;
-}
-
-/// Turns the `cas_shared_cache_address` setting into a gRPC address.
-fn shared_cache_address_url(address: &str) -> anyhow::Result<String> {
-    let address = address.trim();
-    if let Ok(port) = address.parse::<u16>() {
-        return Ok(format!("grpc://127.0.0.1:{port}"));
-    }
-    if address.starts_with("unix://") {
-        return Err(anyhow::anyhow!(
-            "`cas_shared_cache_address = {address}`: Unix sockets are not supported by the \
-             open-source client; run buck2-casd on a loopback TCP port instead"
-        ));
-    }
-    Ok(address.to_owned())
 }
 
 async fn upload_impl<Byt, Cas>(
@@ -3375,23 +3383,6 @@ mod tests {
         assert_eq!(daemon.reads.load(Ordering::Relaxed), 0);
         assert_eq!(response.local_cache_stats.total_cache_lookup_attempts, 0);
         Ok(())
-    }
-
-    #[test]
-    fn test_shared_cache_address_url() {
-        assert_eq!(
-            shared_cache_address_url("9092").unwrap(),
-            "grpc://127.0.0.1:9092"
-        );
-        assert_eq!(
-            shared_cache_address_url(" 9092 ").unwrap(),
-            "grpc://127.0.0.1:9092"
-        );
-        assert_eq!(
-            shared_cache_address_url("grpc://casd.local:9092").unwrap(),
-            "grpc://casd.local:9092"
-        );
-        assert!(shared_cache_address_url("unix:///run/casd.sock").is_err());
     }
 
     #[test]

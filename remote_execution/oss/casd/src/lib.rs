@@ -21,8 +21,10 @@ pub mod server;
 pub mod store;
 pub mod upstream;
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,12 +44,70 @@ use crate::upstream::UpstreamConfig;
 /// gRPC message size limit. Batch payloads are capped well below this.
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// Written into the store directory: the daemon's pid on the first line, its address on the
+/// second.
+pub const PID_FILE_NAME: &str = "buck2-casd.pid";
+/// The socket inside the store directory that the daemon listens on by default.
+pub const DEFAULT_SOCKET_NAME: &str = "buck2-casd.sock";
+
+/// Where the daemon listens. It never listens anywhere other than this machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Listen {
+    /// A Unix socket; the default is `buck2-casd.sock` inside the store directory.
+    Unix(PathBuf),
+    /// A loopback TCP port. Port 0 picks a free one; see [`Running::address`].
+    Loopback(u16),
+}
+
+impl Listen {
+    pub fn default_for(dir: &std::path::Path) -> Self {
+        Self::Unix(dir.join(DEFAULT_SOCKET_NAME))
+    }
+}
+
+impl FromStr for Listen {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = s.strip_prefix("unix://") {
+            return Ok(Self::Unix(PathBuf::from(path)));
+        }
+        if let Ok(port) = s.parse::<u16>() {
+            return Ok(Self::Loopback(port));
+        }
+        let addr: SocketAddr = s.parse().with_context(|| {
+            format!("`{s}` is not `unix://<path>`, a port, or `127.0.0.1:<port>`")
+        })?;
+        if !addr.ip().is_loopback() {
+            return Err(anyhow::anyhow!(
+                "`{s}` is not a loopback address; buck2-casd only serves this machine"
+            ));
+        }
+        Ok(Self::Loopback(addr.port()))
+    }
+}
+
+/// The address a daemon is reachable at, in the form the buck2 client accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    Unix(PathBuf),
+    Loopback(SocketAddr),
+}
+
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix(path) => write!(f, "unix://{}", path.display()),
+            Self::Loopback(addr) => write!(f, "grpc://{addr}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Root of the store. Buck2 daemons are given this same path as `cas_shared_cache`.
     pub dir: PathBuf,
-    /// Address to serve on. Port 0 picks a free port; see [`Running::local_addr`].
-    pub listen: SocketAddr,
+    pub listen: Listen,
     pub digest_function: DigestFunction,
     /// Size cap for the store; `None` never evicts.
     pub max_size_bytes: Option<u64>,
@@ -59,7 +119,7 @@ pub struct Config {
 
 /// A running daemon.
 pub struct Running {
-    pub local_addr: SocketAddr,
+    pub address: Address,
     pub store: Arc<Store>,
     shutdown: Option<oneshot::Sender<()>>,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
@@ -110,11 +170,12 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
     };
     let cas = Cas::new(Arc::clone(&store), upstream);
 
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("Error binding `{}`", config.listen))?;
-    let local_addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let (address, incoming) = bind(&config.listen).await?;
+
+    // For operators and for whoever auto-started us: which process serves this directory.
+    let pid_file = config.dir.join(PID_FILE_NAME);
+    std::fs::write(&pid_file, format!("{}\n{}\n", std::process::id(), address))
+        .with_context(|| format!("Error writing `{}`", pid_file.display()))?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let router = tonic::transport::Server::builder()
@@ -147,7 +208,7 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
     });
 
     tracing::info!(
-        "buck2-casd serving on {local_addr}, store `{}`, upstream {}",
+        "buck2-casd serving at {address}, store `{}`, upstream {}",
         config.dir.display(),
         config
             .upstream
@@ -155,10 +216,122 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
             .map_or("none (standalone)".to_owned(), |u| u.address.clone())
     );
     Ok(Running {
-        local_addr,
+        address,
         store,
         shutdown: Some(shutdown_tx),
         server,
         evictor,
     })
+}
+
+/// One accepted connection, of either kind.
+type Incoming =
+    std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Connection>> + Send + 'static>>;
+
+/// A connection from either listener; tonic needs one concrete type per server.
+#[derive(Debug)]
+pub enum Connection {
+    Tcp(tokio::net::TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl tonic::transport::server::Connected for Connection {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl tokio::io::AsyncRead for Connection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Connection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            Self::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            Self::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn bind(listen: &Listen) -> anyhow::Result<(Address, Incoming)> {
+    use futures::StreamExt;
+    match listen {
+        Listen::Loopback(port) => {
+            let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), *port);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("Error binding `{addr}`"))?;
+            let address = Address::Loopback(listener.local_addr()?);
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+                .map(|c| c.map(Connection::Tcp));
+            Ok((address, Box::pin(incoming)))
+        }
+        #[cfg(unix)]
+        Listen::Unix(path) => {
+            // A socket file left by a dead daemon must be cleared; a live one must be respected.
+            if path.exists() {
+                if tokio::net::UnixStream::connect(path).await.is_ok() {
+                    return Err(anyhow::anyhow!(
+                        "Another buck2-casd is already listening at `{}`",
+                        path.display()
+                    ));
+                }
+                std::fs::remove_file(path)
+                    .with_context(|| format!("Error removing stale `{}`", path.display()))?;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Error creating `{}`", parent.display()))?;
+            }
+            let listener = tokio::net::UnixListener::bind(path)
+                .with_context(|| format!("Error binding `{}`", path.display()))?;
+            let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener)
+                .map(|c| c.map(Connection::Unix));
+            Ok((Address::Unix(path.clone()), Box::pin(incoming)))
+        }
+        #[cfg(not(unix))]
+        Listen::Unix(path) => Err(anyhow::anyhow!(
+            "Unix sockets are not supported on this platform (`{}`); use --listen <port>",
+            path.display()
+        )),
+    }
 }

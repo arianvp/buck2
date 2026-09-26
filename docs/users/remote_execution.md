@@ -57,41 +57,54 @@ of every blob they need. `buck2-casd`, a machine-local CAS daemon that ships
 with buck2, removes that duplication. It is the open-source counterpart of the
 shared CAS daemon buck2 uses at Meta and takes the same configuration keys.
 
-The daemon speaks the remote execution API's CAS and ByteStream services. Buck2
-sends all CAS traffic to it; it passes misses and uploads through to the real
-CAS and keeps every blob it has seen as a raw, read-only file in a directory it
-alone owns. Given that directory, buck2 materializes outputs by cloning those
+The daemon speaks the remote execution API's CAS and ByteStream services over a
+Unix socket inside its directory, and never listens anywhere off the machine.
+Buck2 sends all CAS traffic to it; it passes misses and uploads through to the
+real CAS and keeps every blob it has seen as a raw, read-only file in a
+directory it alone owns. Given that directory, buck2 materializes outputs by cloning those
 files instead of receiving bytes over gRPC. On btrfs, XFS and APFS the clone is
 a reflink, so the data exists once on disk however many daemons use it. One
 store, one downloader, one eviction policy, any number of isolation dirs.
 
-Run the daemon once per machine:
-
-```sh
-$ buck2-casd --dir /var/cache/buck2-casd \
-    --listen 127.0.0.1:9092 \
-    --upstream grpc://cas.example.com:443 --upstream-tls \
-    --max-size-bytes 53687091200 \
-    --digest-function sha256
-```
-
-Then point buck2 at it:
+Configure it in `.buckconfig` next to the other remote execution settings:
 
 ```ini
 [buck2_re_client]
 engine_address = grpc://re.example.com:443
 action_cache_address = grpc://re.example.com:443
+cas_address = grpc://cas.example.com:443
 tls = true
 cas_shared_cache = /var/cache/buck2-casd
-cas_shared_cache_address = 9092
+cas_shared_cache_max_size_bytes = 53687091200
+```
+
+Buck2 starts the daemon itself the first time nothing answers at
+`/var/cache/buck2-casd/buck2-casd.sock`, using the `buck2-casd` binary next to
+the `buck2` executable (or on `PATH`), and hands it the directory, the digest
+function from `[buck2] digest_algorithms`, the size cap, and the `cas_address`,
+TLS and instance name settings above as its upstream. HTTP headers are passed
+through the environment, not the command line. The daemon runs in its own
+session and outlives the buck2 daemon that started it; when several buck2
+daemons find it missing at once, a lock file in the directory makes one of them
+start it while the others wait for the socket. Its output goes to
+`buck2-casd.log` and its pid to `buck2-casd.pid`, both in the directory. To run
+it under a service manager instead, start it yourself and set
+`cas_shared_cache_autostart = false`:
+
+```sh
+$ buck2-casd --dir /var/cache/buck2-casd \
+    --upstream grpc://cas.example.com:443 --upstream-tls \
+    --max-size-bytes 53687091200 \
+    --digest-function sha256
 ```
 
 - `cas_shared_cache` - the daemon's `--dir`. Blobs found there are cloned into
   `buck-out`; buck2 never writes to it. Environment variables in `$VAR` form are
   substituted. Unset disables directory access.
-- `cas_shared_cache_address` - where the daemon listens, as a port number or a
-  `grpc://host:port` URL. When set, all CAS traffic goes to the daemon in place
-  of `cas_address`, without TLS, so the daemon must be on the same machine.
+- `cas_shared_cache_address` - only needed to move the daemon off its default
+  socket: `unix:///path/to/socket`, or a loopback TCP port number (the only
+  option on Windows, which has no Unix sockets). Whenever a daemon is
+  configured, all CAS traffic goes to it in place of `cas_address`, without TLS.
   Engine and action cache traffic still goes to the addresses configured for
   them.
 - `cas_shared_cache_copy_policy` - how blobs are cloned out of the directory.
@@ -100,6 +113,12 @@ cas_shared_cache_address = 9092
 - `cas_shared_cache_mode` - `local_without_sync` (the default) clones from the
   directory and only fetches over gRPC when the daemon does not have a blob yet;
   `remote` never reads the directory and only talks gRPC to the daemon.
+- `cas_shared_cache_autostart` - start the daemon on demand (the default).
+- `cas_shared_cache_binary` - the `buck2-casd` executable to start, if it is not
+  next to `buck2` or on `PATH`. Environment variables in `$VAR` form are
+  substituted.
+- `cas_shared_cache_max_size_bytes` - the size cap given to an auto-started
+  daemon. Unset means it never evicts.
 
 On a miss buck2 asks the daemon for the first byte of the blob, which makes the
 daemon fetch and store all of it, and then clones it from the directory, so
@@ -120,7 +139,7 @@ too, so a second buck2 daemon that gets an action cache hit for the same action
 clones the outputs without a download. The daemon verifies the hash of every
 blob it stores, whether it came from a client or from upstream.
 
-Eviction is the daemon's job. With `--max-size-bytes` it removes least recently
+Eviction is the daemon's job. With a size cap it removes least recently
 used blobs in the background once the store exceeds the cap; a clone by buck2
 counts as a use. Sizes are nominal: a blob reflinked into a `buck-out` shares
 its extents with that clone, and removing it from the store frees the space
