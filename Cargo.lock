@@ -1192,6 +1192,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_casd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "blake3",
+ "buck2_re_configuration",
+ "clap",
+ "futures 0.3.34",
+ "hex",
+ "re_grpc_proto",
+ "remote_execution",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util 0.7.19",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "buck2_certs"
 version = "0.1.0"
 dependencies = [
@@ -7527,6 +7552,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "lru",
  "prost",
  "prost-types",

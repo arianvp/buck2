@@ -9,10 +9,13 @@
  */
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -28,6 +31,8 @@ use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
+use buck2_re_configuration::CASdMode;
+use buck2_re_configuration::CopyPolicy;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
 use futures::Stream;
@@ -91,6 +96,7 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
 
+use crate::casd_autostart::DaemonAddress;
 use crate::error::*;
 use crate::metadata::*;
 use crate::pool::ChannelConfig;
@@ -100,6 +106,8 @@ use crate::pool::PooledChannel;
 use crate::pool::create_channel;
 use crate::request::*;
 use crate::response::*;
+use crate::shared_cache::SharedCacheCounters;
+use crate::shared_cache::SharedCasCache;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 
@@ -311,8 +319,28 @@ impl REClientBuilder {
             None
         };
 
-        // Extract addresses
-        let cas_address = opts.cas_address.clone().context("No CAS address")?;
+        // Extract addresses. CAS traffic goes to the machine-local CAS daemon when one is
+        // configured; it is a Unix socket or a loopback port and never uses TLS.
+        let shared_cache_dir = match &opts.cas_shared_cache {
+            Some(path) => Some(PathBuf::from(
+                substitute_env_vars(path).context("Invalid `cas_shared_cache`")?,
+            )),
+            None => None,
+        };
+        let daemon_address =
+            if shared_cache_dir.is_some() || opts.cas_shared_cache_address.is_some() {
+                Some(DaemonAddress::resolve(
+                    opts.cas_shared_cache_address.as_ref(),
+                    shared_cache_dir.as_deref(),
+                    substitute_env_vars,
+                )?)
+            } else {
+                None
+            };
+        let (cas_address, cas_plaintext) = match &daemon_address {
+            Some(address) => (address.pool_address(), true),
+            None => (opts.cas_address.clone().context("No CAS address")?, false),
+        };
         let action_cache_address = opts
             .action_cache_address
             .clone()
@@ -327,6 +355,34 @@ impl REClientBuilder {
             max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
         };
         let pool = ChannelPool::new(pool_config, channel_config);
+
+        let mut daemon_restart = None;
+        if let (Some(address), Some(dir), true) = (
+            &daemon_address,
+            &shared_cache_dir,
+            opts.cas_shared_cache_autostart.unwrap_or(true),
+        ) {
+            crate::casd_autostart::ensure_running(opts, address, dir, substitute_env_vars)
+                .await
+                .context("Error auto-starting buck2-casd")?;
+            daemon_restart = Some(Arc::new(DaemonRestart {
+                opts: opts.clone(),
+                address: address.clone(),
+                dir: dir.clone(),
+                last_confirmed: Mutex::new(Instant::now()),
+            }));
+        }
+        let shared_cache = match shared_cache_dir {
+            Some(dir) if !matches!(opts.cas_shared_cache_mode, Some(CASdMode::Remote)) => Some(
+                SharedCasCache::new(
+                    dir,
+                    opts.cas_shared_cache_copy_policy
+                        .unwrap_or(CopyPolicy::Hybrid),
+                )
+                .context("Error opening the shared CAS cache directory")?,
+            ),
+            _ => None,
+        };
 
         Ok(REClient::new(
             RERuntimeOpts {
@@ -344,8 +400,11 @@ impl REClientBuilder {
             max_decoding_msg_size,
             interceptor,
             cas_address,
+            cas_plaintext,
+            daemon_restart,
             engine_address.clone(),
             action_cache_address,
+            shared_cache,
         ))
     }
 
@@ -490,9 +549,27 @@ pub struct REClient {
     max_decoding_msg_size: usize,
     interceptor: InjectHeadersInterceptor,
     cas_address: String,
+    /// Whether `cas_address` is the machine-local CAS daemon, reached without TLS.
+    cas_plaintext: bool,
+    /// How to bring the machine-local CAS daemon back if it disappears while this client lives
+    /// (it crashed, `buck2 killall` stopped it, or its directory was removed).
+    daemon_restart: Option<Arc<DaemonRestart>>,
     engine_address: String,
     action_cache_address: String,
+    shared_cache: Option<SharedCasCache>,
 }
+
+struct DaemonRestart {
+    opts: Buck2OssReConfiguration,
+    address: DaemonAddress,
+    dir: PathBuf,
+    /// When the daemon was last confirmed to answer, so that a live client notices a daemon
+    /// that died without cleaning up (SIGKILL, a crash) without probing on every call.
+    last_confirmed: Mutex<Instant>,
+}
+
+/// How often a live client re-checks that the daemon still answers.
+const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl Drop for REClient {
     fn drop(&mut self) {
@@ -663,8 +740,11 @@ impl REClient {
         max_decoding_msg_size: usize,
         interceptor: InjectHeadersInterceptor,
         cas_address: String,
+        cas_plaintext: bool,
+        daemon_restart: Option<Arc<DaemonRestart>>,
         engine_address: String,
         action_cache_address: String,
+        shared_cache: Option<SharedCasCache>,
     ) -> Self {
         REClient {
             runtime_opts,
@@ -680,8 +760,11 @@ impl REClient {
             max_decoding_msg_size,
             interceptor,
             cas_address,
+            cas_plaintext,
+            daemon_restart,
             engine_address,
             action_cache_address,
+            shared_cache,
         }
     }
 
@@ -949,6 +1032,7 @@ impl REClient {
             request,
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
+            self.shared_cache.as_ref(),
             |re_request| async move {
                 let resp = self
                     .cas_client()
@@ -1084,8 +1168,37 @@ impl REClient {
         self
     }
 
+    async fn cas_channel(&self) -> anyhow::Result<PooledChannel> {
+        if self.cas_plaintext {
+            // A daemon that exited cleanly takes its socket file with it, which one stat per
+            // call notices at once. One killed outright (`buck2 killall`, a crash) leaves the
+            // file behind, so every few seconds the daemon is also asked to answer. Either way
+            // the same start logic runs, and the lazily reconnecting channel then finds the
+            // successor at the same path.
+            if let Some(restart) = &self.daemon_restart {
+                let socket_missing =
+                    matches!(&restart.address, DaemonAddress::Unix(path) if !path.exists());
+                let due = restart.last_confirmed.lock().unwrap().elapsed() >= DAEMON_PROBE_INTERVAL;
+                if socket_missing || due {
+                    crate::casd_autostart::ensure_running(
+                        &restart.opts,
+                        &restart.address,
+                        &restart.dir,
+                        substitute_env_vars,
+                    )
+                    .await
+                    .context("Error restarting buck2-casd")?;
+                    *restart.last_confirmed.lock().unwrap() = Instant::now();
+                }
+            }
+            self.pool.get_plaintext(&self.cas_address).await
+        } else {
+            self.pool.get(&self.cas_address).await
+        }
+    }
+
     async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
+        let channel = self.cas_channel().await?;
         Ok(
             ContentAddressableStorageClient::new(InterceptedService::new(
                 channel,
@@ -1096,7 +1209,7 @@ impl REClient {
     }
 
     async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
+        let channel = self.cas_channel().await?;
         Ok(
             ByteStreamClient::new(InterceptedService::new(channel, self.interceptor.dupe()))
                 .max_decoding_message_size(self.max_decoding_msg_size),
@@ -1318,6 +1431,7 @@ async fn download_impl<Byt, BytRet, Cas>(
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
+    shared_cache: Option<&SharedCasCache>,
     cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
@@ -1349,6 +1463,7 @@ where
         }
     }
 
+    let raw_bystream_fut = bystream_fut;
     let bystream_fut = |digest: TDigest| async move {
         let resource_name = resource_name(instance_name, bystream_compressor, &digest);
 
@@ -1388,7 +1503,22 @@ where
     };
 
     let inlined_digests = request.inlined_digests.unwrap_or_default();
-    let file_digests = request.file_digests.unwrap_or_default();
+    let counters = SharedCacheCounters::default();
+    // Clone whatever the daemon's directory already has, then have the daemon fetch the rest and
+    // clone that too. Only what is still not there is received over gRPC below.
+    let file_digests = match shared_cache {
+        Some(cache) => {
+            let (_, misses) = materialize_from_shared_cache(
+                cache,
+                request.file_digests.unwrap_or_default(),
+                Some(&counters),
+            )
+            .await;
+            warm_shared_cache(instance_name, raw_bystream_fut, &misses).await;
+            materialize_from_shared_cache(cache, misses, None).await.1
+        }
+        None => request.file_digests.unwrap_or_default(),
+    };
 
     let mut curr_size = 0;
     let mut requests = vec![];
@@ -1526,8 +1656,109 @@ where
     Ok(DownloadResponse {
         inlined_blobs: Some(inlined_blobs),
         directories: None,
-        local_cache_stats: Default::default(),
+        local_cache_stats: counters.take_stats(),
     })
+}
+
+/// Clones every file the daemon's directory can serve and returns `(hits, misses)`. With
+/// `counters`, records each file as a hit or a miss.
+///
+/// A directory that fails to serve a blob is treated as a miss: the blob is then received over
+/// gRPC, which surfaces any persistent problem with the directory without failing the build.
+async fn materialize_from_shared_cache(
+    cache: &SharedCasCache,
+    files: Vec<NamedDigestWithPermissions>,
+    counters: Option<&SharedCacheCounters>,
+) -> (
+    Vec<NamedDigestWithPermissions>,
+    Vec<NamedDigestWithPermissions>,
+) {
+    let outcomes = futures::future::join_all(files.into_iter().map(|req| async move {
+        let digest = &req.named_digest.digest;
+        if digest.size_in_bytes == 0 {
+            return (req, false);
+        }
+        let hit = match cache
+            .materialize(digest, Path::new(&req.named_digest.name), req.is_executable)
+            .await
+        {
+            Ok(hit) => hit,
+            Err(e) => {
+                tracing::warn!(
+                    "Shared CAS cache failed to clone `{}` to `{}`, downloading instead: {:#}",
+                    digest,
+                    req.named_digest.name,
+                    e
+                );
+                false
+            }
+        };
+        (req, hit)
+    }))
+    .await;
+
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    for (req, hit) in outcomes {
+        // Empty files are written directly and never involve the directory.
+        if let Some(counters) = counters.filter(|_| req.named_digest.digest.size_in_bytes > 0) {
+            if hit {
+                counters.hit(req.named_digest.digest.size_in_bytes);
+            } else {
+                counters.miss(req.named_digest.digest.size_in_bytes);
+            }
+        }
+        if hit {
+            hits.push(req);
+        } else {
+            misses.push(req);
+        }
+    }
+    (hits, misses)
+}
+
+/// Asks the daemon for the first byte of each distinct blob in `files`. Serving that read makes
+/// the daemon fetch and store the whole blob, after which it can be cloned from its directory.
+/// Failures are ignored here; the ordinary download that follows reports them properly.
+async fn warm_shared_cache<Byt, BytRet>(
+    instance_name: &InstanceName,
+    bystream_fut: impl Fn(ReadRequest) -> Byt + Copy,
+    files: &[NamedDigestWithPermissions],
+) where
+    Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
+    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
+{
+    let mut seen = HashSet::new();
+    let distinct: Vec<&TDigest> = files
+        .iter()
+        .map(|req| &req.named_digest.digest)
+        .filter(|d| d.size_in_bytes > 0 && seen.insert((*d).clone()))
+        .collect();
+    futures::future::join_all(distinct.into_iter().map(|digest| async move {
+        let resource_name = format!(
+            "{}blobs/{}/{}",
+            instance_name.as_resource_prefix(),
+            digest.hash,
+            digest.size_in_bytes
+        );
+        let result = async {
+            let mut stream = bystream_fut(ReadRequest {
+                resource_name,
+                read_offset: 0,
+                read_limit: 1,
+            })
+            .await?;
+            while let Some(item) = stream.next().await {
+                item?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::debug!("Warming the shared CAS cache for `{digest}` failed: {e:#}");
+        }
+    }))
+    .await;
 }
 
 async fn upload_impl<Byt, Cas>(
@@ -1949,6 +2180,7 @@ mod tests {
             req,
             None,
             10000,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2056,6 +2288,7 @@ mod tests {
             req,
             None,
             10, // kept small to simulate a large file download
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2138,6 +2371,7 @@ mod tests {
             req,
             None,
             100000,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2225,6 +2459,7 @@ mod tests {
             req,
             None,
             7,
+            None,
             |req| {
                 counter.fetch_add(1, Ordering::Relaxed);
                 let res = BatchReadBlobsResponse {
@@ -2294,6 +2529,7 @@ mod tests {
             req,
             None,
             10, // intentionally small value to keep data in the test blobs small
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2350,6 +2586,7 @@ mod tests {
             req,
             None,
             100000,
+            None,
             |req| {
                 let res = res.clone();
                 async move {
@@ -2389,6 +2626,7 @@ mod tests {
             req,
             None,
             0,
+            None,
             |_req| async { panic!("not called") },
             |req| async move {
                 assert_eq!(req.resource_name, "instance/blobs/aa/0");
@@ -2927,6 +3165,272 @@ mod tests {
         Ok(())
     }
 
+    fn named(path: &str, digest: &TDigest, is_executable: bool) -> NamedDigestWithPermissions {
+        NamedDigestWithPermissions {
+            named_digest: NamedDigest {
+                name: path.to_owned(),
+                digest: digest.clone(),
+                ..Default::default()
+            },
+            is_executable,
+            ..Default::default()
+        }
+    }
+
+    fn tdigest(hash: &str, size: i64) -> TDigest {
+        TDigest {
+            hash: hash.to_owned(),
+            size_in_bytes: size,
+            ..Default::default()
+        }
+    }
+
+    /// The part of buck2-casd this code relies on: serving any read of a blob, even a one-byte
+    /// one, publishes the whole blob into the directory first.
+    struct FakeDaemon {
+        root: PathBuf,
+        blobs: HashMap<String, Vec<u8>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeDaemon {
+        fn new(work: &tempfile::TempDir, blobs: &[(&TDigest, &[u8])]) -> Self {
+            Self {
+                root: crate::shared_cache::tests::fake_daemon_dir(work.path()),
+                blobs: blobs
+                    .iter()
+                    .map(|(d, data)| (d.hash.clone(), data.to_vec()))
+                    .collect(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn cache(&self) -> SharedCasCache {
+            SharedCasCache::new(self.root.clone(), CopyPolicy::Hybrid).unwrap()
+        }
+
+        fn serve(
+            &self,
+            req: ReadRequest,
+        ) -> anyhow::Result<
+            Pin<
+                Box<futures::stream::Iter<std::vec::IntoIter<Result<ReadResponse, tonic::Status>>>>,
+            >,
+        > {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let parts: Vec<&str> = req.resource_name.split('/').collect();
+            assert_eq!(parts[parts.len() - 3], "blobs", "{}", req.resource_name);
+            let hash = parts[parts.len() - 2];
+            let size: i64 = parts[parts.len() - 1].parse()?;
+            let data = self
+                .blobs
+                .get(hash)
+                .with_context(|| format!("fake daemon has no blob {hash}"))?;
+            crate::shared_cache::tests::publish(&self.root, &tdigest(hash, size), data);
+            let limit = if req.read_limit > 0 {
+                req.read_limit as usize
+            } else {
+                data.len()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(ReadResponse {
+                data: data[..limit.min(data.len())].to_vec(),
+            })])))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_shared_cache_hit() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+        let digest1 = tdigest("aa", 3);
+        let digest2 = tdigest("bb", 3);
+        let daemon = FakeDaemon::new(&work, &[]);
+        crate::shared_cache::tests::publish(&daemon.root, &digest1, &[1, 2, 3]);
+        crate::shared_cache::tests::publish(&daemon.root, &digest2, &[4, 5, 6]);
+        let cache = daemon.cache();
+        let daemon = &daemon;
+        let upstream_calls = std::sync::atomic::AtomicUsize::new(0);
+        let upstream_calls = &upstream_calls;
+
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![
+                    named(&path("one"), &digest1, true),
+                    named(&path("two"), &digest2, false),
+                    named(&path("three"), &digest2, false),
+                ]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| async move {
+                upstream_calls.fetch_add(1, Ordering::Relaxed);
+                anyhow::Ok(BatchReadBlobsResponse::default())
+            },
+            |req| async move { daemon.serve(req) },
+        )
+        .await?;
+
+        assert_eq!(
+            upstream_calls.load(Ordering::Relaxed),
+            0,
+            "nothing to fetch"
+        );
+        assert_eq!(daemon.reads.load(Ordering::Relaxed), 0, "nothing to warm");
+        assert_eq!(response.local_cache_stats.hits_files, 3);
+        assert_eq!(response.local_cache_stats.hits_bytes, 9);
+        assert_eq!(response.local_cache_stats.misses_files, 0);
+        assert_eq!(tokio::fs::read(path("one")).await?, vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(path("two")).await?, vec![4, 5, 6]);
+        assert_eq!(tokio::fs::read(path("three")).await?, vec![4, 5, 6]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |name: &str| std::fs::metadata(path(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("one"), 0o755);
+            assert_eq!(mode("two"), 0o644);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_shared_cache_miss_warms_daemon_then_clones() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = |name: &str| work.path().join(name).to_str().unwrap().to_owned();
+        let digest1 = tdigest("aa", 3);
+        let digest2 = tdigest("bb", 3);
+        let daemon = FakeDaemon::new(&work, &[(&digest1, &[1, 2, 3]), (&digest2, &[4, 5, 6])]);
+        let cache = daemon.cache();
+        let daemon = &daemon;
+        let upstream_calls = std::sync::atomic::AtomicUsize::new(0);
+        let upstream_calls = &upstream_calls;
+
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![
+                    named(&path("one"), &digest1, false),
+                    named(&path("two"), &digest1, true),
+                    named(&path("three"), &digest2, false),
+                ]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| async move {
+                upstream_calls.fetch_add(1, Ordering::Relaxed);
+                anyhow::Ok(BatchReadBlobsResponse::default())
+            },
+            |req| async move { daemon.serve(req) },
+        )
+        .await?;
+
+        assert_eq!(
+            daemon.reads.load(Ordering::Relaxed),
+            2,
+            "one warm-up per distinct digest"
+        );
+        assert_eq!(
+            upstream_calls.load(Ordering::Relaxed),
+            0,
+            "everything came from the directory"
+        );
+        assert_eq!(response.local_cache_stats.hits_files, 0);
+        assert_eq!(response.local_cache_stats.misses_files, 3);
+        assert_eq!(response.local_cache_stats.misses_bytes, 9);
+        assert_eq!(tokio::fs::read(path("one")).await?, vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(path("two")).await?, vec![1, 2, 3]);
+        assert_eq!(tokio::fs::read(path("three")).await?, vec![4, 5, 6]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |name: &str| std::fs::metadata(path(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("one"), 0o644);
+            assert_eq!(mode("two"), 0o755);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_shared_cache_falls_back_to_grpc() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("out").to_str().unwrap().to_owned();
+        let digest = tdigest("cc", 2);
+        // The daemon's directory never gets this blob (say, it was evicted at once).
+        let daemon = FakeDaemon::new(&work, &[]);
+        let cache = daemon.cache();
+        let daemon = &daemon;
+        let res = BatchReadBlobsResponse {
+            responses: vec![batch_read_blobs_response::Response {
+                digest: Some(tdigest_to(digest.clone())),
+                data: vec![7, 8],
+                ..Default::default()
+            }],
+        };
+
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![named(&path, &digest, false)]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |req| {
+                let res = res.clone();
+                async move {
+                    assert_eq!(req.digests.len(), 1);
+                    Ok(res)
+                }
+            },
+            |req| async move { daemon.serve(req) },
+        )
+        .await?;
+
+        assert_eq!(
+            daemon.reads.load(Ordering::Relaxed),
+            1,
+            "warm-up was attempted"
+        );
+        assert_eq!(tokio::fs::read(&path).await?, vec![7, 8]);
+        assert_eq!(response.local_cache_stats.misses_files, 1);
+        assert_eq!(response.local_cache_stats.hits_files, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_empty_with_shared_cache() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("empty").to_str().unwrap().to_owned();
+        let digest = tdigest("da39a3ee5e6b4b0d3255bfef95601890afd80709", 0);
+        let daemon = FakeDaemon::new(&work, &[]);
+        let cache = daemon.cache();
+        let daemon = &daemon;
+        let response = download_impl(
+            &InstanceName(None),
+            DownloadRequest {
+                file_digests: Some(vec![named(&path, &digest, true)]),
+                ..Default::default()
+            },
+            None,
+            10000,
+            Some(&cache),
+            |_req| async move { anyhow::Ok(BatchReadBlobsResponse::default()) },
+            |req| async move { daemon.serve(req) },
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&path).await?, Vec::<u8>::new());
+        assert_eq!(daemon.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(response.local_cache_stats.total_cache_lookup_attempts, 0);
+        Ok(())
+    }
+
     #[test]
     fn test_substitute_env_vars() {
         let getter = |s: &str| match s {
@@ -3025,6 +3529,7 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         },
         Some(Compressor::Zstd),
         10,
+        None,
         |_req| async { panic!("not called") },
         |_req| async move {
             Ok(Box::pin(futures::stream::iter(

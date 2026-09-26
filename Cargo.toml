@@ -171,6 +171,7 @@ members = [
   "pagable",
   "pagable_derive",
   "pagable_storage",
+  "remote_execution/oss/casd",
   "remote_execution/oss/re_grpc",
   "remote_execution/oss/re_grpc_proto",
   "shed/lock_free_hashtable",
@@ -231,6 +232,7 @@ buck2_build_info = { path = "app/buck2_build_info" }
 buck2_build_signals = { path = "app/buck2_build_signals" }
 buck2_build_signals_impl = { path = "app/buck2_build_signals_impl" }
 buck2_bxl = { path = "app/buck2_bxl" }
+buck2_casd = { path = "remote_execution/oss/casd" }
 buck2_certs = { path = "app/buck2_certs" }
 buck2_cfg_constructor = { path = "app/buck2_cfg_constructor" }
 buck2_cli_proto = { path = "app/buck2_cli_proto" }

@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+mod casd_autostart;
 mod client;
 mod digest;
 mod error;
@@ -16,6 +17,7 @@ mod metadata;
 mod pool;
 mod request;
 mod response;
+mod shared_cache;
 mod stats;
 
 use std::sync::Arc;
@@ -29,6 +31,7 @@ pub use grpc::*;
 pub use metadata::*;
 pub use request::*;
 pub use response::*;
+pub use shared_cache::SharedCasCache;
 
 /// The global version of the network stats full of atomics
 #[derive(Default, Debug)]
