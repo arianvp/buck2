@@ -21,7 +21,6 @@ use buck2_casd::digest::DigestFunction;
 use buck2_casd::server::MAX_BATCH_TOTAL_SIZE_BYTES;
 use buck2_casd::upstream::UpstreamConfig;
 use buck2_re_configuration::Buck2OssReConfiguration;
-use remote_execution::ActionResultRequest;
 use remote_execution::DownloadRequest;
 use remote_execution::GetDigestsTtlRequest;
 use remote_execution::InlinedBlobWithDigest;
@@ -30,10 +29,8 @@ use remote_execution::NamedDigestWithPermissions;
 use remote_execution::REClient;
 use remote_execution::REClientBuilder;
 use remote_execution::RemoteExecutionMetadata;
-use remote_execution::TActionResult2;
 use remote_execution::TDigest;
 use remote_execution::UploadRequest;
-use remote_execution::WriteActionResultRequest;
 
 async fn daemon(dir: &Path, upstream: Option<SocketAddr>, max_size_bytes: Option<u64>) -> Running {
     buck2_casd::start(Config {
@@ -332,81 +329,6 @@ async fn evicts_when_over_cap() -> anyhow::Result<()> {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    origin.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_action_cache() -> anyhow::Result<()> {
-    let work = tempfile::tempdir()?;
-    let origin = daemon(&work.path().join("origin"), None, None).await;
-    let proxy = daemon(&work.path().join("proxy"), Some(origin.local_addr), None).await;
-    let origin_client = client(origin.local_addr).await;
-    let proxy_client = client(proxy.local_addr).await;
-    let action = digest_of(b"some action proto");
-
-    // A miss is NOT_FOUND, which buck2 treats as "not cached".
-    let miss = origin_client
-        .get_action_result(
-            &RemoteExecutionMetadata::default(),
-            ActionResultRequest {
-                digest: action.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        .err()
-        .expect("nothing cached yet");
-    assert!(format!("{miss:#}").contains("not found"), "{miss:#}");
-
-    origin_client
-        .write_action_result(
-            &RemoteExecutionMetadata::default(),
-            WriteActionResultRequest {
-                action_digest: action.clone(),
-                action_result: TActionResult2 {
-                    exit_code: 7,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await?;
-    let hit = origin_client
-        .get_action_result(
-            &RemoteExecutionMetadata::default(),
-            ActionResultRequest {
-                digest: action.clone(),
-                ..Default::default()
-            },
-        )
-        .await?;
-    assert_eq!(hit.action_result.exit_code, 7);
-    assert!(
-        work.path()
-            .join("origin/ac")
-            .join(&action.hash[..2])
-            .exists()
-    );
-
-    // A proxy leaves the action cache to the remote.
-    let refused = proxy_client
-        .get_action_result(
-            &RemoteExecutionMetadata::default(),
-            ActionResultRequest {
-                digest: action,
-                ..Default::default()
-            },
-        )
-        .await
-        .err()
-        .expect("proxies do not serve the action cache");
-    assert!(
-        format!("{refused:#}").contains("action_cache_address"),
-        "{refused:#}"
-    );
-
-    proxy.shutdown().await?;
     origin.shutdown().await?;
     Ok(())
 }

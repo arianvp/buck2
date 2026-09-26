@@ -26,9 +26,7 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
 use futures::Stream;
 use futures::StreamExt;
-use prost::Message;
 use re_grpc_proto::build::bazel::remote::execution::v2 as re;
-use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
 use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_server::Capabilities;
 use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorage;
 use re_grpc_proto::build::bazel::semver::SemVer;
@@ -424,65 +422,6 @@ impl ByteStream for Cas {
     }
 }
 
-/// A standalone daemon (no upstream) also serves an action cache, so it is a complete cache
-/// backend for local builds. With an upstream, action cache traffic is the remote's business:
-/// point `action_cache_address` at it.
-#[tonic::async_trait]
-impl ActionCache for Cas {
-    async fn get_action_result(
-        &self,
-        request: Request<re::GetActionResultRequest>,
-    ) -> Result<Response<re::ActionResult>, Status> {
-        if self.inner.upstream.is_some() {
-            return Err(Status::unimplemented(
-                "buck2-casd only proxies CAS traffic; point action_cache_address at the remote",
-            ));
-        }
-        let request = request.into_inner();
-        let action_digest = self.digest(
-            request
-                .action_digest
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing action_digest"))?,
-        )?;
-        let data = self
-            .store()
-            .get_action_result(&action_digest)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| Status::not_found(format!("No action result for `{action_digest}`")))?;
-        let result = re::ActionResult::decode(data.as_slice())
-            .map_err(|e| Status::internal(format!("Corrupt action result: {e}")))?;
-        Ok(Response::new(result))
-    }
-
-    async fn update_action_result(
-        &self,
-        request: Request<re::UpdateActionResultRequest>,
-    ) -> Result<Response<re::ActionResult>, Status> {
-        if self.inner.upstream.is_some() {
-            return Err(Status::unimplemented(
-                "buck2-casd only proxies CAS traffic; point action_cache_address at the remote",
-            ));
-        }
-        let request = request.into_inner();
-        let action_digest = self.digest(
-            request
-                .action_digest
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing action_digest"))?,
-        )?;
-        let result = request
-            .action_result
-            .ok_or_else(|| Status::invalid_argument("missing action_result"))?;
-        self.store()
-            .put_action_result(&action_digest, result.encode_to_vec())
-            .await
-            .map_err(internal)?;
-        Ok(Response::new(result))
-    }
-}
-
 #[tonic::async_trait]
 impl Capabilities for Cas {
     async fn get_capabilities(
@@ -493,7 +432,7 @@ impl Capabilities for Cas {
             cache_capabilities: Some(re::CacheCapabilities {
                 digest_functions: vec![self.store().digest_function().proto_value() as i32],
                 action_cache_update_capabilities: Some(re::ActionCacheUpdateCapabilities {
-                    update_enabled: self.inner.upstream.is_none(),
+                    update_enabled: false,
                 }),
                 max_batch_total_size_bytes: MAX_BATCH_TOTAL_SIZE_BYTES as i64,
                 symlink_absolute_path_strategy: re::symlink_absolute_path_strategy::Value::Allowed

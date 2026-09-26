@@ -14,7 +14,6 @@
 //!
 //! ```text
 //! <root>/blobs/<first two hex chars>/<hash>-<size>   raw blob bytes, mode 0444
-//! <root>/ac/<first two hex chars>/<hash>-<size>      serialized ActionResult, standalone mode
 //! <root>/tmp/<random>                                 in-flight writes
 //! ```
 //!
@@ -44,7 +43,6 @@ const BLOB_MODE: u32 = 0o444;
 
 pub struct Store {
     blobs_dir: PathBuf,
-    ac_dir: PathBuf,
     tmp_dir: PathBuf,
     digest_function: DigestFunction,
     max_size_bytes: Option<u64>,
@@ -95,12 +93,9 @@ impl Store {
         max_size_bytes: Option<u64>,
     ) -> anyhow::Result<Self> {
         let blobs_dir = root.join("blobs");
-        let ac_dir = root.join("ac");
         let tmp_dir = root.join("tmp");
         fs::create_dir_all(&blobs_dir)
             .with_context(|| format!("Error creating `{}`", blobs_dir.display()))?;
-        fs::create_dir_all(&ac_dir)
-            .with_context(|| format!("Error creating `{}`", ac_dir.display()))?;
         fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("Error creating `{}`", tmp_dir.display()))?;
 
@@ -124,7 +119,6 @@ impl Store {
 
         Ok(Self {
             blobs_dir,
-            ac_dir,
             tmp_dir,
             digest_function,
             max_size_bytes,
@@ -155,59 +149,6 @@ impl Store {
 
     pub fn new_tmp_path(&self) -> PathBuf {
         self.tmp_dir.join(uuid::Uuid::new_v4().to_string())
-    }
-
-    fn action_result_path(&self, action_digest: &Digest) -> PathBuf {
-        self.ac_dir
-            .join(&action_digest.hash[..2])
-            .join(format!("{}-{}", action_digest.hash, action_digest.size))
-    }
-
-    /// The serialized action result stored under `action_digest`, if any.
-    pub async fn get_action_result(
-        &self,
-        action_digest: &Digest,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
-        let path = self.action_result_path(action_digest);
-        blocking(move || match fs::read(&path) {
-            Ok(data) => {
-                if let Ok(file) = fs::File::open(&path) {
-                    let _ignored = file.set_modified(SystemTime::now());
-                }
-                Ok(Some(data))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("Error reading `{}`", path.display())),
-        })
-        .await
-    }
-
-    /// Stores a serialized action result under `action_digest`, replacing any previous one.
-    pub async fn put_action_result(
-        &self,
-        action_digest: &Digest,
-        data: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let path = self.action_result_path(action_digest);
-        let tmp = self.new_tmp_path();
-        blocking(move || {
-            let result = (|| {
-                fs::write(&tmp, data)
-                    .with_context(|| format!("Error writing `{}`", tmp.display()))?;
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("Error creating `{}`", parent.display()))?;
-                }
-                fs::rename(&tmp, &path).with_context(|| {
-                    format!("Error moving `{}` to `{}`", tmp.display(), path.display())
-                })
-            })();
-            if result.is_err() {
-                let _ignored = fs::remove_file(&tmp);
-            }
-            result
-        })
-        .await
     }
 
     /// Returns the blob's path if it is present, touching it for LRU purposes.
