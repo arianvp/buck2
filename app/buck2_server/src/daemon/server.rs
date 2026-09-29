@@ -521,6 +521,7 @@ impl BuckdServer {
             Some(
                 m @ StreamingRequest {
                     request: Some(buck2_cli_proto::streaming_request::Request::Context(_)),
+                    ..
                 },
             ) => Ok(m),
             _ => Err(Status::failed_precondition(
@@ -1805,6 +1806,30 @@ impl DaemonApi for BuckdServer {
         .await
     }
 
+    type ReplStream = ResponseStream;
+    async fn repl(
+        &self,
+        req: Request<tonic::Streaming<StreamingRequest>>,
+    ) -> Result<Response<Self::ReplStream>, Status> {
+        self.run_bidirectional(
+            req,
+            ReplCommandOptions,
+            |ctx,
+             partial_result_dispatcher,
+             _client_ctx,
+             req: StreamingRequestHandler<ReplRequest>| {
+                async move {
+                    BXL_SERVER_COMMANDS
+                        .get()?
+                        .repl(ctx, partial_result_dispatcher, req)
+                        .await
+                }
+                .boxed()
+            },
+        )
+        .await
+    }
+
     async fn set_log_filter(
         &self,
         req: Request<SetLogFilterRequest>,
@@ -2157,6 +2182,18 @@ struct DapCommandOptions;
 impl OneshotCommandOptions for DapCommandOptions {}
 
 impl<Req> StreamingCommandOptions<Req> for DapCommandOptions {
+    fn prevents_background_cleanup(&self) -> bool {
+        false
+    }
+}
+
+/// Options for `repl`, long lived in the same way as `lsp` (see `LspCommandOptions`). The
+/// session holds no DICE transaction between inputs, so it must not hold off cleanup either.
+struct ReplCommandOptions;
+
+impl OneshotCommandOptions for ReplCommandOptions {}
+
+impl<Req> StreamingCommandOptions<Req> for ReplCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
         false
     }

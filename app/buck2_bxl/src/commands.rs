@@ -14,9 +14,11 @@ use buck2_server_ctx::bxl::BxlServerCommands;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
+use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 
 use crate::command::bxl_command;
 use crate::profile_command::bxl_profile_command;
+use crate::repl::repl_command;
 
 struct BxlServerCommandsInstance;
 
@@ -38,6 +40,15 @@ impl BxlServerCommands for BxlServerCommandsInstance {
         req: buck2_cli_proto::ProfileRequest,
     ) -> buck2_error::Result<buck2_cli_proto::ProfileResponse> {
         Ok(bxl_profile_command(ctx, partial_result_dispatcher, req).await?)
+    }
+
+    async fn repl(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::ReplMessage>,
+        req: StreamingRequestHandler<buck2_cli_proto::ReplRequest>,
+    ) -> buck2_error::Result<buck2_cli_proto::ReplResponse> {
+        repl_command(ctx, partial_result_dispatcher, req).await
     }
 }
 

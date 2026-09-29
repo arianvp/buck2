@@ -211,6 +211,12 @@ pub trait StreamingCommand: Sized + Send + Sync {
         true
     }
 
+    /// Whether the command handles SIGINT (Ctrl-C) itself. When `false` (the default), a
+    /// SIGINT drops the command and exits with the interrupt exit code.
+    fn handles_sigint(&self) -> bool {
+        false
+    }
+
     /// Currently only for BxlCommand.
     fn user_event_log(&self) -> &Option<PathArg> {
         &None
@@ -233,6 +239,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
         mut ctx: ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
+        let handles_sigint = self.handles_sigint();
         let work = async {
             let mut connect_options = if T::existing_only() {
                 BuckdConnectOptions::ExistingOnly
@@ -283,10 +290,14 @@ impl<T: StreamingCommand> BuckSubcommand for T {
             command_result
         };
 
-        // FIXME: move this into client_ctx
-        with_simple_sigint_handler(work)
-            .await
-            .unwrap_or_else(ExitResult::signal_interrupt)
+        if handles_sigint {
+            work.await
+        } else {
+            // FIXME: move this into client_ctx
+            with_simple_sigint_handler(work)
+                .await
+                .unwrap_or_else(ExitResult::signal_interrupt)
+        }
     }
 
     fn update_events_ctx(

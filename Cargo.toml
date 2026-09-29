@@ -77,6 +77,7 @@ members = [
   "app/buck2_cmd_log_client",
   "app/buck2_cmd_query_server",
   "app/buck2_cmd_rage_client",
+  "app/buck2_cmd_repl_client",
   "app/buck2_cmd_starlark_client",
   "app/buck2_cmd_starlark_server",
   "app/buck2_cmd_targets_server",
@@ -132,6 +133,7 @@ members = [
   "app/buck2_query_impls",
   "app/buck2_query_parser",
   "app/buck2_re_configuration",
+  "app/buck2_repl_syntax",
   "app/buck2_resource_control",
   "app/buck2_server",
   "app/buck2_server_commands",
@@ -245,6 +247,7 @@ buck2_cmd_docs_server = { path = "app/buck2_cmd_docs_server" }
 buck2_cmd_log_client = { path = "app/buck2_cmd_log_client" }
 buck2_cmd_query_server = { path = "app/buck2_cmd_query_server" }
 buck2_cmd_rage_client = { path = "app/buck2_cmd_rage_client" }
+buck2_cmd_repl_client = { path = "app/buck2_cmd_repl_client" }
 buck2_cmd_starlark_client = { path = "app/buck2_cmd_starlark_client" }
 buck2_cmd_starlark_server = { path = "app/buck2_cmd_starlark_server" }
 buck2_cmd_targets_server = { path = "app/buck2_cmd_targets_server" }
@@ -296,6 +299,7 @@ buck2_query_derive = { path = "app/buck2_query_derive" }
 buck2_query_impls = { path = "app/buck2_query_impls" }
 buck2_query_parser = { path = "app/buck2_query_parser" }
 buck2_re_configuration = { path = "app/buck2_re_configuration" }
+buck2_repl_syntax = { path = "app/buck2_repl_syntax" }
 buck2_resource_control = { path = "app/buck2_resource_control" }
 buck2_server = { path = "app/buck2_server" }
 buck2_server_commands = { path = "app/buck2_server_commands" }

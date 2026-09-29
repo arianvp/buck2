@@ -85,7 +85,7 @@ impl HasClientContext for StreamingRequest {
 
 impl HasBuildOptions for StreamingRequest {
     fn build_options(&self) -> Option<&CommonBuildOptions> {
-        None
+        self.build_opts.as_ref()
     }
 }
 
@@ -104,6 +104,7 @@ impl From<LspRequest> for StreamingRequest {
     fn from(request: LspRequest) -> Self {
         Self {
             request: Some(streaming_request::Request::Lsp(request)),
+            build_opts: None,
         }
     }
 }
@@ -123,6 +124,7 @@ impl From<SubscriptionRequestWrapper> for StreamingRequest {
     fn from(request: SubscriptionRequestWrapper) -> Self {
         Self {
             request: Some(streaming_request::Request::Subscription(request)),
+            build_opts: None,
         }
     }
 }
@@ -142,6 +144,27 @@ impl From<DapRequest> for StreamingRequest {
     fn from(request: DapRequest) -> Self {
         Self {
             request: Some(streaming_request::Request::Dap(request)),
+            build_opts: None,
+        }
+    }
+}
+
+impl TryFrom<StreamingRequest> for ReplRequest {
+    type Error = buck2_error::Error;
+
+    fn try_from(value: StreamingRequest) -> Result<Self, Self::Error> {
+        match value.request {
+            Some(streaming_request::Request::Repl(req)) => Ok(req),
+            _ => Err(wrong_request_type("ReplRequest")),
+        }
+    }
+}
+
+impl From<ReplRequest> for StreamingRequest {
+    fn from(request: ReplRequest) -> Self {
+        Self {
+            request: Some(streaming_request::Request::Repl(request)),
+            build_opts: None,
         }
     }
 }
@@ -304,6 +327,7 @@ result_convert!(InstallResponse);
 result_convert!(CleanStaleResponse);
 result_convert!(LspResponse);
 result_convert!(DapResponse);
+result_convert!(ReplResponse);
 result_convert!(AllocativeResponse);
 result_convert!(SubscriptionCommandResponse);
 result_convert!(TraceIoResponse);
@@ -313,6 +337,7 @@ partial_result_convert!(StdoutBytes);
 partial_result_convert!(LspMessage);
 partial_result_convert!(SubscriptionResponseWrapper);
 partial_result_convert!(DapMessage);
+partial_result_convert!(ReplMessage);
 
 define_request!(KillRequest);
 define_request!(StatusRequest);

@@ -723,6 +723,7 @@ dependencies = [
  "buck2_cmd_log_client",
  "buck2_cmd_query_server",
  "buck2_cmd_rage_client",
+ "buck2_cmd_repl_client",
  "buck2_cmd_starlark_client",
  "buck2_cmd_starlark_server",
  "buck2_cmd_targets_server",
@@ -1164,6 +1165,7 @@ dependencies = [
  "buck2_profile",
  "buck2_query",
  "buck2_query_parser",
+ "buck2_repl_syntax",
  "buck2_server_ctx",
  "buck2_transition",
  "buck2_util",
@@ -1601,6 +1603,29 @@ dependencies = [
  "superconsole",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "buck2_cmd_repl_client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "buck2_cli_proto",
+ "buck2_client_ctx",
+ "buck2_core",
+ "buck2_error",
+ "buck2_repl_syntax",
+ "buck2_util",
+ "buck2_wrapper_common",
+ "clap",
+ "dirs",
+ "dupe",
+ "futures 0.3.34",
+ "rustyline",
+ "serde_json",
+ "shlex",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -2915,6 +2940,13 @@ dependencies = [
  "buck2_common",
  "buck2_core",
  "buck2_error",
+]
+
+[[package]]
+name = "buck2_repl_syntax"
+version = "0.1.0"
+dependencies = [
+ "shlex",
 ]
 
 [[package]]
