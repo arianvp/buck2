@@ -19,10 +19,12 @@
 //! - [`chunker`]: splits piped input into inputs, line by line.
 //! - [`text`]: dedent, input prechecks, string literals and output capping.
 //! - [`commands`]: the meta-command table and its parser.
+//! - [`site`]: what the cursor is on, for completion.
 
 pub mod chunker;
 pub mod commands;
 pub mod completeness;
 pub mod lexer;
 mod nesting;
+pub mod site;
 pub mod text;
