@@ -192,7 +192,7 @@ rustls = { version = "0.23.45", features = ["ring"] }
 rustls-native-certs = "0.8.3"
 rustls-pemfile = "2.2.0"
 rustls-pki-types = { version = "1.15.1", features = ["alloc", "std"] }
-rustyline = { version = "18.0.1", features = ["derive"] }
+rustyline = { version = "18.0.1", features = ["buffer-redux", "derive"] }
 scopeguard = "1.2.0"
 sequence_trie = { version = "0.3.6", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }

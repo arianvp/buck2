@@ -251,7 +251,11 @@ impl LspModule {
             }
             Some(line_span) => line_span,
         };
-        let current_pos = std::cmp::min(line_span.begin() + col, line_span.end());
+        // `col` comes from the client: it may be past the end of the line, by any amount.
+        let current_pos = std::cmp::min(
+            Pos::new(line_span.begin().get().saturating_add(col)),
+            line_span.end(),
+        );
 
         // Finalize the results after recursing down from and back up to the top level scope.
         match Self::find_definition_in_scope(&scope, current_pos) {

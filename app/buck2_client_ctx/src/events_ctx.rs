@@ -110,7 +110,19 @@ pub trait PartialResultHandler {
         ctx: PartialResultCtx<'_>,
         partial_res: Self::PartialResult,
     ) -> buck2_error::Result<()>;
+
+    /// Whether what the daemon wrote to its stderr so far is to be passed on to the subscribers
+    /// before `partial_res` is handled (rather than when the tailer next reads it, within 200
+    /// ms): for a partial result that ends a part of a long command, whose messages should come
+    /// with it.
+    fn sync_daemon_stderr_before(&self, _partial_res: &Self::PartialResult) -> bool {
+        false
+    }
 }
+
+/// Longest a partial result waits for the daemon's stderr to be read (see
+/// [`PartialResultHandler::sync_daemon_stderr_before`]).
+const DAEMON_STDERR_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Exposes restricted access to EventsCtx from PartialResultHandler instances.
 pub struct PartialResultCtx<'a> {
@@ -210,6 +222,13 @@ impl<'a> DaemonEventsCtx<'a> {
                     events.push(event);
                 }
                 StreamValue::PartialResult(partial_res) => {
+                    // The events that came before it are handled first, so that what they print
+                    // (such as streamed BXL output) is not printed after what it prints.
+                    if !events.is_empty() {
+                        self.inner
+                            .handle_events(std::mem::take(&mut events), shutdown)
+                            .await?;
+                    }
                     let partial_res = partial_res
                         .partial_result
                         .internal_error("Empty partial result")?
@@ -221,6 +240,9 @@ impl<'a> DaemonEventsCtx<'a> {
                                 e
                             )
                         })?;
+                    if partial_result_handler.sync_daemon_stderr_before(&partial_res) {
+                        self.sync_tailers().await?;
+                    }
                     partial_result_handler
                         .handle_partial_result(PartialResultCtx { inner: self.inner }, partial_res)
                         .await?;
@@ -236,6 +258,20 @@ impl<'a> DaemonEventsCtx<'a> {
         }
         self.inner.handle_events(events, shutdown).await?;
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Passes on what the daemon wrote to its stdout and stderr so far.
+    async fn sync_tailers(&mut self) -> buck2_error::Result<()> {
+        self.tailers.sync(DAEMON_STDERR_SYNC_TIMEOUT).await;
+        while let Some(event) = self
+            .tailers
+            .stream
+            .as_mut()
+            .and_then(|stream| stream.try_recv().ok())
+        {
+            self.dispatch_tailer_event(event).await?;
+        }
+        Ok(())
     }
 
     async fn dispatch_tailer_event(&mut self, event: FileTailerEvent) -> buck2_error::Result<()> {

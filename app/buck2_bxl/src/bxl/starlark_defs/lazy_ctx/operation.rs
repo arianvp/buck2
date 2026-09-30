@@ -14,8 +14,6 @@ use allocative::Allocative;
 use async_recursion::async_recursion;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
-use buck2_core::cells::cell_path::CellPathRef;
-use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::configuration::compatibility::MaybeCompatible;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::pattern::pattern::ParsedPattern;
@@ -171,7 +169,7 @@ impl LazyOperation {
                 // Parse the target pattern
                 let parsed_pattern = ParsedPattern::<TargetPatternExtra>::parse_relaxed(
                     core_data.target_alias_resolver(),
-                    CellPathRef::new(core_data.cell_name(), CellRelativePath::empty()),
+                    core_data.relative_pattern_base(),
                     pattern,
                     core_data.cell_resolver(),
                     core_data.cell_alias_resolver(),
@@ -275,74 +273,100 @@ impl LazyOperation {
 #[display("{:?}", self)]
 pub(crate) struct StarlarkLazy {
     lazy: Arc<LazyOperation>,
+    /// How many operations nest in `lazy` (1 if none do).
+    #[derivative(Debug = "ignore")]
+    depth: u32,
 }
 
 starlark_simple_value!(StarlarkLazy);
 
+/// Most operations that may nest in a lazy operation (with `catch`, `join` and `join_all`).
+/// Resolving it, formatting it and dropping it recurse on its nesting, which must not exhaust
+/// the native stack (that aborts the daemon): resolving takes several KiB of it per level.
+const MAX_LAZY_DEPTH: u32 = 200;
+
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
+enum LazyDepthError {
+    #[error(
+        "Lazy operations nest too deeply (more than {MAX_LAZY_DEPTH} levels of `catch`, `join` and `join_all`); `ctx.lazy.join_all` joins any number of operations in one level"
+    )]
+    TooDeep,
+}
+
 impl StarlarkLazy {
-    pub(crate) fn new_analysis(label: ConfiguredProvidersLabel) -> Self {
+    fn new(lazy: LazyOperation) -> Self {
         Self {
-            lazy: Arc::new(LazyOperation::Analysis(label)),
+            lazy: Arc::new(lazy),
+            depth: 1,
         }
+    }
+
+    /// An operation over `children`, one level deeper than the deepest of them.
+    fn nesting<'a>(
+        children: impl IntoIterator<Item = &'a StarlarkLazy>,
+        lazy: impl FnOnce() -> LazyOperation,
+    ) -> buck2_error::Result<Self> {
+        let depth = children.into_iter().map(|c| c.depth).max().unwrap_or(0) + 1;
+        if depth > MAX_LAZY_DEPTH {
+            return Err(LazyDepthError::TooDeep.into());
+        }
+        Ok(Self {
+            lazy: Arc::new(lazy()),
+            depth,
+        })
+    }
+
+    pub(crate) fn new_analysis(label: ConfiguredProvidersLabel) -> Self {
+        Self::new(LazyOperation::Analysis(label))
     }
 
     pub(crate) fn new_configured_target_node(
         arg: OwnedConfiguredTargetNodeArg,
         global_cfg_options: buck2_error::Result<GlobalCfgOptions>,
     ) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::ConfiguredTargetNode {
-                arg,
-                global_cfg_options,
-            }),
-        }
+        Self::new(LazyOperation::ConfiguredTargetNode {
+            arg,
+            global_cfg_options,
+        })
     }
 
     pub(crate) fn new_unconfigured_target_node(expr: OwnedTargetNodeArg) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::UnconfiguredTargetNode(expr)),
-        }
+        Self::new(LazyOperation::UnconfiguredTargetNode(expr))
     }
 
     pub(crate) fn new_unconfigured_target_node_keep_going(pattern: String) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::UnconfiguredTargetNodeKeepGoing(pattern)),
-        }
+        Self::new(LazyOperation::UnconfiguredTargetNodeKeepGoing(pattern))
     }
 
-    pub(crate) fn new_batch<I: IntoIterator<Item = StarlarkLazy>>(lazies: I) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::Batch(
-                lazies.into_iter().map(|v| v.lazy).collect(),
-            )),
-        }
+    pub(crate) fn new_batch(lazies: Vec<StarlarkLazy>) -> buck2_error::Result<Self> {
+        Self::nesting(&lazies, || {
+            LazyOperation::Batch(lazies.iter().map(|v| v.lazy.dupe()).collect())
+        })
     }
 
-    pub(crate) fn new_join(lazy0: StarlarkLazy, lazy1: StarlarkLazy) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::Join(lazy0.lazy, lazy1.lazy)),
-        }
+    pub(crate) fn new_join(
+        lazy0: &StarlarkLazy,
+        lazy1: &StarlarkLazy,
+    ) -> buck2_error::Result<Self> {
+        Self::nesting([lazy0, lazy1], || {
+            LazyOperation::Join(lazy0.lazy.dupe(), lazy1.lazy.dupe())
+        })
     }
 
     pub(crate) fn new_uquery(op: LazyUqueryOperation, allow_partial_graph: bool) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::Uquery {
-                op,
-                allow_partial_graph,
-            }),
-        }
+        Self::new(LazyOperation::Uquery {
+            op,
+            allow_partial_graph,
+        })
     }
 
     pub(crate) fn new_cquery(op: LazyCqueryOperation) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::Cquery(op)),
-        }
+        Self::new(LazyOperation::Cquery(op))
     }
 
     pub(crate) fn new_build_artifact(artifact: LazyBuildArtifact) -> Self {
-        Self {
-            lazy: Arc::new(LazyOperation::BuildArtifact(artifact)),
-        }
+        Self::new(LazyOperation::BuildArtifact(artifact))
     }
 }
 
@@ -404,7 +428,8 @@ fn lazy_operation_methods(builder: &mut MethodsBuilder) {
     ///     analysis_result = ctx.lazy.analysis(target).catch().resolve()
     /// ```
     fn catch(this: &StarlarkLazy) -> starlark::Result<StarlarkLazy> {
-        let lazy = Arc::new(LazyOperation::Catch(this.lazy.dupe()));
-        Ok(StarlarkLazy { lazy })
+        Ok(StarlarkLazy::nesting([this], || {
+            LazyOperation::Catch(this.lazy.dupe())
+        })?)
     }
 }

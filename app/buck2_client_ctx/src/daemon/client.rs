@@ -588,6 +588,32 @@ impl FlushingBuckdClient<'_> {
         SubscriptionResponseWrapper
     );
 
+    /// Like the `bidirectional_stream_method!` methods, but also sends the build options
+    /// that the daemon uses for every build of the session.
+    pub async fn repl(
+        &mut self,
+        context: ClientContext,
+        build_opts: CommonBuildOptions,
+        requests: impl Stream<Item = ReplRequest> + Send + Sync + 'static,
+        events_ctx: &mut EventsCtx,
+        handler: &mut impl PartialResultHandler<PartialResult = ReplMessage>,
+    ) -> buck2_error::Result<CommandOutcome<ReplResponse>> {
+        let mut events_ctx = DaemonEventsCtx::new(self.inner, events_ctx)?;
+        let req = create_client_stream_with_build_opts(context, Some(build_opts), requests);
+        let res = self
+            .inner
+            .stream(
+                |d, r| Box::pin(DaemonApiClient::repl(d, r)),
+                req,
+                &mut events_ctx,
+                handler,
+                None,
+            )
+            .await;
+        events_ctx.flush().await?;
+        res
+    }
+
     oneshot_method!(flush_dep_files, FlushDepFilesRequest, GenericResponse);
     stream_method!(
         hydration,
@@ -674,8 +700,21 @@ fn create_client_stream<
     context: ClientContext,
     requests: InStream,
 ) -> impl Stream<Item = StreamingRequest> + Send + Sync + 'static {
+    create_client_stream_with_build_opts(context, None, requests)
+}
+
+/// Like [`create_client_stream`], but the first (context) message also carries `build_opts`.
+fn create_client_stream_with_build_opts<
+    T: Into<StreamingRequest>,
+    InStream: Stream<Item = T> + Send + Sync + 'static,
+>(
+    context: ClientContext,
+    build_opts: Option<CommonBuildOptions>,
+    requests: InStream,
+) -> impl Stream<Item = StreamingRequest> + Send + Sync + 'static {
     let init_req = StreamingRequest {
         request: Some(streaming_request::Request::Context(context)),
+        build_opts,
     };
     stream::once(async move { init_req }).chain(requests.map(|request| request.into()))
 }

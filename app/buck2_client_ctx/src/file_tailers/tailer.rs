@@ -20,6 +20,7 @@ use buck2_error::BuckErrorContext;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use dupe::Dupe;
 use futures::FutureExt;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
@@ -41,6 +42,8 @@ pub(crate) struct FileTailer {
     // This thread is periodically checking the file for new data. When a message is
     // sent on the end_signaller, the thread will do one final sync of data and then exit.
     _end_signaller: oneshot::Sender<Infallible>,
+    // Asks for a sync now: the sender is answered once the data written so far is sent.
+    sync_requests: UnboundedSender<oneshot::Sender<()>>,
 }
 
 impl FileTailer {
@@ -55,13 +58,14 @@ impl FileTailer {
 
         reader.seek(SeekFrom::End(0))?;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
         // Startup a thread that will repeatedly (with a 200ms interval between) copy from
         // the current position to the end of the file.
         // TODO(cjhopman): It would probably be nicer to implement this via inotify/fsevents/etc
         // rather than just repeatedly reading the file, but I tried to use each of
         // https://crates.io/crates/hotwatch and https://crates.io/crates/notify and neither worked.
         tokio::spawn(async move {
-            let res = Self::tailer_loop(rx, reader, stdout_or_stderr, sender).await;
+            let res = Self::tailer_loop(rx, sync_rx, reader, stdout_or_stderr, sender).await;
             match res {
                 Ok(()) => {}
                 Err(e) => {
@@ -70,11 +74,24 @@ impl FileTailer {
             }
         });
 
-        Ok(FileTailer { _end_signaller: tx })
+        Ok(FileTailer {
+            _end_signaller: tx,
+            sync_requests: sync_tx,
+        })
+    }
+
+    /// Copies what was written to the file so far now, rather than at the next check. The
+    /// receiver is answered once it is sent (or the tailer is gone).
+    pub(crate) fn sync(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        // If the tailer is gone, `tx` is dropped, which answers too.
+        let _ignored = self.sync_requests.send(tx);
+        rx
     }
 
     async fn tailer_loop(
         rx: oneshot::Receiver<Infallible>,
+        mut sync_rx: UnboundedReceiver<oneshot::Sender<()>>,
         mut reader: BufReader<File>,
         stdout_or_stderr: StdoutOrStderr,
         mut sender: UnboundedSender<FileTailerEvent>,
@@ -84,6 +101,7 @@ impl FileTailer {
 
         let mut completing = false;
         while !completing {
+            let mut synced = None;
             tokio::select! {
                 _ = interval.tick() => {},
                 _ = &mut rx => {
@@ -91,6 +109,7 @@ impl FileTailer {
                     // drain any remaining output and return.
                     completing = true;
                 }
+                Some(ack) = sync_rx.recv() => synced = Some(ack),
             }
 
             (sender, reader) = tokio::task::spawn_blocking(move || {
@@ -114,6 +133,10 @@ impl FileTailer {
                 buck2_error::Ok((sender, reader))
             })
             .await??;
+            if let Some(ack) = synced {
+                // The requester may have stopped waiting.
+                let _ignored = ack.send(());
+            }
         }
 
         buck2_error::Ok(())

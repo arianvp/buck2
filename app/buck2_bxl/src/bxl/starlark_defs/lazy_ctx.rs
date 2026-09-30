@@ -110,7 +110,7 @@ fn lazy_ctx_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] lazy0: &'v StarlarkLazy,
         #[starlark(require = pos)] lazy1: &'v StarlarkLazy,
     ) -> starlark::Result<StarlarkLazy> {
-        Ok(StarlarkLazy::new_join(lazy0.dupe(), lazy1.dupe()))
+        Ok(StarlarkLazy::new_join(lazy0, lazy1)?)
     }
 
     /// Join a list of lazy operations into a single operation that can be evaluated.
@@ -130,8 +130,8 @@ fn lazy_ctx_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] operations: UnpackList<&StarlarkLazy>,
     ) -> starlark::Result<StarlarkLazy> {
         Ok(StarlarkLazy::new_batch(
-            operations.into_iter().map(|o| o.dupe()),
-        ))
+            operations.into_iter().map(|o| o.dupe()).collect(),
+        )?)
     }
 
     /// Analyze a target lazily. This will return a lazy operation that can be evaluated later.

@@ -25,6 +25,7 @@ use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_build_api::materialize::materialize_and_upload_artifact_group;
 use buck2_cli_proto::BxlRequest;
 use buck2_cli_proto::BxlResponse;
+use buck2_cli_proto::TargetCfg;
 use buck2_cli_proto::build_request::Materializations;
 use buck2_cli_proto::build_request::Uploads;
 use buck2_common::dice::cells::HasCellResolver;
@@ -43,7 +44,6 @@ use buck2_data::BxlEnsureArtifactsEnd;
 use buck2_data::BxlEnsureArtifactsStart;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
-use buck2_events::dispatch::get_dispatcher;
 use buck2_hash::BuckMutMap;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::parse_import::ParseImportOptions;
@@ -122,56 +122,39 @@ impl BxlServerCommand {
         _stdout: impl Write + Send,
         dice_ctx: DiceTransaction,
     ) -> buck2_error::Result<buck2_cli_proto::BxlResponse> {
-        let bxl_cmd_ctx = self
-            .parse_and_validate_request(server_ctx, &dice_ctx)
-            .await?;
+        let target_cfg = self
+            .req
+            .target_cfg
+            .as_ref()
+            .internal_error("target_cfg must be set")?;
+        let dispatcher = dice_ctx.per_transaction_data().get_dispatcher().dupe();
+        let mut streaming_output_writer = StreamingOutputWriter::new(dispatcher);
 
-        let resolved_cli_args = self.resolve_cli_args(&bxl_cmd_ctx, &dice_ctx).await?;
-        let bxl_args = match resolved_cli_args {
-            BxlResolvedCliArgs::Resolved(bxl_args) => Arc::new(bxl_args),
-            BxlResolvedCliArgs::Help => {
+        let run = BxlRun {
+            bxl_label: &self.req.bxl_label,
+            bxl_args: &self.req.bxl_args,
+            target_cfg,
+            print_stacktrace: self.req.print_stacktrace,
+            materialization_context: self.create_materialization_context(),
+        };
+        let outcome = run_bxl_in_txn(
+            server_ctx,
+            &dice_ctx,
+            run,
+            &mut streaming_output_writer,
+            |error| Ok(server_ctx.stderr()?.write_all(error)?),
+        )
+        .await?;
+        let (bxl_cmd_ctx, errors) = match outcome {
+            BxlRunOutcome::Help => {
                 return Ok(BxlResponse {
-                    project_root: bxl_cmd_ctx.project_root,
+                    project_root: server_ctx.project_root().to_string(),
                     errors: Vec::new(),
                     serialized_build_report: None,
                 });
             }
+            BxlRunOutcome::Ran { ctx, errors } => (ctx, errors),
         };
-
-        let bxl_eval_result = self.eval_bxl(&bxl_cmd_ctx, &dice_ctx, bxl_args).await;
-
-        // let per_transaction_data = dice_ctx.per_transaction_data();
-        let dispatcher = dice_ctx.per_transaction_data().get_dispatcher().dupe();
-        let mut streaming_output_writer = StreamingOutputWriter::new(dispatcher);
-
-        // If the bxl result is cached, we need to output the streaming outputs to stdout
-        let bxl_result = match bxl_eval_result {
-            Ok(bxl_result) => {
-                self.emit_streaming_output(
-                    &dice_ctx,
-                    bxl_result.streaming(),
-                    &mut streaming_output_writer,
-                )?;
-                bxl_result
-            }
-            Err(e) => {
-                if let Some(output) = &e.output_stream_state {
-                    self.emit_streaming_output(
-                        &dice_ctx,
-                        &output.streaming,
-                        &mut streaming_output_writer,
-                    )?;
-                }
-                return Err(e.error);
-            }
-        };
-
-        let errors = self
-            .materialize_artifacts(&dice_ctx, bxl_result.dupe(), &mut streaming_output_writer)
-            .await;
-
-        self.emit_outputs(server_ctx, bxl_result, &mut streaming_output_writer)
-            .await?;
 
         let error_reports = errors
             .iter()
@@ -190,114 +173,6 @@ impl BxlServerCommand {
         })
     }
 
-    async fn parse_and_validate_request<'d>(
-        &self,
-        server_ctx: &'d dyn ServerCommandContextTrait,
-        dice_ctx: &'d DiceTransaction,
-    ) -> buck2_error::Result<BxlCommandContext<'d>> {
-        let cwd = server_ctx.working_dir();
-        let cell_resolver = dice_ctx.ctx().get_cell_resolver().await?;
-        let cell_alias_resolver = dice_ctx.ctx().get_cell_alias_resolver_for_dir(cwd).await?;
-        let bxl_label = parse_bxl_label_from_cli(
-            cwd,
-            &self.req.bxl_label,
-            &cell_resolver,
-            &cell_alias_resolver,
-        )?;
-        let project_root = server_ctx.project_root().to_string();
-
-        let global_cfg_options = global_cfg_options_from_client_context(
-            self.req
-                .target_cfg
-                .as_ref()
-                .internal_error("target_cfg must be set")?,
-            server_ctx,
-            &mut dice_ctx.ctx(),
-        )
-        .await?;
-
-        Ok(BxlCommandContext {
-            cwd,
-            cell_resolver,
-            bxl_label,
-            project_root,
-            global_cfg_options,
-        })
-    }
-
-    async fn resolve_cli_args(
-        &self,
-        ctx: &BxlCommandContext<'_>,
-        dice_ctx: &DiceTransaction,
-    ) -> buck2_error::Result<BxlResolvedCliArgs> {
-        let cur_package =
-            PackageLabel::from_cell_path(ctx.cell_resolver.get_cell_path(ctx.cwd).as_ref())?;
-        let cell_name = ctx.cell_resolver.find(ctx.cwd);
-        let cell_alias_resolver = dice_ctx.ctx().get_cell_alias_resolver(cell_name).await?;
-
-        let target_alias_resolver = dice_ctx.ctx().target_alias_resolver().await?.dupe();
-
-        let bxl_module = dice_ctx
-            .ctx()
-            .get_loaded_module(StarlarkModulePath::BxlFile(&ctx.bxl_label.bxl_path))
-            .await?;
-
-        let frozen_callable = get_bxl_callable(&ctx.bxl_label, bxl_module)?;
-        let cli_ctx = CliResolutionCtx {
-            target_alias_resolver,
-            cell_resolver: ctx.cell_resolver,
-            cell_alias_resolver,
-            relative_dir: cur_package,
-            dice: dice_ctx,
-            global_cfg_options: ctx.global_cfg_options.dupe(),
-        };
-
-        resolve_cli_args(
-            &ctx.bxl_label,
-            &cli_ctx,
-            &self.req.bxl_args,
-            frozen_callable.as_ref(),
-        )
-        .await
-    }
-
-    /// Evaluate the bxl main function and return the result.
-    async fn eval_bxl(
-        &self,
-        ctx: &BxlCommandContext<'_>,
-        dice_ctx: &DiceTransaction,
-        bxl_args: Arc<OrderedMap<String, CliArgValue>>,
-    ) -> bxl::eval::Result<Arc<BxlResult>> {
-        let bxl_key = BxlKey::new(
-            ctx.bxl_label.clone(),
-            bxl_args,
-            self.req.print_stacktrace,
-            ctx.global_cfg_options.dupe(),
-        );
-
-        eval_bxl(&mut dice_ctx.ctx(), bxl_key.clone()).await
-    }
-
-    /// Materializes artifacts from the BXL result
-    ///
-    /// Returns errors encountered during materialization.
-    async fn materialize_artifacts(
-        &self,
-        dice_ctx: &DiceTransaction,
-        bxl_result: Arc<BxlResult>,
-        output: &mut (impl Write + Send),
-    ) -> Vec<buck2_error::Error> {
-        let materialization_context = self.create_materialization_context();
-
-        self.ensure_all_artifacts(
-            &mut dice_ctx.ctx(),
-            materialization_context,
-            bxl_result,
-            output,
-        )
-        .await
-    }
-
     /// Creates a materialization context from request parameters.
     /// This context determines how artifacts will be materialized and uploaded.
     fn create_materialization_context(&self) -> MaterializationAndUploadContext {
@@ -310,137 +185,6 @@ impl BxlServerCommand {
             .unwrap();
 
         (materializations, uploads).into()
-    }
-
-    /// Ensures that all artifacts from BXL execution are materialized.
-    ///
-    /// Wraps the materialization process in tracing spans.
-    ///
-    /// Returns errors encountered during materialization.
-    async fn ensure_all_artifacts(
-        &self,
-        ctx: &mut DiceComputations<'_>,
-        materialization_context: MaterializationAndUploadContext,
-        bxl_result: Arc<BxlResult>,
-        output: &mut (impl Write + Send),
-    ) -> Vec<buck2_error::Error> {
-        if bxl_result.artifacts().is_empty() {
-            return vec![];
-        }
-
-        let result = get_dispatcher()
-            .span_async(BxlEnsureArtifactsStart {}, async move {
-                let result = self
-                    .materialize_collected_artifacts(
-                        ctx,
-                        materialization_context,
-                        bxl_result,
-                        output,
-                    )
-                    .await;
-
-                (result, BxlEnsureArtifactsEnd {})
-            })
-            .await;
-
-        match result {
-            Ok(_) => vec![],
-            Err(errors) => errors,
-        }
-    }
-
-    /// Collects and materializes artifacts
-    ///
-    /// Returns the aggregated errors encountered during materialization.
-    async fn materialize_collected_artifacts(
-        &self,
-        ctx: &mut DiceComputations<'_>,
-        materialization_context: MaterializationAndUploadContext,
-        bxl_result: Arc<BxlResult>,
-        output: &mut (impl Write + Send),
-    ) -> Result<(), Vec<buck2_error::Error>> {
-        let artifacts_to_materialize: Vec<_> = bxl_result.artifacts().iter().duped().collect();
-
-        let mut futs: FuturesUnordered<_> = ctx
-            .compute_many(artifacts_to_materialize.into_iter().map(|artifact| {
-                DiceComputations::declare_closure(async |ctx| {
-                    let res = materialize_and_upload_artifact_group(
-                        ctx,
-                        &artifact,
-                        materialization_context,
-                        &ctx.per_transaction_data()
-                            .get_materialization_queue_tracker(),
-                    )
-                    .await;
-                    match res {
-                        Ok(_) => Ok(artifact),
-                        Err(e) => Err(e),
-                    }
-                })
-            }))
-            .into_iter()
-            .collect();
-
-        let mut pending_streaming =
-            PendingStreaming::new(bxl_result.pending_streaming_outputs().iter().cloned());
-
-        let mut errors: Vec<buck2_error::Error> = Vec::new();
-
-        while let Some(res) = tokio::task::unconstrained(futs.next()).await {
-            match res {
-                Ok(artifact) => {
-                    let outputs = pending_streaming.next_outputs(&artifact);
-                    for output_msg in outputs {
-                        output.write_all(&output_msg).unwrap_or_else(|e| {
-                            errors.push(e.into());
-                        });
-                    }
-                    output.flush().unwrap_or_else(|e| {
-                        errors.push(e.into());
-                    });
-                }
-                Err(e) => errors.push(e),
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Output the outputs from BxlResult to stdout and stderr
-    async fn emit_outputs(
-        &self,
-        server_ctx: &dyn ServerCommandContextTrait,
-        bxl_result: Arc<BxlResult>,
-        mut stdout: impl Write,
-    ) -> buck2_error::Result<()> {
-        stdout.write_all(bxl_result.output())?;
-        server_ctx.stderr()?.write_all(bxl_result.error())?;
-        Ok(())
-    }
-
-    /// Output streaming output to stdout if BxlKey is cached.
-    /// Note that when cached, we do not eval the bxl, so we don't get the streaming output in the bxl script.
-    fn emit_streaming_output(
-        &self,
-        dice_ctx: &DiceTransaction,
-        streaming_output: &[u8],
-        stdout: &mut impl Write,
-    ) -> buck2_error::Result<()> {
-        let bxl_streaming_tracker = dice_ctx
-            .per_transaction_data()
-            .get_bxl_streaming_tracker()
-            .expect("BXL streaming tracker should be set");
-        if !bxl_streaming_tracker.was_called() {
-            stdout.write_all(streaming_output)?;
-            stdout.flush()?;
-            Ok(())
-        } else {
-            Ok(())
-        }
     }
 
     async fn write_build_report(
@@ -476,7 +220,7 @@ impl BxlServerCommand {
             write_bxl_build_report(
                 build_report_opts,
                 artifact_fs,
-                &ctx.cell_resolver,
+                ctx.cell_resolver,
                 server_ctx.project_root(),
                 ctx.cwd,
                 server_ctx.events().trace_id(),
@@ -494,8 +238,225 @@ impl BxlServerCommand {
     }
 }
 
+/// A BXL function to run, as `buck2 bxl` (or `:bxl` in `buck2 repl`) asks for it.
+pub(crate) struct BxlRun<'a> {
+    /// `<file.bxl>:<function>`: the file is a label, or a path relative to the command's
+    /// directory.
+    pub(crate) bxl_label: &'a str,
+    /// The function's command-line arguments.
+    pub(crate) bxl_args: &'a Vec<String>,
+    pub(crate) target_cfg: &'a TargetCfg,
+    pub(crate) print_stacktrace: bool,
+    /// How the artifacts the function ensures are materialized.
+    pub(crate) materialization_context: MaterializationAndUploadContext,
+}
+
+/// How a run of a BXL function ended, when it did not fail.
+pub(crate) enum BxlRunOutcome<'d> {
+    /// The arguments asked for the function's help, which was shown instead of running it.
+    Help,
+    /// The function ran, and its output was written.
+    Ran {
+        ctx: BxlCommandContext<'d>,
+        /// The errors of materializing the artifacts the function ensured.
+        errors: Vec<buck2_error::Error>,
+    },
+}
+
+/// Runs a BXL function in the command's transaction `dice_ctx`, as `buck2 bxl` does: resolves
+/// the function and its command-line arguments (relative to the command's directory), evaluates
+/// it (`BxlComputeKey`, so it may declare and build actions), materializes the artifacts it
+/// ensured, and writes its output.
+///
+/// Streamed output that was not shown while the function ran (its result was cached) goes to
+/// `stdout` first, then the output of pending streams as the artifacts they wait on are
+/// materialized, then the output of `ctx.output.print`; the error output is given to `stderr`.
+///
+/// It takes no transaction of its own, so `buck2 repl` runs it in the transaction of a request
+/// (`with_dice_ctx` must never be nested).
+pub(crate) async fn run_bxl_in_txn<'d>(
+    server_ctx: &'d dyn ServerCommandContextTrait,
+    dice_ctx: &'d DiceTransaction,
+    run: BxlRun<'_>,
+    stdout: &mut (impl Write + Send),
+    stderr: impl FnOnce(&[u8]) -> buck2_error::Result<()>,
+) -> buck2_error::Result<BxlRunOutcome<'d>> {
+    let bxl_cmd_ctx =
+        parse_and_validate_request(server_ctx, dice_ctx, run.bxl_label, run.target_cfg).await?;
+
+    let resolved_cli_args = resolve_bxl_cli_args(&bxl_cmd_ctx, dice_ctx, run.bxl_args).await?;
+    let bxl_args = match resolved_cli_args {
+        BxlResolvedCliArgs::Resolved(bxl_args) => Arc::new(bxl_args),
+        BxlResolvedCliArgs::Help => return Ok(BxlRunOutcome::Help),
+    };
+
+    let bxl_eval_result =
+        eval_bxl_function(&bxl_cmd_ctx, dice_ctx, bxl_args, run.print_stacktrace).await;
+
+    // If the bxl result is cached, we need to output the streaming outputs to stdout
+    let bxl_result = match bxl_eval_result {
+        Ok(bxl_result) => {
+            emit_streaming_output(dice_ctx, bxl_result.streaming(), stdout)?;
+            bxl_result
+        }
+        Err(e) => {
+            if let Some(output) = &e.output_stream_state {
+                emit_streaming_output(dice_ctx, &output.streaming, stdout)?;
+            }
+            return Err(e.error);
+        }
+    };
+
+    let errors = ensure_all_artifacts(
+        dice_ctx,
+        run.materialization_context,
+        bxl_result.dupe(),
+        stdout,
+    )
+    .await;
+
+    // Output the outputs from BxlResult to stdout and stderr
+    stdout.write_all(bxl_result.output())?;
+    stderr(bxl_result.error())?;
+
+    Ok(BxlRunOutcome::Ran {
+        ctx: bxl_cmd_ctx,
+        errors,
+    })
+}
+
+async fn parse_and_validate_request<'d>(
+    server_ctx: &'d dyn ServerCommandContextTrait,
+    dice_ctx: &'d DiceTransaction,
+    bxl_label: &str,
+    target_cfg: &TargetCfg,
+) -> buck2_error::Result<BxlCommandContext<'d>> {
+    let cwd = server_ctx.working_dir();
+    let cell_resolver = dice_ctx.ctx().get_cell_resolver().await?;
+    let cell_alias_resolver = dice_ctx.ctx().get_cell_alias_resolver_for_dir(cwd).await?;
+    let bxl_label = parse_bxl_label_from_cli(cwd, bxl_label, cell_resolver, cell_alias_resolver)?;
+    let project_root = server_ctx.project_root().to_string();
+
+    let global_cfg_options =
+        global_cfg_options_from_client_context(target_cfg, server_ctx, &mut dice_ctx.ctx()).await?;
+
+    Ok(BxlCommandContext {
+        cwd,
+        cell_resolver,
+        bxl_label,
+        project_root,
+        global_cfg_options,
+    })
+}
+
+async fn resolve_bxl_cli_args(
+    ctx: &BxlCommandContext<'_>,
+    dice_ctx: &DiceTransaction,
+    bxl_args: &Vec<String>,
+) -> buck2_error::Result<BxlResolvedCliArgs> {
+    let cur_package =
+        PackageLabel::from_cell_path(ctx.cell_resolver.get_cell_path(ctx.cwd).as_ref())?;
+    let cell_name = ctx.cell_resolver.find(ctx.cwd);
+    let cell_alias_resolver = dice_ctx.ctx().get_cell_alias_resolver(cell_name).await?;
+
+    let target_alias_resolver = dice_ctx.ctx().target_alias_resolver().await?.dupe();
+
+    let bxl_module = dice_ctx
+        .ctx()
+        .get_loaded_module(StarlarkModulePath::BxlFile(&ctx.bxl_label.bxl_path))
+        .await?;
+
+    let frozen_callable = get_bxl_callable(&ctx.bxl_label, bxl_module)?;
+    let cli_ctx = CliResolutionCtx {
+        target_alias_resolver,
+        cell_resolver: ctx.cell_resolver,
+        cell_alias_resolver,
+        relative_dir: cur_package,
+        dice: dice_ctx,
+        global_cfg_options: ctx.global_cfg_options.dupe(),
+    };
+
+    resolve_cli_args(&ctx.bxl_label, &cli_ctx, bxl_args, frozen_callable.as_ref()).await
+}
+
+/// Evaluate the bxl main function and return the result.
+async fn eval_bxl_function(
+    ctx: &BxlCommandContext<'_>,
+    dice_ctx: &DiceTransaction,
+    bxl_args: Arc<OrderedMap<String, CliArgValue>>,
+    print_stacktrace: bool,
+) -> bxl::eval::Result<Arc<BxlResult>> {
+    let bxl_key = BxlKey::new(
+        ctx.bxl_label.clone(),
+        bxl_args,
+        print_stacktrace,
+        ctx.global_cfg_options.dupe(),
+    );
+
+    eval_bxl(&mut dice_ctx.ctx(), bxl_key.clone()).await
+}
+
+/// Ensures that all artifacts from BXL execution are materialized.
+///
+/// Wraps the materialization process in tracing spans.
+///
+/// Returns errors encountered during materialization.
+async fn ensure_all_artifacts(
+    dice_ctx: &DiceTransaction,
+    materialization_context: MaterializationAndUploadContext,
+    bxl_result: Arc<BxlResult>,
+    output: &mut (impl Write + Send),
+) -> Vec<buck2_error::Error> {
+    if bxl_result.artifacts().is_empty() {
+        return vec![];
+    }
+
+    let mut ctx = dice_ctx.ctx();
+    let result = dice_ctx
+        .per_transaction_data()
+        .get_dispatcher()
+        .dupe()
+        .span_async(BxlEnsureArtifactsStart {}, async move {
+            let result = materialize_ensured_artifacts(
+                &mut ctx,
+                materialization_context,
+                bxl_result.artifacts().iter().duped().collect(),
+                bxl_result.pending_streaming_outputs().iter().cloned(),
+                output,
+            )
+            .await;
+
+            (result, BxlEnsureArtifactsEnd {})
+        })
+        .await;
+
+    match result {
+        Ok(_) => vec![],
+        Err(errors) => errors,
+    }
+}
+
+/// Output streaming output to stdout if BxlKey is cached.
+/// Note that when cached, we do not eval the bxl, so we don't get the streaming output in the bxl script.
+fn emit_streaming_output(
+    dice_ctx: &DiceTransaction,
+    streaming_output: &[u8],
+    stdout: &mut impl Write,
+) -> buck2_error::Result<()> {
+    let bxl_streaming_tracker = dice_ctx
+        .per_transaction_data()
+        .get_bxl_streaming_tracker()
+        .internal_error("BXL streaming tracker should be set")?;
+    if !bxl_streaming_tracker.was_called() {
+        stdout.write_all(streaming_output)?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+/// What a BXL function to run resolves to.
 #[derive(Debug)]
-struct BxlCommandContext<'d> {
+pub(crate) struct BxlCommandContext<'d> {
     cwd: &'d ProjectRelativePath,
     cell_resolver: &'d CellResolver,
     bxl_label: BxlFunctionLabel,
@@ -590,6 +551,66 @@ pub(crate) fn parse_bxl_label_from_cli(
         bxl_path: BxlFilePath::new(import_path)?,
         name: bxl_fn.to_owned(),
     })
+}
+
+/// Materializes the ensured `artifacts` of a BXL evaluation (`buck2 bxl`, or an input of
+/// `buck2 repl`), and writes each of the `pending_streaming_outputs` to `output` as soon as every
+/// artifact it waits on is materialized.
+///
+/// Returns the aggregated errors encountered during materialization.
+pub(crate) async fn materialize_ensured_artifacts(
+    ctx: &mut DiceComputations<'_>,
+    materialization_context: MaterializationAndUploadContext,
+    artifacts: Vec<ArtifactGroup>,
+    pending_streaming_outputs: impl Iterator<Item = PendingStreamingOutput>,
+    output: &mut (impl Write + Send),
+) -> Result<(), Vec<buck2_error::Error>> {
+    let mut futs: FuturesUnordered<_> = ctx
+        .compute_many(artifacts.into_iter().map(|artifact| {
+            DiceComputations::declare_closure(async |ctx| {
+                let res = materialize_and_upload_artifact_group(
+                    ctx,
+                    &artifact,
+                    materialization_context,
+                    &ctx.per_transaction_data()
+                        .get_materialization_queue_tracker(),
+                )
+                .await;
+                match res {
+                    Ok(_) => Ok(artifact),
+                    Err(e) => Err(e),
+                }
+            })
+        }))
+        .into_iter()
+        .collect();
+
+    let mut pending_streaming = PendingStreaming::new(pending_streaming_outputs);
+
+    let mut errors: Vec<buck2_error::Error> = Vec::new();
+
+    while let Some(res) = tokio::task::unconstrained(futs.next()).await {
+        match res {
+            Ok(artifact) => {
+                let outputs = pending_streaming.next_outputs(&artifact);
+                for output_msg in outputs {
+                    output.write_all(&output_msg).unwrap_or_else(|e| {
+                        errors.push(e.into());
+                    });
+                }
+                output.flush().unwrap_or_else(|e| {
+                    errors.push(e.into());
+                });
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 #[derive(Debug)]

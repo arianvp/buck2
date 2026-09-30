@@ -52,6 +52,7 @@ use buck2_cmd_audit_client::AuditCommand;
 use buck2_cmd_debug_client::DebugCommand;
 use buck2_cmd_log_client::LogCommand;
 use buck2_cmd_rage_client::rage::RageCommand;
+use buck2_cmd_repl_client::ReplCommand;
 use buck2_cmd_starlark_client::StarlarkCommand;
 use buck2_common::argv::Argv;
 use buck2_common::invocation_paths::RESERVED_BUCK_OUT_PREFIX;
@@ -386,6 +387,7 @@ pub(crate) enum CommandKind {
     Aquery(AqueryCommand),
     Build(BuildCommand),
     Bxl(BxlCommand),
+    Repl(ReplCommand),
     // TODO(nga): implement `buck2 help-buckconfig` too
     //   https://www.internalfb.com/tasks/?t=183528129
     HelpEnv(HelpEnvCommand),
@@ -559,6 +561,7 @@ impl CommandKind {
             CommandKind::Aquery(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Build(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Bxl(cmd) => command_ctx.exec(cmd, matches, events_ctx),
+            CommandKind::Repl(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Test(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Cquery(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::HelpEnv(cmd) => cmd.exec(matches, command_ctx),
@@ -609,6 +612,7 @@ impl CommandKind {
             CommandKind::Aquery(cmd) => cmd.logging_name(),
             CommandKind::Build(cmd) => cmd.logging_name(),
             CommandKind::Bxl(cmd) => cmd.logging_name(),
+            CommandKind::Repl(cmd) => cmd.logging_name(),
             CommandKind::Test(cmd) => cmd.logging_name(),
             CommandKind::Cquery(cmd) => cmd.logging_name(),
             CommandKind::HelpEnv(_) => "help-env",

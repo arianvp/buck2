@@ -761,6 +761,7 @@ message CommandResult {
     ConfiguredTargetsResponse configured_targets_response = 23;
     DapResponse dap_response = 24;
     HydrationResponse hydration_response = 25;
+    ReplResponse repl_response = 26;
     GenericResponse generic_response = 100;
     NewGenericResponseMessage new_generic_response_message = 101;
   }
@@ -786,6 +787,7 @@ message PartialResult {
     LspMessage lsp_message = 2;
     SubscriptionResponseWrapper subscription_response_wrapper = 3;
     DapMessage dap_message = 4;
+    ReplMessage repl_message = 5;
   }
 }
 
@@ -820,7 +822,11 @@ message StreamingRequest {
     LspRequest lsp = 2;
     SubscriptionRequestWrapper subscription = 3;
     DapRequest dap = 4;
+    ReplRequest repl = 5;
   }
+  // Only read from the first (context) message. Only set by `buck2 repl`,
+  // whose builds use the options of the whole session.
+  CommonBuildOptions build_opts = 6;
 }
 
 message UnstableHeapDumpRequest {
@@ -891,6 +897,232 @@ message DapRequest {
 /// DAP requests are sent back in the event
 /// stream. See `buck.data.DapResult`
 message DapResponse {}
+
+/// A request from the `buck2 repl` client. The first request of a session must
+/// be `open`. The client sends one request and waits for its `done` (or
+/// `completions`) before sending the next one, except for `interrupt` and
+/// `hangup`.
+message ReplRequest {
+  // Assigned by the client: unique and increasing. `open` is 1.
+  uint64 id = 1;
+  oneof request {
+    ReplOpen open = 2;
+    ReplEval eval = 3;
+    ReplComplete complete = 4;
+    ReplInterrupt interrupt = 5;
+    ReplHangup hangup = 6;
+  }
+}
+
+message ReplOpen {
+  TargetCfg target_cfg = 1;
+  // Maximum Starlark heap of the session, in bytes. 0 means 4 GiB.
+  uint64 max_heap_bytes = 2;
+  // Also render values as JSON (`ReplValue.json`).
+  bool json_values = 3;
+  // Files to evaluate before the first input.
+  repeated string preload = 4;
+}
+
+message ReplEval {
+  string input = 1;
+  // The client's 1-based input counter; the codemap is named `<repl:number>`.
+  uint32 number = 2;
+}
+
+message ReplComplete {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    NAME = 1;
+    ATTR = 2;
+    // A target pattern; `//x:y[` completes the subtargets of `//x:y`.
+    TARGET_PATTERN = 3;
+    // An argument of a call of the chain `root` + `steps`: its keyword
+    // parameters (`name=`) not in `used_kwargs` (and not filled by the first
+    // `positional_args` arguments), and the names of NAME.
+    KWARG = 4;
+    // A module to load (a label: `//pkg:x.bzl`, `:x.bzl`).
+    LOAD_PATH = 5;
+    // The public symbols of the module `load_module` (resolved as `load()` at
+    // the prompt resolves it) whose names start with `prefix`.
+    LOAD_SYMBOL = 6;
+    // The functions of the query language `query_dialect` (every one: the
+    // client filters them), as `name(`, with the types of their arguments in
+    // `detail`.
+    QUERY = 7;
+    // The BXL functions of the `.bxl` file `load_module` (as `:bxl` takes it)
+    // whose names start with `prefix`.
+    BXL_FUNCTION = 8;
+  }
+  enum QueryDialect {
+    UQUERY = 0;
+    CQUERY = 1;
+    AQUERY = 2;
+  }
+  Kind kind = 1;
+  // Partial word, pattern or query text before the cursor.
+  string prefix = 2;
+  // ATTR/KWARG: the identifier that starts the chain.
+  string root = 3;
+  // ATTR/KWARG: the steps between `root` and `prefix`.
+  repeated ReplChainStep steps = 4;
+  repeated string used_kwargs = 5;
+  string load_module = 6;
+  QueryDialect query_dialect = 7;
+  // KWARG: the number of positional arguments before the cursor.
+  uint32 positional_args = 8;
+}
+
+message ReplChainStep {
+  oneof step {
+    string attr = 1;
+    ReplCallStep call = 2;
+  }
+}
+
+message ReplCallStep {}
+
+message ReplInterrupt {
+  // The id of the request to interrupt.
+  uint64 target_id = 1;
+}
+
+message ReplHangup {}
+
+message ReplResponse {}
+
+/// A message from the `buck2 repl` server, sent as a partial result.
+message ReplMessage {
+  // The id of the request this message belongs to.
+  uint64 id = 1;
+  oneof message {
+    ReplReady ready = 2;
+    ReplOutput output = 3;
+    ReplDone done = 4;
+    ReplCompletions completions = 5;
+    ReplNotice notice = 6;
+  }
+}
+
+message ReplReady {
+  // The cwd as a cell path, e.g. `root//pkg`.
+  string cwd = 1;
+  string target_platform = 2;
+  bool prelude_loaded = 3;
+}
+
+message ReplOutput {
+  enum Channel {
+    STDOUT = 0;
+    STDERR = 1;
+  }
+  // How the client shows `data`.
+  enum Format {
+    // As it is, as soon as it arrives.
+    PLAIN = 0;
+    // Markdown (the documentation of `:doc` and `:qdoc <function>`): the
+    // client renders it for the terminal once the request's consecutive
+    // MARKDOWN chunks have all arrived.
+    MARKDOWN = 1;
+  }
+  Channel channel = 1;
+  // At most 16 KiB.
+  bytes data = 2;
+  Format format = 3;
+}
+
+message ReplDone {
+  // Unset when the input produced no value.
+  oneof outcome {
+    ReplValue value = 1;
+    ReplError error = 2;
+    ReplRun run = 3;
+  }
+  uint64 wait_ms = 4;
+  uint64 eval_ms = 5;
+  bool sources_changed = 6;
+  uint64 heap_bytes = 7;
+}
+
+message ReplValue {
+  string type = 1;
+  // At most 64 KiB.
+  string text = 2;
+  bool truncated = 3;
+  // At most 1 MiB.
+  optional string json = 4;
+}
+
+message ReplError {
+  enum Kind {
+    UNKNOWN = 0;
+    SYNTAX = 1;
+    EVAL = 2;
+    BUCK = 3;
+    INTERRUPTED = 4;
+    UNSUPPORTED = 5;
+    BUSY = 6;
+    USAGE = 7;
+    INTERNAL = 8;
+  }
+  Kind kind = 1;
+  // Fully rendered; starts with `error: `. At most 64 KiB.
+  string message = 2;
+}
+
+message ReplRun {
+  repeated string argv = 1;
+  // Empty means the client's cwd.
+  string cwd = 2;
+  string label = 3;
+  bool print_only = 4;
+}
+
+message ReplCompletions {
+  enum Status {
+    OK = 0;
+    BUSY = 1;
+    CANCELLED = 2;
+    TIMEOUT = 3;
+    ERROR = 4;
+  }
+  Status status = 1;
+  // At most 500, filtered by the prefix.
+  repeated ReplCandidate candidates = 2;
+  string message = 3;
+}
+
+message ReplCandidate {
+  enum Kind {
+    VALUE = 0;
+    FUNCTION = 1;
+    TYPE = 2;
+    MODULE = 3;
+    KEYWORD = 4;
+    COMMAND = 5;
+    TARGET = 6;
+    PACKAGE = 7;
+    DIRECTORY = 8;
+    CELL = 9;
+    PATTERN = 10;
+    KWARG = 11;
+    FILE = 12;
+  }
+  // Replaces the text from the start of the completion site to the cursor.
+  string replacement = 1;
+  string display = 2;
+  Kind kind = 3;
+  string detail = 4;
+}
+
+message ReplNotice {
+  enum Level {
+    INFO = 0;
+    WARNING = 1;
+  }
+  Level level = 1;
+  string text = 2;
+}
 
 message BxlProfile {
   string bxl_label = 1;
@@ -1126,6 +1358,9 @@ service DaemonApi {
 
   // Starts a starlark DAP server.
   rpc Dap(stream StreamingRequest) returns (stream MultiCommandProgress);
+
+  // Starts an interactive `buck2 repl` session.
+  rpc Repl(stream StreamingRequest) returns (stream MultiCommandProgress);
 
   // Update the daemon's log filter.
   rpc SetLogFilter(SetLogFilterRequest) returns (SetLogFilterResponse);

@@ -16,8 +16,6 @@ use buck2_cli_proto::build_request::Materializations;
 use buck2_cli_proto::build_request::Uploads;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_common::events::HasEvents;
-use buck2_core::cells::cell_path::CellPathRef;
-use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::provider::label::ProvidersLabel;
@@ -55,6 +53,7 @@ use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::BxlContextError;
 use crate::bxl::starlark_defs::context::BxlContextType;
 use crate::bxl::starlark_defs::context::NotATargetLabelString;
+use crate::bxl::starlark_defs::context::ReplUnsupported;
 use crate::bxl::starlark_defs::context::actions::BxlActions;
 use crate::bxl::starlark_defs::context::actions::resolve_bxl_execution_platform;
 use crate::bxl::starlark_defs::context::actions::validate_action_instantiation;
@@ -433,6 +432,11 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<BxlActions<'v>> {
+        if this.is_repl() {
+            // Artifacts owned by the session's synthetic key could never be built: resolving
+            // them re-evaluates the key's .bxl file, which does not exist.
+            return Err(buck2_error::Error::from(ReplUnsupported::BxlActions).into());
+        }
         let heap = eval.heap();
         Ok(this.via_dice(eval, |ctx| {
             ctx.via(|ctx| {
@@ -691,7 +695,7 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
                 async move {
                     match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
                         this.target_alias_resolver(),
-                        CellPathRef::new(this.cell_name(), CellRelativePath::empty()),
+                        this.relative_pattern_base(),
                         label,
                         this.cell_resolver(),
                         this.cell_alias_resolver(),

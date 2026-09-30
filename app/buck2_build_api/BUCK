@@ -41,6 +41,7 @@ rust_library(
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:sorted_vector_map",
+        "fbsource//third-party/rust:stacker",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
         "//buck2/allocative/allocative:allocative",

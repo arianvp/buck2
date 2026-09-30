@@ -27,7 +27,9 @@ use buck2_common::target_aliases::HasTargetAliasResolver;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::name::CellName;
+use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
@@ -87,6 +89,18 @@ enum BxlContextError {
     Unsupported(String),
     #[error("Execution platform is inherited from the root BXL")]
     RequireSameExecutionPlatformAsRoot,
+}
+
+/// Features of `ctx` that `buck2 repl` does not support.
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
+pub(crate) enum ReplUnsupported {
+    #[error(
+        "`ctx.bxl_actions()` is not available in `buck2 repl`: actions declared at the prompt are \
+         not owned by a real .bxl file and cannot be built. Put this code in a BXL function of \
+         a .bxl file and run it with `:bxl <file.bxl>:<function>` (or `buck2 bxl`)."
+    )]
+    BxlActions,
 }
 
 #[derive(buck2_error::Error, Debug)]
@@ -204,6 +218,8 @@ pub(crate) struct BxlContextCoreData {
     project_fs: ProjectRoot,
     #[derivative(Debug = "ignore")]
     artifact_fs: ArtifactFs,
+    /// Set for the `ctx` of `buck2 repl`: the directory the session was started in.
+    repl_cwd: Option<CellPath>,
 }
 
 impl BxlContextCoreData {
@@ -240,7 +256,27 @@ impl BxlContextCoreData {
             cell_alias_resolver,
             project_fs,
             artifact_fs: artifact_fs.dupe(),
+            repl_cwd: None,
         })
+    }
+
+    /// Marks this as the data of a `buck2 repl` session started in `cwd`.
+    pub(crate) fn with_repl_cwd(self, cwd: CellPath) -> Self {
+        Self {
+            repl_cwd: Some(cwd),
+            ..self
+        }
+    }
+
+    /// Whether this is the data of a `buck2 repl` session, whose synthetic `BxlKey` must not
+    /// own artifacts.
+    pub(crate) fn is_repl(&self) -> bool {
+        self.repl_cwd.is_some()
+    }
+
+    /// The directory the `buck2 repl` session was started in, if this is one.
+    pub(crate) fn repl_cwd(&self) -> Option<&CellPath> {
+        self.repl_cwd.as_ref()
     }
 
     pub(crate) fn key(&self) -> &BxlKey {
@@ -287,15 +323,35 @@ impl BxlContextCoreData {
         &self.artifact_fs
     }
 
+    /// The directory relative target patterns are parsed against: the cell root, or in
+    /// `buck2 repl` the directory the session was started in.
+    pub(crate) fn relative_pattern_base(&self) -> CellPathRef<'_> {
+        match &self.repl_cwd {
+            Some(cwd) => cwd.as_ref(),
+            None => CellPathRef::new(self.cell_name, CellRelativePath::empty()),
+        }
+    }
+
     /// Working dir for resolving literals.
     /// Note, unlike buck2 command line UI, we resolve targets and literals
-    /// against the cell root instead of user working dir.
+    /// against the cell root instead of user working dir (except in `buck2 repl`, which
+    /// resolves them against the directory the session was started in, like the command line).
     pub(crate) fn working_dir(&self) -> buck2_error::Result<ProjectRelativePathBuf> {
+        if let Some(cwd) = &self.repl_cwd {
+            return self.cell_resolver().resolve_path(cwd.as_ref());
+        }
         let cell = self.cell_resolver().get(self.cell_name())?;
         Ok(cell.path().as_project_relative_path().to_owned())
     }
 
     pub(crate) fn parse_query_file_literal(&self, literal: &str) -> buck2_error::Result<CellPath> {
+        let repl_cwd_abs = match &self.repl_cwd {
+            Some(cwd) => Some(
+                self.project_root()
+                    .resolve(&self.cell_resolver().resolve_path(cwd.as_ref())?),
+            ),
+            None => None,
+        };
         parse_query_file_literal(
             literal,
             self.cell_alias_resolver(),
@@ -304,7 +360,8 @@ impl BxlContextCoreData {
             //   which is inconsistent with the rest of buck2:
             //   The same query `owner(foo.h)` is resolved using
             //   current directory in `buck2 query`, but relative to cell root in BXL.
-            self.cell_root_abs(),
+            //   (`buck2 repl` passes the directory the session was started in.)
+            repl_cwd_abs.as_ref().unwrap_or(self.cell_root_abs()),
             self.project_root(),
         )
     }

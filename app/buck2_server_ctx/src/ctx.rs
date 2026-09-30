@@ -19,6 +19,7 @@ use buck2_build_signals::env::BuildSignalsContext;
 use buck2_build_signals::env::DeferredBuildSignals;
 use buck2_build_signals::env::HasCriticalPathBackend;
 use buck2_certs::validate::CertState;
+use buck2_cli_proto::CommonBuildOptions;
 use buck2_cli_proto::client_context::ExitWhen;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
@@ -245,6 +246,9 @@ pub trait ServerCommandContextTrait: Send + Sync {
     fn cancellation_context(&self) -> &CancellationContext;
 
     fn command_start(&self) -> Instant;
+
+    /// The build options the client sent with the command, if it sent any.
+    fn build_options(&self) -> Option<&CommonBuildOptions>;
 }
 
 pub struct PrivateStruct(());

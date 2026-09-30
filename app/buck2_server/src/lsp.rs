@@ -492,8 +492,8 @@ impl<'a> BuckLspContext<'a> {
                     .await?;
 
                 let path = self.fs.resolve(&relative_path);
-                let uri = Uri::from_file_path(path)
-                    .unwrap()
+                let uri = Uri::from_file_path(&path)
+                    .ok_or_else(|| internal_error!("Failed to convert path to file URI: {}", path))?
                     .try_into()
                     .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Lsp))?;
                 let string_literal = StringLiteralResult {
@@ -669,9 +669,17 @@ impl LspContext for BuckLspContext<'_> {
         self.runtime
             .block_on(with_dispatcher_async(dispatcher, async {
                 let import_path = match current_file {
-                    LspUri::File(current_file) => {
-                        Ok(self.import_path(current_file.parent().unwrap()).await?)
-                    }
+                    // The URI comes from the client: `file:///` has no parent.
+                    LspUri::File(current_file) => match current_file.parent() {
+                        Some(dir) => Ok(self.import_path(dir).await?),
+                        None => {
+                            return Err(buck2_error::buck2_error!(
+                                buck2_error::ErrorTag::Lsp,
+                                "`{}` is not in a directory",
+                                current_file.display()
+                            ));
+                        }
+                    },
                     _ => Err(ResolveLoadError::WrongScheme(
                         "file://".to_owned(),
                         current_file.clone(),
@@ -817,12 +825,15 @@ async fn run_lsp_server(
     let dispatcher = ctx.events().dupe();
     let buck_lsp_ctx = BuckLspContext::new(ctx).await?;
 
+    // When the client goes away (the request stream ends), `send_to_server` is dropped: the LSP
+    // server ends once it has handled the messages already queued, or as soon as it cannot send
+    // a message (the thread that forwards them has ended), without panicking.
     tokio::task::block_in_place(|| {
         thread::scope(|scope| {
             let recv_thread = scope.spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .build()
-                    .unwrap();
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Lsp))?;
                 runtime.block_on(recv_from_lsp(client_receiver, events_from_server))
             });
 
@@ -830,12 +841,8 @@ async fn run_lsp_server(
                 move || server_with_connection(connection, buck_lsp_ctx)
             }));
 
-            let res = {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap();
-
-                runtime.block_on(async move {
+            let res = match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(runtime) => runtime.block_on(async move {
                     loop {
                         let message_handler_res = tokio::select! {
                             m = req.message().fuse() => {
@@ -851,11 +858,21 @@ async fn run_lsp_server(
                             Err(e) => break Err(e),
                         }
                     }
-                })
+                }),
+                Err(e) => {
+                    // The server ends when its input is closed.
+                    drop(send_to_server);
+                    Err(from_any_with_tag(e, buck2_error::ErrorTag::Lsp))
+                }
             };
 
             let _ignored = recv_thread.join();
-            let _ignored = server_thread.join();
+            match server_thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!("LSP server ended with an error: {e}"),
+                // A panic aborts the daemon (panic = "abort"): not reached.
+                Err(_) => {}
+            }
             res
         })
     })
@@ -873,7 +890,7 @@ async fn recv_from_lsp(
             .recv()
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Lsp))?;
 
-        let lsp_json = serde_json::to_string(&msg).unwrap();
+        let lsp_json = serde_json::to_string(&msg)?;
         let res = buck2_cli_proto::LspMessage { lsp_json };
         match event_sender.send(res).await {
             Ok(_) => {}
@@ -894,11 +911,14 @@ fn handle_incoming_lsp_message(
     from_client: &crossbeam_channel::Sender<Message>,
     message: buck2_error::Result<LspRequest>,
 ) -> buck2_error::Result<Option<LspResponse>> {
-    if let Ok(m) = message {
-        let message = serde_json::from_str(&m.lsp_json)?;
-        if from_client.send(message).is_ok() {
-            return Ok(None);
+    match message {
+        Ok(m) => {
+            let message = serde_json::from_str(&m.lsp_json)?;
+            if from_client.send(message).is_ok() {
+                return Ok(None);
+            }
         }
+        Err(e) => tracing::debug!("LSP client disconnected: {e}"),
     }
     Ok(Some(LspResponse {}))
 }

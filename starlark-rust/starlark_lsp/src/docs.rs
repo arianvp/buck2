@@ -40,8 +40,8 @@ pub(crate) fn get_doc_item_for_def<P: AstPayload>(
     codemap: &CodeMap,
 ) -> Option<DocFunction> {
     let raw_docstring = peek_docstring(&def.body);
-    // TODO(nga): do not unwrap.
-    let def = DefParams::unpack(&def.params, codemap).unwrap();
+    // The parser checked the parameters (an AST has only valid ones).
+    let def = DefParams::unpack(&def.params, codemap).ok()?;
 
     let dp = |i: usize| -> DocParam {
         let param = &def.params[i];

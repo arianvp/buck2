@@ -20,6 +20,7 @@ use dupe::Dupe;
 use crate::ctx::ServerCommandContextTrait;
 use crate::partial_result_dispatcher::NoPartialResult;
 use crate::partial_result_dispatcher::PartialResultDispatcher;
+use crate::streaming_request_handler::StreamingRequestHandler;
 
 #[async_trait]
 pub trait BxlServerCommands: Send + Sync + 'static {
@@ -35,6 +36,13 @@ pub trait BxlServerCommands: Send + Sync + 'static {
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::ProfileRequest,
     ) -> buck2_error::Result<buck2_cli_proto::ProfileResponse>;
+    /// Runs a `buck2 repl` session until the client hangs up.
+    async fn repl(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::ReplMessage>,
+        req: StreamingRequestHandler<buck2_cli_proto::ReplRequest>,
+    ) -> buck2_error::Result<buck2_cli_proto::ReplResponse>;
 }
 
 pub static BXL_SERVER_COMMANDS: LateBinding<&'static dyn BxlServerCommands> =

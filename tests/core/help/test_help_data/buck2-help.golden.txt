@@ -11,6 +11,8 @@ Commands:
   aquery                Perform queries on the action graph (experimental)
   build                 Build the specified targets
   bxl                   Run BXL scripts
+  repl                  Start an interactive BXL/Starlark session: evaluate code with `ctx` bound,
+                        run queries, builds and binaries
   help-env              Print help for environment variables used by buck2
   test                  Build and test the specified targets
   cquery                Perform queries on the configured target graph

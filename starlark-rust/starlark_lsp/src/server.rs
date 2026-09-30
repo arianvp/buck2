@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use derivative::Derivative;
 use derive_more::Display;
@@ -33,6 +35,7 @@ use dupe::Dupe;
 use dupe::OptionDupedExt;
 use itertools::Itertools;
 use lsp_server::Connection;
+use lsp_server::ErrorCode;
 use lsp_server::Message;
 use lsp_server::Notification;
 use lsp_server::ProtocolError;
@@ -408,6 +411,9 @@ pub(crate) struct Backend<T: LspContext> {
     /// The `AstModule` from the last time that a file was opened / changed and parsed successfully.
     /// Entries are evicted when the file is closed.
     pub(crate) last_valid_parse: RwLock<HashMap<LspUri, Arc<LspModule>>>,
+    /// A message could not be sent: the client is gone (the other end of the connection was
+    /// dropped). Nothing more is sent, and the main loop ends.
+    client_gone: AtomicBool,
 }
 
 /// The logic implementations of stuff
@@ -471,7 +477,11 @@ impl<T: LspContext> Backend<T> {
 
     fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<(), LspOpError> {
         // We asked for Sync full, so can just grab all the text from params
-        let change = params.content_changes.into_iter().next().unwrap();
+        let Some(change) = params.content_changes.into_iter().next() else {
+            return Err(LspOpError::Other(
+                "`textDocument/didChange` without content changes".to_owned(),
+            ));
+        };
         self.validate(
             params.text_document.uri,
             Some(params.text_document.version as i64),
@@ -1222,14 +1232,36 @@ impl<T: LspContext> Backend<T> {
 /// The library style pieces
 impl<T: LspContext> Backend<T> {
     fn send_notification(&self, x: Notification) {
-        self.connection
-            .sender
-            .send(Message::Notification(x))
-            .unwrap()
+        self.send(Message::Notification(x))
     }
 
     fn send_response(&self, x: Response) {
-        self.connection.sender.send(Message::Response(x)).unwrap()
+        self.send(Message::Response(x))
+    }
+
+    /// Sends a message to the client. A message that cannot be sent means that the client went
+    /// away (e.g. it was killed while requests were in flight): that is not an error of the
+    /// server, which stops sending and ends its main loop (see [`Backend::client_gone`]).
+    fn send(&self, message: Message) {
+        if self.client_gone.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.connection.sender.send(message).is_err() {
+            self.client_gone.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn client_gone(&self) -> bool {
+        self.client_gone.load(Ordering::Relaxed)
+    }
+
+    /// Answers a request whose parameters do not match its method.
+    fn invalid_params(&self, id: RequestId, error: serde_json::Error) {
+        self.send_response(Response::new_err(
+            id,
+            ErrorCode::InvalidParams as i32,
+            format!("invalid parameters: {error}"),
+        ));
     }
 
     fn maybe_log_error(&self, res: Result<(), LspOpError>) {
@@ -1251,41 +1283,79 @@ impl<T: LspContext> Backend<T> {
         ));
     }
 
+    /// Handles the client's messages until it shuts the server down, the connection is closed,
+    /// or the client goes away (a message to it cannot be sent). Messages from the client are
+    /// never trusted: parameters that do not match the method are answered with an error (a
+    /// request) or logged (a notification).
     fn main_loop(&self, initialize_params: InitializeParams) -> Result<(), ProtocolError> {
         self.log_message(MessageType::INFO, "Starlark server initialised");
         for msg in &self.connection.receiver {
+            if self.client_gone() {
+                break;
+            }
             match msg {
                 Message::Request(req) => {
-                    // TODO(nmj): Also implement DocumentSymbols so that some logic can
-                    //            be handled client side.
-                    if let Some(params) = as_request::<GotoDefinition>(&req) {
-                        self.goto_definition(req.id, params, &initialize_params);
-                    } else if let Some(params) = as_request::<StarlarkFileContentsRequest>(&req) {
-                        self.get_starlark_file_contents(req.id, params);
-                    } else if let Some(params) = as_request::<Completion>(&req) {
-                        self.completion(req.id, params, &initialize_params);
-                    } else if let Some(params) = as_request::<HoverRequest>(&req) {
-                        self.hover(req.id, params, &initialize_params);
-                    } else if self.connection.handle_shutdown(&req)? {
+                    if self.handle_request(req, &initialize_params)? {
                         return Ok(());
                     }
-                    // Currently don't handle any other requests
                 }
-                Message::Notification(x) => {
-                    if let Some(params) = as_notification::<DidOpenTextDocument>(&x) {
-                        self.maybe_log_error(self.did_open(params));
-                    } else if let Some(params) = as_notification::<DidChangeTextDocument>(&x) {
-                        self.maybe_log_error(self.did_change(params));
-                    } else if let Some(params) = as_notification::<DidCloseTextDocument>(&x) {
-                        self.maybe_log_error(self.did_close(params));
-                    }
-                }
+                Message::Notification(x) => self.handle_notification(x),
                 Message::Response(_) => {
                     // Don't expect any of these
                 }
             }
+            if self.client_gone() {
+                break;
+            }
         }
         Ok(())
+    }
+
+    /// Handles a request. `true` if it was the `shutdown` request (answered, and followed by
+    /// the `exit` notification).
+    fn handle_request(
+        &self,
+        req: Request,
+        initialize_params: &InitializeParams,
+    ) -> Result<bool, ProtocolError> {
+        // TODO(nmj): Also implement DocumentSymbols so that some logic can
+        //            be handled client side.
+        let id = req.id.clone();
+        let handled = if let Some(params) = as_request::<GotoDefinition>(&req) {
+            params.map(|params| self.goto_definition(id.clone(), params, initialize_params))
+        } else if let Some(params) = as_request::<StarlarkFileContentsRequest>(&req) {
+            params.map(|params| self.get_starlark_file_contents(id.clone(), params))
+        } else if let Some(params) = as_request::<Completion>(&req) {
+            params.map(|params| self.completion(id.clone(), params, initialize_params))
+        } else if let Some(params) = as_request::<HoverRequest>(&req) {
+            params.map(|params| self.hover(id.clone(), params, initialize_params))
+        } else {
+            // Currently don't handle any other requests
+            return self.connection.handle_shutdown(&req);
+        };
+        if let Err(e) = handled {
+            self.invalid_params(id, e);
+        }
+        Ok(false)
+    }
+
+    fn handle_notification(&self, x: Notification) {
+        let handled = if let Some(params) = as_notification::<DidOpenTextDocument>(&x) {
+            params.map(|params| self.did_open(params))
+        } else if let Some(params) = as_notification::<DidChangeTextDocument>(&x) {
+            params.map(|params| self.did_change(params))
+        } else if let Some(params) = as_notification::<DidCloseTextDocument>(&x) {
+            params.map(|params| self.did_close(params))
+        } else {
+            return;
+        };
+        match handled {
+            Ok(result) => self.maybe_log_error(result),
+            Err(e) => self.log_message(
+                MessageType::ERROR,
+                &format!("Invalid notification `{}`: {e}", x.method),
+            ),
+        }
     }
 }
 
@@ -1297,6 +1367,12 @@ pub enum LspServerError {
     BadInitializeParams(serde_json::Error),
     #[error(transparent)]
     Stdio(std::io::Error),
+    /// The client did not start with the `initialize` handshake.
+    #[error("{0}")]
+    Initialize(String),
+    /// The connection was closed before the `initialize` handshake was over.
+    #[error("the connection was closed during initialization")]
+    Disconnected,
 }
 
 /// Instantiate an LSP server that reads on stdin, and writes to stdout
@@ -1319,7 +1395,7 @@ pub fn server_with_connection<T: LspContext>(
     context: T,
 ) -> Result<(), LspServerError> {
     // Run the server and wait for the main thread to end (typically by trigger LSP Exit event).
-    let (init_request_id, init_value) = connection.initialize_start()?;
+    let (init_request_id, init_value) = initialize_start(&connection)?;
 
     let initialization_params: InitializeParams =
         serde_json::from_value(init_value).map_err(LspServerError::BadInitializeParams)?;
@@ -1334,52 +1410,102 @@ pub fn server_with_connection<T: LspContext>(
     let initialize_data = serde_json::json!({
             "capabilities": server_capabilities,
     });
-    connection.initialize_finish(init_request_id, initialize_data)?;
+    initialize_finish(&connection, init_request_id, initialize_data)?;
 
     Backend {
         connection,
         context,
         last_valid_parse: RwLock::default(),
+        client_gone: AtomicBool::new(false),
     }
     .main_loop(initialization_params)?;
 
     Ok(())
 }
 
-fn as_notification<T>(x: &Notification) -> Option<T::Params>
+/// Waits for the `initialize` request (as `Connection::initialize_start` does, whose answers to
+/// other requests panic when the client has gone away).
+fn initialize_start(
+    connection: &Connection,
+) -> Result<(RequestId, serde_json::Value), LspServerError> {
+    loop {
+        let Ok(msg) = connection.receiver.recv() else {
+            return Err(LspServerError::Disconnected);
+        };
+        match msg {
+            Message::Request(req) if req.method == "initialize" => return Ok((req.id, req.params)),
+            Message::Request(req) => {
+                let response = Response::new_err(
+                    req.id,
+                    ErrorCode::ServerNotInitialized as i32,
+                    format!("expected an `initialize` request, got `{}`", req.method),
+                );
+                if connection.sender.send(response.into()).is_err() {
+                    return Err(LspServerError::Disconnected);
+                }
+            }
+            Message::Notification(n) if n.method != "exit" => {}
+            Message::Notification(n) => {
+                return Err(LspServerError::Initialize(format!(
+                    "expected an `initialize` request, got `{}`",
+                    n.method
+                )));
+            }
+            Message::Response(r) => {
+                return Err(LspServerError::Initialize(format!(
+                    "expected an `initialize` request, got a response to request {}",
+                    r.id
+                )));
+            }
+        }
+    }
+}
+
+/// Answers the `initialize` request and waits for the `initialized` notification (as
+/// `Connection::initialize_finish` does, which panics when the client has gone away).
+fn initialize_finish(
+    connection: &Connection,
+    initialize_id: RequestId,
+    initialize_result: serde_json::Value,
+) -> Result<(), LspServerError> {
+    let response = Response::new_ok(initialize_id, initialize_result);
+    if connection.sender.send(response.into()).is_err() {
+        return Err(LspServerError::Disconnected);
+    }
+    match connection.receiver.recv() {
+        Ok(Message::Notification(n)) if n.method == "initialized" => Ok(()),
+        Ok(Message::Notification(n)) => Err(LspServerError::Initialize(format!(
+            "expected an `initialized` notification, got `{}`",
+            n.method
+        ))),
+        Ok(Message::Request(r)) => Err(LspServerError::Initialize(format!(
+            "expected an `initialized` notification, got a `{}` request",
+            r.method
+        ))),
+        Ok(Message::Response(r)) => Err(LspServerError::Initialize(format!(
+            "expected an `initialized` notification, got a response to request {}",
+            r.id
+        ))),
+        Err(_) => Err(LspServerError::Disconnected),
+    }
+}
+
+/// The parameters of `x` if it is a `T` notification (an error if they do not match it).
+fn as_notification<T>(x: &Notification) -> Option<Result<T::Params, serde_json::Error>>
 where
     T: lsp_types::notification::Notification,
     T::Params: DeserializeOwned,
 {
-    if x.method == T::METHOD {
-        let params = serde_json::from_value(x.params.clone()).unwrap_or_else(|err| {
-            panic!(
-                "Invalid notification\nMethod: {}\n error: {}",
-                x.method, err
-            )
-        });
-        Some(params)
-    } else {
-        None
-    }
+    (x.method == T::METHOD).then(|| serde_json::from_value(x.params.clone()))
 }
 
-fn as_request<T>(x: &Request) -> Option<T::Params>
+/// The parameters of `x` if it is a `T` request (an error if they do not match it).
+fn as_request<T>(x: &Request) -> Option<Result<T::Params, serde_json::Error>>
 where
     T: lsp_types::request::Request,
     T::Params: DeserializeOwned,
 {
-    if x.method == T::METHOD {
-        let params = serde_json::from_value(x.params.clone()).unwrap_or_else(|err| {
-            panic!(
-                "Invalid request\n  method: {}\n  error: {}\n  request: {:?}\n",
-                x.method, err, x
-            )
-        });
-        Some(params)
-    } else {
-        None
-    }
+    (x.method == T::METHOD).then(|| serde_json::from_value(x.params.clone()))
 }
 
 /// Create a new `Notification` object with the correct name from the given params.
@@ -1420,29 +1546,37 @@ mod tests {
     use std::str::FromStr as _;
 
     use anyhow::Context;
+    use lsp_server::Message;
     use lsp_server::Request;
     use lsp_server::RequestId;
     use lsp_types::GotoDefinitionParams;
     use lsp_types::GotoDefinitionResponse;
+    use lsp_types::Hover;
+    use lsp_types::HoverParams;
+    use lsp_types::InitializeParams;
     use lsp_types::LocationLink;
     use lsp_types::Position;
     use lsp_types::Range;
     use lsp_types::TextDocumentIdentifier;
     use lsp_types::TextDocumentPositionParams;
     use lsp_types::Uri;
+    use lsp_types::notification::LogMessage;
     use lsp_types::request::GotoDefinition;
+    use lsp_types::request::HoverRequest;
     use starlark::codemap::ResolvedSpan;
     use starlark::wasm::is_wasm;
     use textwrap::dedent;
     use tower_lsp_server::UriExt as _;
 
     use crate::definition::helpers::FixtureWithRanges;
+    use crate::server::LspServerError;
     use crate::server::LspServerSettings;
     use crate::server::LspUri;
     use crate::server::StarlarkFileContentsParams;
     use crate::server::StarlarkFileContentsRequest;
     use crate::server::StarlarkFileContentsResponse;
     use crate::test::TestServer;
+    use crate::test::start_bare_server;
 
     fn goto_definition_request(
         server: &mut TestServer,
@@ -1529,6 +1663,204 @@ mod tests {
 
     fn uri_to_load_string(uri: &Uri) -> String {
         path_to_load_string(&uri.to_file_path().unwrap())
+    }
+
+    fn hover_request(server: &mut TestServer, uri: Uri, line: u32, character: u32) -> Request {
+        server.new_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+        })
+    }
+
+    /// Waits for a message logged by the server that contains `text`.
+    fn logged_message(server: &mut TestServer, text: &str) -> anyhow::Result<()> {
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let logged = server.get_notification::<LogMessage>()?;
+            if logged.message.contains(text) {
+                return Ok(());
+            }
+            seen.push(logged.message);
+        }
+        Err(anyhow::anyhow!("`{text}` was not logged; got {seen:?}"))
+    }
+
+    /// A client that goes away while its requests are in flight (its end of the connection is
+    /// dropped): the server stops without panicking (in the buck2 daemon, a panic aborts it).
+    #[test]
+    fn client_gone_while_requests_are_in_flight() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let (client, server) = start_bare_server();
+        let lsp_server::Connection { sender, receiver } = client;
+        let uri = temp_file_uri("gone.star");
+        let request = |id: i32, method: &str, params: serde_json::Value| {
+            Message::Request(Request {
+                id: RequestId::from(id),
+                method: method.to_owned(),
+                params,
+            })
+        };
+        let notification = |method: &str, params: serde_json::Value| {
+            Message::Notification(lsp_server::Notification {
+                method: method.to_owned(),
+                params,
+            })
+        };
+        sender.send(request(
+            1,
+            "initialize",
+            serde_json::to_value(InitializeParams::default())?,
+        ))?;
+        match receiver.recv_timeout(std::time::Duration::from_secs(10))? {
+            Message::Response(response) if response.id == RequestId::from(1) => {}
+            message => {
+                return Err(anyhow::anyhow!(
+                    "expected the initialize result: {message:?}"
+                ));
+            }
+        }
+        // The client goes away: from now on, nothing the server sends can arrive. (The server
+        // may stop before it has read what follows: then these sends fail.)
+        drop(receiver);
+        let _ignored = sender.send(notification("initialized", serde_json::json!({})));
+        let _ignored = sender.send(notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument": {
+                "uri": uri, "languageId": "starlark", "version": 1, "text": "x = 1\n"
+            }}),
+        ));
+        for id in 2..50 {
+            let _ignored = sender.send(request(
+                id,
+                "textDocument/hover",
+                serde_json::json!({
+                    "textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}
+                }),
+            ));
+        }
+        drop(sender);
+        let result = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("the server panicked"))?;
+        result?;
+        Ok(())
+    }
+
+    /// The same before the handshake: a client that sends requests before `initialize` and
+    /// goes away gets no answers, and the server stops.
+    #[test]
+    fn client_gone_before_initialize() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let (client, server) = start_bare_server();
+        let lsp_server::Connection { sender, receiver } = client;
+        drop(receiver);
+        for id in 1..5 {
+            let _ignored = sender.send(Message::Request(Request {
+                id: RequestId::from(id),
+                method: "textDocument/hover".to_owned(),
+                params: serde_json::json!({}),
+            }));
+        }
+        drop(sender);
+        let result = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("the server panicked"))?;
+        assert!(
+            matches!(result, Err(LspServerError::Disconnected)),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    /// Parameters that do not match their method get an error (a request) or are logged (a
+    /// notification), and the server goes on.
+    #[test]
+    fn invalid_params_are_not_fatal() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let uri = temp_file_uri("file.star");
+        let mut server = TestServer::new()?;
+        server.open_file(uri.clone(), "y = 1\n".to_owned())?;
+
+        let bad = server.send_request(Request {
+            id: RequestId::from(1000),
+            method: "textDocument/hover".to_owned(),
+            params: serde_json::json!({"textDocument": 5}),
+        })?;
+        let error = server
+            .get_response::<Hover>(bad)
+            .expect_err("invalid params are an error");
+        assert!(error.to_string().contains("invalid parameters"), "{error}");
+
+        server.send_notification(lsp_server::Notification {
+            method: "textDocument/didOpen".to_owned(),
+            params: serde_json::json!({"x": 1}),
+        })?;
+        logged_message(&mut server, "Invalid notification `textDocument/didOpen`")?;
+
+        // A change without its content is logged too.
+        server.send_notification(lsp_server::Notification {
+            method: "textDocument/didChange".to_owned(),
+            params: serde_json::json!({
+                "textDocument": {"uri": uri, "version": 5}, "contentChanges": []
+            }),
+        })?;
+        logged_message(&mut server, "without content changes")?;
+
+        let request = hover_request(&mut server, uri, 0, 0);
+        let id = server.send_request(request)?;
+        server.get_response::<Hover>(id)?;
+        Ok(())
+    }
+
+    /// A position past the end of its line, by any amount (the client chooses it), is the end
+    /// of the line: no overflow of the position in the file (which panics with overflow checks
+    /// on, and in the buck2 daemon aborts it).
+    #[test]
+    fn positions_past_the_end_of_a_line() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let uri = temp_file_uri("file.star");
+        let mut server = TestServer::new()?;
+        server.open_file(
+            uri.clone(),
+            "y = 1\ndef f(a):\n    return a\nprint(f(y))\n".to_owned(),
+        )?;
+        for line in 0..5 {
+            for character in [u32::MAX, u32::MAX - 3, 1 << 31, 1000] {
+                let request = hover_request(&mut server, uri.clone(), line, character);
+                let id = server.send_request(request)?;
+                server.get_response::<Hover>(id)?;
+
+                let request = goto_definition_request(&mut server, uri.clone(), line, character);
+                let id = server.send_request(request)?;
+                server.get_response::<GotoDefinitionResponse>(id)?;
+
+                let request = server.new_request::<lsp_types::request::Completion>(
+                    lsp_types::CompletionParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: Position { line, character },
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: None,
+                    },
+                );
+                let id = server.send_request(request)?;
+                server.get_response::<lsp_types::CompletionResponse>(id)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]

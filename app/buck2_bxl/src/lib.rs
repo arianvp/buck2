@@ -19,6 +19,7 @@ pub(crate) mod bxl;
 pub(crate) mod command;
 mod commands;
 pub(crate) mod profile_command;
+pub(crate) mod repl;
 
 pub fn init_late_bindings() {
     static ONCE: Once = Once::new();

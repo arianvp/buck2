@@ -723,6 +723,7 @@ dependencies = [
  "buck2_cmd_log_client",
  "buck2_cmd_query_server",
  "buck2_cmd_rage_client",
+ "buck2_cmd_repl_client",
  "buck2_cmd_starlark_client",
  "buck2_cmd_starlark_server",
  "buck2_cmd_targets_server",
@@ -1008,6 +1009,7 @@ dependencies = [
  "setsketch",
  "smallvec",
  "sorted_vector_map",
+ "stacker",
  "starlark",
  "starlark_map",
  "strong_hash",
@@ -1149,6 +1151,7 @@ dependencies = [
  "buck2_anon_target",
  "buck2_artifact",
  "buck2_build_api",
+ "buck2_certs",
  "buck2_cli_proto",
  "buck2_common",
  "buck2_core",
@@ -1164,6 +1167,7 @@ dependencies = [
  "buck2_profile",
  "buck2_query",
  "buck2_query_parser",
+ "buck2_repl_syntax",
  "buck2_server_ctx",
  "buck2_transition",
  "buck2_util",
@@ -1185,6 +1189,7 @@ dependencies = [
  "pagable",
  "serde",
  "serde_json",
+ "stacker",
  "starlark",
  "starlark_map",
  "strong_hash",
@@ -1601,6 +1606,33 @@ dependencies = [
  "superconsole",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "buck2_cmd_repl_client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "buck2_cli_proto",
+ "buck2_client_ctx",
+ "buck2_core",
+ "buck2_data",
+ "buck2_error",
+ "buck2_event_observer",
+ "buck2_events",
+ "buck2_repl_syntax",
+ "buck2_util",
+ "buck2_wrapper_common",
+ "clap",
+ "crossterm",
+ "dirs",
+ "dupe",
+ "futures 0.3.34",
+ "rustyline",
+ "serde_json",
+ "shlex",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -2918,6 +2950,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_repl_syntax"
+version = "0.1.0"
+dependencies = [
+ "shlex",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "buck2_resource_control"
 version = "0.1.0"
 dependencies = [
@@ -3359,6 +3400,15 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "buffer-redux"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "431a9cc8d7efa49bc326729264537f5e60affce816c66edf434350778c9f4f54"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -7959,6 +8009,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53f6a737db68eb1a8ccff86b584b2fc13eca6a7bb6f78ebc7c529547e3ab9684"
 dependencies = [
  "bitflags 2.13.2",
+ "buffer-redux",
  "cfg-if",
  "clipboard-win",
  "home",

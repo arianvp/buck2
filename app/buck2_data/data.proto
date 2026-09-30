@@ -1520,6 +1520,7 @@ message CommandStart {
     ExpandExternalCellsCommandStart expand_external_cell = 41;
     CompleteCommandStart complete = 42;
     HydrationCommandStart hydration = 43;
+    ReplCommandStart repl = 44;
   }
 }
 
@@ -1601,6 +1602,8 @@ message CompleteCommandStart {}
 
 message HydrationCommandStart {}
 
+message ReplCommandStart {}
+
 message CommandEnd {
   reserved 3, 4;
   oneof data {
@@ -1628,6 +1631,7 @@ message CommandEnd {
     ExpandExternalCellsCommandEnd expand_external_cell = 41;
     CompleteCommandEnd complete = 42;
     HydrationCommandEnd hydration = 43;
+    ReplCommandEnd repl = 44;
   }
 
   // This should eventually be deleted. Retaining only so that ingress
@@ -1856,6 +1860,8 @@ message ExpandExternalCellsCommandEnd {}
 message CompleteCommandEnd {}
 
 message HydrationCommandEnd {}
+
+message ReplCommandEnd {}
 
 message LoadPackageStart {
   string path = 1;

@@ -13,8 +13,6 @@ use std::iter;
 
 use allocative::Allocative;
 use buck2_build_api::configure_targets::get_maybe_compatible_targets;
-use buck2_core::cells::cell_path::CellPathRef;
-use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::configuration::compatibility::IncompatiblePlatformReason;
 use buck2_core::configuration::compatibility::MaybeCompatible;
 use buck2_core::configuration::compatibility::ResultMaybeCompatible;
@@ -402,7 +400,7 @@ impl<'v> TargetListExpr<'v, ConfiguredTargetNode> {
         match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
             ctx.target_alias_resolver(),
             // TODO(nga): Parse relaxed relative to cell root is incorrect.
-            CellPathRef::new(ctx.cell_name(), CellRelativePath::empty()),
+            ctx.relative_pattern_base(),
             val,
             ctx.cell_resolver(),
             ctx.cell_alias_resolver(),
@@ -566,7 +564,7 @@ impl<'v> TargetListExpr<'v, TargetNode> {
                 match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
                     ctx.target_alias_resolver(),
                     // TODO(nga): Parse relaxed relative to cell root is incorrect.
-                    CellPathRef::new(ctx.cell_name(), CellRelativePath::empty()),
+                    ctx.relative_pattern_base(),
                     s,
                     ctx.cell_resolver(),
                     ctx.cell_alias_resolver(),
@@ -655,7 +653,7 @@ async fn unpack_string_literal(
     match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
         ctx.target_alias_resolver(),
         // TODO(nga): Parse relaxed relative to cell root is incorrect.
-        CellPathRef::new(ctx.cell_name(), CellRelativePath::empty()),
+        ctx.relative_pattern_base(),
         val,
         ctx.cell_resolver(),
         ctx.cell_alias_resolver(),
@@ -831,7 +829,7 @@ impl OwnedTargetNodeArg {
             OwnedTargetNodeArg::String(str) => {
                 match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
                     ctx.target_alias_resolver(),
-                    CellPathRef::new(ctx.cell_name(), CellRelativePath::empty()),
+                    ctx.relative_pattern_base(),
                     str,
                     ctx.cell_resolver(),
                     ctx.cell_alias_resolver(),

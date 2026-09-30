@@ -9,6 +9,7 @@
  */
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::Write;
 use std::iter;
 use std::ops::Deref;
@@ -58,6 +59,7 @@ use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::values::ValueIdentity;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::ListRef;
@@ -191,6 +193,32 @@ impl OutputStreamState {
 
     pub(crate) fn take_state(&self) -> buck2_error::Result<OutputStreamOutcome> {
         let state = self.inner.try_lock().unwrap().take().unwrap();
+        Self::into_outcome(state)
+    }
+
+    /// Takes everything written so far and leaves the state empty but usable, unlike
+    /// [`take_state`](Self::take_state), which can be called once. `buck2 repl` shares one state
+    /// across its whole session and drains it after every input.
+    ///
+    /// The state is emptied even when the conversion of the ensured artifacts fails.
+    pub(crate) fn drain(&self) -> buck2_error::Result<OutputStreamOutcome> {
+        let state = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.replace(OutputStreamStateInner::default())
+        };
+        match state {
+            Some(state) => Self::into_outcome(state),
+            None => Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "the output stream state was taken"
+            )),
+        }
+    }
+
+    fn into_outcome(state: OutputStreamStateInner) -> buck2_error::Result<OutputStreamOutcome> {
         let artifacts = state
             .artifacts_to_ensure
             .into_iter()
@@ -452,16 +480,58 @@ impl StarlarkOutputStream {
             artifact_fs: &'a ArtifactFs,
             project_fs: &'a ProjectRoot,
             async_ctx: &'a RefCell<&'s mut BxlDiceComputations<'d>>,
+            /// The containers on the path to the value being serialized: containers are walked
+            /// here rather than by `Value::serialize`, so they need its guards.
+            path: &'a RefCell<HashSet<ValueIdentity<'v>>>,
         }
 
-        impl<'v> SerializeValue<'_, 'v, '_, '_> {
+        /// Native stack left free when entering a container, as `Value::serialize` does:
+        /// serializing a level of nesting takes several KiB of it.
+        const JSON_STACK_RESERVE: usize = 256 << 10;
+
+        /// Takes a container off the path once it is serialized.
+        struct OnPath<'a, 'v> {
+            path: &'a RefCell<HashSet<ValueIdentity<'v>>>,
+            value: ValueIdentity<'v>,
+        }
+
+        impl Drop for OnPath<'_, '_> {
+            fn drop(&mut self) {
+                self.path.borrow_mut().remove(&self.value);
+            }
+        }
+
+        impl<'a, 'v> SerializeValue<'a, 'v, '_, '_> {
             fn with_value(&self, x: Value<'v>) -> Self {
                 Self {
                     value: x,
                     artifact_fs: self.artifact_fs,
                     project_fs: self.project_fs,
                     async_ctx: self.async_ctx,
+                    path: self.path,
                 }
+            }
+
+            /// Puts the container on the path, unless it is on it already (a cycle, which would
+            /// never end) or its nesting would run out of native stack (which aborts).
+            fn enter<E: serde::ser::Error>(&self) -> Result<OnPath<'a, 'v>, E> {
+                if stacker::remaining_stack().is_some_and(|left| left < JSON_STACK_RESERVE) {
+                    return Err(E::custom(format!(
+                        "Value of type `{}` is nested too deeply to serialize to JSON without running out of stack",
+                        self.value.get_type()
+                    )));
+                }
+                let value = self.value.identity();
+                if !self.path.borrow_mut().insert(value) {
+                    return Err(E::custom(format!(
+                        "Cycle detected when serializing value of type `{}` to JSON",
+                        self.value.get_type()
+                    )));
+                }
+                Ok(OnPath {
+                    path: self.path,
+                    value,
+                })
             }
         }
 
@@ -514,17 +584,22 @@ impl StarlarkOutputStream {
                         .map_err(|err| serde::ser::Error::custom(format!("{err:#}")))?;
                     seq_ser.end()
                 } else if let Some(x) = ListRef::from_value(self.value) {
+                    let _on_path = self.enter()?;
                     serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
                 } else if let Some(x) = TupleRef::from_value(self.value) {
+                    let _on_path = self.enter()?;
                     serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
                 } else if let Some(x) = DictRef::from_value(self.value) {
+                    let _on_path = self.enter()?;
                     serializer.collect_map(
                         x.iter()
                             .map(|(k, v)| (self.with_value(k), self.with_value(v))),
                     )
                 } else if let Some(x) = StructRef::from_value(self.value) {
+                    let _on_path = self.enter()?;
                     serializer.collect_map(x.iter().map(|(k, v)| (k, self.with_value(v))))
                 } else if let Some(x) = Record::from_value(self.value) {
+                    let _on_path = self.enter()?;
                     serializer.collect_map(x.iter().map(|(k, v)| (k, self.with_value(v))))
                 } else {
                     self.value.serialize(serializer)
@@ -545,6 +620,7 @@ impl StarlarkOutputStream {
                 artifact_fs: &self.artifact_fs,
                 project_fs: &self.project_fs,
                 async_ctx: &RefCell::new(&mut BxlEvalExtra::from_context(eval)?.dice),
+                path: &RefCell::new(HashSet::new()),
             },
         )
         .buck_error_context("Error writing to JSON for `write_json`")?;
