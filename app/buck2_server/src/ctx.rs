@@ -1429,4 +1429,8 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
     fn command_start(&self) -> Instant {
         self.command_start
     }
+
+    fn build_options(&self) -> Option<&CommonBuildOptions> {
+        self.build_options.as_ref()
+    }
 }

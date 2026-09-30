@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use buck2_certs::validate::CertState;
+use buck2_cli_proto::CommonBuildOptions;
 use buck2_cli_proto::client_context::ExitWhen;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_core::fs::project::ProjectRoot;
@@ -170,5 +171,9 @@ impl ServerCommandContextTrait for ReplCtx<'_> {
 
     fn command_start(&self) -> Instant {
         self.inner.command_start()
+    }
+
+    fn build_options(&self) -> Option<&CommonBuildOptions> {
+        self.inner.build_options()
     }
 }

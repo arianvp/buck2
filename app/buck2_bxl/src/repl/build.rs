@@ -46,11 +46,11 @@ use buck2_core::pattern::pattern::ProvidersLabelWithModifiers;
 use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::ProvidersLabel;
-use buck2_core::provider::label::ProvidersName;
-use buck2_core::target::label::label::TargetLabel;
+use buck2_events::dispatch::console_message;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_hash::BuckMutMap;
+use buck2_node::load_patterns::MissingTargetBehavior;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_repl_syntax::text::CappedString;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
@@ -58,6 +58,7 @@ use buck2_server_ctx::target_resolution_config::TargetResolutionConfig;
 use dice::DiceComputations;
 use dupe::Dupe;
 use futures::FutureExt;
+use starlark_map::small_set::SmallSet;
 
 use crate::repl::render::MAX_TEXT_BYTES;
 use crate::repl::render::ReplFailure;
@@ -105,27 +106,41 @@ pub(crate) async fn build(
     target_cfg: &TargetCfg,
     spec: &BuildSpec,
 ) -> Result<Built, ReplFailure> {
-    let labels = resolve(sctx, dc, target_cfg, &spec.patterns)
+    let opts = TargetOptions::new(sctx);
+    let resolved = resolve(sctx, dc, target_cfg, &spec.patterns, opts)
         .await
         .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Buck, &e))?;
     if let Some(run) = &spec.run {
-        if labels.len() != 1 {
+        let mut errors = BuildErrors::default();
+        for e in &resolved.errors {
+            errors.add(e);
+        }
+        errors.check()?;
+        if resolved.labels.len() != 1 {
             return Err(ReplFailure::new(
                 repl_error::Kind::Usage,
                 &format_args!(
                     "`:run` needs exactly one target, but {} {}",
                     spec.patterns.join(" "),
-                    match labels.len() {
+                    match resolved.labels.len() {
                         0 => "matches none".to_owned(),
                         n => format!("matches {n}"),
                     }
                 ),
             ));
         }
-        let result = build_labels(dc, labels, true).await?;
+        // The target to run was asked for, even if a wildcard matched it (as `//pkg:` does when
+        // `pkg` has one target): if it is incompatible, that is an error.
+        let labels = resolved
+            .labels
+            .into_keys()
+            .map(|label| (label, false))
+            .collect();
+        let result = build_labels(dc, labels, Vec::new(), false, true).await?;
         run_command(dc, &result, run).await
     } else {
-        let result = build_labels(dc, labels, false).await?;
+        let Resolved { labels, errors } = resolved;
+        let result = build_labels(dc, labels, errors, opts.fail_fast, false).await?;
         let artifact_fs = dc
             .get_artifact_fs()
             .await
@@ -134,15 +149,58 @@ pub(crate) async fn build(
     }
 }
 
-/// The configured targets that the patterns match, each with whether it may be skipped when it
-/// is incompatible with its configuration: as in `buck2 build`, targets named explicitly may
-/// not, targets matched by a wildcard (`//pkg:`, `//pkg/...`) may.
+/// The options of `buck2 build` about which targets to build and when to stop, from the
+/// session's build options (the others act through the transaction).
+#[derive(Clone, Copy)]
+struct TargetOptions {
+    /// `--skip-missing-targets`.
+    missing: MissingTargetBehavior,
+    /// `--skip-incompatible-targets`: targets named explicitly may be skipped too.
+    skip_incompatible: bool,
+    /// `--fail-fast`.
+    fail_fast: bool,
+}
+
+impl TargetOptions {
+    fn new(sctx: &dyn ServerCommandContextTrait) -> Self {
+        let opts = sctx.build_options();
+        TargetOptions {
+            missing: MissingTargetBehavior::from_skip(opts.is_some_and(|o| o.skip_missing_targets)),
+            skip_incompatible: opts.is_some_and(|o| o.skip_incompatible_targets),
+            fail_fast: opts.is_some_and(|o| o.fail_fast),
+        }
+    }
+}
+
+/// What target patterns resolve to.
+#[derive(Default)]
+struct Resolved {
+    /// The configured targets, each with whether it may be skipped when it is incompatible with
+    /// its configuration.
+    labels: BTreeMap<ConfiguredProvidersLabel, bool>,
+    /// Packages that failed to load, missing targets and targets that failed to configure: as
+    /// `buck2 build`, `:build` builds the other targets and then fails with these errors.
+    errors: Vec<buck2_error::Error>,
+}
+
+impl Resolved {
+    fn add_label(&mut self, label: ConfiguredProvidersLabel, skippable: bool) {
+        // Patterns with different modifiers may configure to the same label, which is built
+        // once: it may be skipped only if each of them allows it.
+        let entry = self.labels.entry(label).or_insert(skippable);
+        *entry = *entry && skippable;
+    }
+}
+
+/// Resolves the patterns and configures the targets they match, loading the packages and
+/// configuring the targets concurrently.
 async fn resolve(
     sctx: &dyn ServerCommandContextTrait,
     dc: &mut DiceComputations<'_>,
     target_cfg: &TargetCfg,
     patterns: &[String],
-) -> buck2_error::Result<BTreeMap<ConfiguredProvidersLabel, bool>> {
+    opts: TargetOptions,
+) -> buck2_error::Result<Resolved> {
     let resolved =
         parse_and_resolve_patterns_with_modifiers_from_cli_args::<ProvidersPatternExtra>(
             dc,
@@ -150,69 +208,103 @@ async fn resolve(
             sctx.working_dir(),
         )
         .await?;
-    let mut labels: Vec<(ProvidersLabelWithModifiers, bool)> = Vec::new();
-    for (package_with_modifiers, spec) in resolved.specs {
-        let PackageLabelWithModifiers { package, modifiers } = package_with_modifiers;
-        match spec {
-            PackageSpec::Targets(targets) => {
-                for (name, extra) in targets {
-                    labels.push((
-                        ProvidersLabelWithModifiers {
-                            providers_label: ProvidersLabel::new(
-                                TargetLabel::new(package.dupe(), name.as_ref()),
-                                extra.providers,
-                            ),
-                            modifiers: modifiers.dupe(),
-                        },
-                        false,
-                    ));
-                }
-            }
-            PackageSpec::All() => {
-                let results = dc.get_interpreter_results(package.dupe()).await?;
-                for name in results.targets().keys() {
-                    labels.push((
-                        ProvidersLabelWithModifiers {
-                            providers_label: ProvidersLabel::new(
-                                TargetLabel::new(package.dupe(), name),
-                                ProvidersName::Default,
-                            ),
-                            modifiers: modifiers.dupe(),
-                        },
-                        true,
-                    ));
-                }
-            }
-        }
-    }
-
     let config = TargetResolutionConfig::from_args(dc, target_cfg, sctx, &[]).await?;
-    let mut configured: BTreeMap<ConfiguredProvidersLabel, bool> = BTreeMap::new();
-    for (label, skippable) in labels {
-        for label in config
-            .get_configured_provider_label_with_modifiers(dc, &label)
-            .await?
-        {
-            // A target named explicitly is never skipped, even if a wildcard matches it too.
-            let entry = configured.entry(label).or_insert(skippable);
-            *entry = *entry && skippable;
+    let config = &config;
+    let packages = dc
+        .compute_join(resolved.specs, async |dc, (package, spec)| {
+            resolve_package(dc, config, package, spec, opts).await
+        })
+        .await;
+    let mut all = Resolved::default();
+    for package in packages {
+        for (label, skippable) in package.labels {
+            all.add_label(label, skippable);
+        }
+        all.errors.extend(package.errors);
+    }
+    Ok(all)
+}
+
+/// The targets of one package that a pattern matches, configured. As in `buck2 build`, the
+/// targets matched by a wildcard (`//pkg:`, `//pkg/...`) may be skipped when they are
+/// incompatible, the targets named explicitly only with `--skip-incompatible-targets`. A target
+/// named in a package that a wildcard also matches is merged into the wildcard when the patterns
+/// are resolved, so it may be skipped too (as in `buck2 build //pkg:x //pkg:`).
+async fn resolve_package(
+    dc: &mut DiceComputations<'_>,
+    config: &TargetResolutionConfig,
+    package: PackageLabelWithModifiers,
+    spec: PackageSpec<ProvidersPatternExtra>,
+    opts: TargetOptions,
+) -> Resolved {
+    let skippable = match spec {
+        PackageSpec::Targets(_) => opts.skip_incompatible,
+        PackageSpec::All() => true,
+    };
+    let PackageLabelWithModifiers { package, modifiers } = package;
+    let mut resolved = Resolved::default();
+    let results = match dc.get_interpreter_results(package.dupe()).await {
+        Ok(results) => results,
+        Err(e) => {
+            resolved.errors.push(e);
+            return resolved;
+        }
+    };
+    let (targets, missing) = results.apply_spec(spec);
+    if let Some(missing) = missing {
+        match opts.missing {
+            MissingTargetBehavior::Fail => resolved
+                .errors
+                .extend(missing.into_all_errors().map(buck2_error::Error::from)),
+            MissingTargetBehavior::Warn => console_message(missing.missing_targets_warning()),
         }
     }
-    Ok(configured)
+    let modifiers = &modifiers;
+    let configured = dc
+        .compute_join(targets, async |dc, ((_name, extra), node)| {
+            let label = ProvidersLabelWithModifiers {
+                providers_label: ProvidersLabel::new(node.label().dupe(), extra.providers),
+                modifiers: modifiers.dupe(),
+            };
+            config
+                .get_configured_provider_label_with_modifiers(dc, &label)
+                .await
+        })
+        .await;
+    for configured in configured {
+        match configured {
+            Ok(labels) => {
+                for label in labels {
+                    resolved.add_label(label, skippable);
+                }
+            }
+            Err(e) => resolved.errors.push(e),
+        }
+    }
+    resolved
 }
 
 /// Builds the targets and materializes their outputs (their `RunInfo` for `:run`, their default
-/// outputs otherwise), failing if anything failed.
+/// outputs otherwise). Fails with `errors` (those of resolving the targets) and the errors of the
+/// build, if there are any: with `fail_fast`, nothing is built when `errors` is not empty, and
+/// the build stops at its first error.
 async fn build_labels(
     dc: &mut DiceComputations<'_>,
     labels: BTreeMap<ConfiguredProvidersLabel, bool>,
+    errors: Vec<buck2_error::Error>,
+    fail_fast: bool,
     run: bool,
 ) -> Result<BuildTargetResult, ReplFailure> {
+    let labels = if fail_fast && !errors.is_empty() {
+        BTreeMap::new()
+    } else {
+        labels
+    };
     let (builder, consumer) = AsyncBuildTargetResultBuilder::new(None, Instant::now());
     let consumer = &consumer;
     let result = builder
         .wait_for(
-            false,
+            fail_fast,
             dc.compute_join(labels, async |ctx, (label, skippable)| {
                 let consumer = consumer.clone();
                 ctx.with_linear_recompute(|ctx| {
@@ -246,30 +338,55 @@ async fn build_labels(
         .await
         .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Buck, &e))?;
 
-    let mut errors: Vec<&buck2_error::Error> = Vec::new();
-    for target in result.configured.values().flatten() {
-        errors.extend(target.errors.iter().map(|e| &e.inner));
-        errors.extend(target.outputs.iter().filter_map(|o| o.inner.as_ref().err()));
+    let mut all = BuildErrors::default();
+    for e in &errors {
+        all.add(e);
     }
-    errors.extend(result.other_errors.values().flatten());
-    match errors.as_slice() {
-        [] => Ok(result),
-        [e] => Err(ReplFailure::from_buck2(repl_error::Kind::Buck, e)),
-        errors => Err(ReplFailure::new(
-            repl_error::Kind::Buck,
-            &BuildErrors(errors),
-        )),
+    for target in result.configured.values().flatten() {
+        for e in &target.errors {
+            all.add(&e.inner);
+        }
+        for e in target.outputs.iter().filter_map(|o| o.inner.as_ref().err()) {
+            all.add(e);
+        }
+    }
+    for e in result.other_errors.values().flatten() {
+        all.add(e);
+    }
+    all.check()?;
+    Ok(result)
+}
+
+/// The distinct errors of a build (as `buck2 build` reports them, an error that several targets
+/// share, such as that of an action they depend on, is shown once).
+#[derive(Default)]
+struct BuildErrors(SmallSet<String>);
+
+impl BuildErrors {
+    fn add(&mut self, e: &buck2_error::Error) {
+        self.0.insert(format!("{e:?}"));
+    }
+
+    /// Fails if there are errors: one error is rendered like other commands' errors, several one
+    /// after the other.
+    fn check(self) -> Result<(), ReplFailure> {
+        let errors: Vec<String> = self.0.into_iter().collect();
+        match errors.as_slice() {
+            [] => Ok(()),
+            [e] => Err(ReplFailure::new(repl_error::Kind::Buck, e)),
+            errors => Err(ReplFailure::new(repl_error::Kind::Buck, &AllErrors(errors))),
+        }
     }
 }
 
-/// The errors of a failed build, one after the other.
-struct BuildErrors<'a>(&'a [&'a buck2_error::Error]);
+/// Several errors, one after the other.
+struct AllErrors<'a>(&'a [String]);
 
-impl fmt::Display for BuildErrors<'_> {
+impl fmt::Display for AllErrors<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "the build failed with {} errors", self.0.len())?;
         for e in self.0 {
-            write!(f, "\n\n{e:?}")?;
+            write!(f, "\n\n{e}")?;
         }
         Ok(())
     }
@@ -341,14 +458,21 @@ async fn run_command(
     result: &BuildTargetResult,
     run: &RunSpec,
 ) -> Result<Built, ReplFailure> {
-    let Some((label, Some(target))) = result.configured.iter().next() else {
-        // An explicitly named target is never skipped: its incompatibility is an error.
+    let Some((label, target)) = result.configured.iter().next() else {
         return Err(ReplFailure::new(
             repl_error::Kind::Internal,
             &"the target of `:run` was not built",
         ));
     };
     let label = label.unconfigured().to_string();
+    let Some(target) = target else {
+        // Not expected: the target is built as not skippable, so that its incompatibility with
+        // its configuration is an error of the build.
+        return Err(ReplFailure::new(
+            repl_error::Kind::Buck,
+            &format_args!("target `{label}` is incompatible with its configuration"),
+        ));
+    };
     let not_runnable = || {
         ReplFailure::new(
             repl_error::Kind::Buck,

@@ -198,12 +198,16 @@ fn details(id: CommandId) -> &'static str {
         }
         CommandId::Build => {
             "Builds the targets, materializes their outputs and prints one `label  path` line \
-             per output. `_` becomes a dict of the output paths by label."
+             per output. `_` becomes a dict of the output paths by label.\n\nAs with \
+             `buck2 build`, targets that a wildcard matches (`//pkg:`, `//pkg/...`) are skipped \
+             when they are incompatible with the target platform, and the session's \
+             `--skip-missing-targets`, `--skip-incompatible-targets` and `--fail-fast` apply."
         }
         CommandId::Run => {
             "Builds the target and runs its `RunInfo` command in the current directory, with \
              the arguments after `--`. With `--print`, prints the command instead of running \
-             it."
+             it. The pattern must match exactly one target, which is never skipped: if it is \
+             incompatible with the target platform, that is an error."
         }
         _ => "",
     }
