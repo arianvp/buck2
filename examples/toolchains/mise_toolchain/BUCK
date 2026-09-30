@@ -1,0 +1,1 @@
+# The lock file is loaded from this package: `load("@root//:mise.lock.toml", ...)`.

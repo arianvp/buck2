@@ -1,0 +1,21 @@
+java_library(
+    name = "lib",
+    srcs = ["Hello.java"],
+)
+
+java_binary(
+    name = "hello",
+    main_class = "Hello",
+    deps = [":lib"],
+)
+
+kotlin_library(
+    name = "kotlin_lib",
+    srcs = ["Hello.kt"],
+)
+
+java_binary(
+    name = "hello_kotlin",
+    main_class = "HelloKt",
+    deps = [":kotlin_lib"],
+)

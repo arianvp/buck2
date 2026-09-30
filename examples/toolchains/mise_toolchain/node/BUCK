@@ -1,0 +1,5 @@
+genrule(
+    name = "hello",
+    out = "hello.txt",
+    cmd = "$(exe toolchains//:node[node]) -e 'console.log(`Hello from Node ${process.version}`)' > $OUT",
+)

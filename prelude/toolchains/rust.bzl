@@ -35,46 +35,61 @@ _DEFAULT_TRIPLE = select({
     }),
 })
 
+# Attributes of the toolchain rules that use `rust_toolchain_info`.
+RUST_TOOLCHAIN_ATTRS = {
+    "allow_lints": attrs.list(attrs.string(), default = []),
+    "clippy_toml": attrs.option(attrs.dep(providers = [DefaultInfo]), default = None),
+    "default_edition": attrs.option(attrs.string(), default = None),
+    "deny_lints": attrs.list(attrs.string(), default = []),
+    "doctests": attrs.bool(default = False),
+    "nightly_features": attrs.bool(default = True),
+    "report_unused_deps": attrs.bool(default = False),
+    "rustc_binary_flags": attrs.list(attrs.arg(), default = []),
+    "rustc_flags": attrs.list(attrs.arg(), default = []),
+    "rustc_target_triple": attrs.string(default = _DEFAULT_TRIPLE),
+    "rustc_test_flags": attrs.list(attrs.arg(), default = []),
+    "rustdoc_flags": attrs.list(attrs.arg(), default = []),
+    "warn_lints": attrs.list(attrs.string(), default = []),
+}
+
+def rust_toolchain_info(ctx, compiler: RunInfo, rustdoc: RunInfo, clippy_driver: RunInfo) -> RustToolchainInfo:
+    """
+    The `RustToolchainInfo` for a rule with `RUST_TOOLCHAIN_ATTRS`, running
+    the given binaries.
+    """
+    return RustToolchainInfo(
+        allow_lints = ctx.attrs.allow_lints,
+        clippy_driver = clippy_driver,
+        clippy_toml = ctx.attrs.clippy_toml[DefaultInfo].default_outputs[0] if ctx.attrs.clippy_toml else None,
+        compiler = compiler,
+        default_edition = ctx.attrs.default_edition,
+        panic_runtime = PanicRuntime("unwind"),
+        deny_lints = ctx.attrs.deny_lints,
+        doctests = ctx.attrs.doctests,
+        nightly_features = ctx.attrs.nightly_features,
+        report_unused_deps = ctx.attrs.report_unused_deps,
+        rustc_binary_flags = ctx.attrs.rustc_binary_flags,
+        rustc_flags = ctx.attrs.rustc_flags,
+        rustc_target_triple = ctx.attrs.rustc_target_triple,
+        rustc_test_flags = ctx.attrs.rustc_test_flags,
+        rustdoc = rustdoc,
+        rustdoc_flags = ctx.attrs.rustdoc_flags,
+        warn_lints = ctx.attrs.warn_lints,
+    )
+
 def _system_rust_toolchain_impl(ctx):
     return [
         DefaultInfo(),
-        RustToolchainInfo(
-            allow_lints = ctx.attrs.allow_lints,
-            clippy_driver = RunInfo(args = ["clippy-driver"]),
-            clippy_toml = ctx.attrs.clippy_toml[DefaultInfo].default_outputs[0] if ctx.attrs.clippy_toml else None,
+        rust_toolchain_info(
+            ctx,
             compiler = RunInfo(args = ["rustc"]),
-            default_edition = ctx.attrs.default_edition,
-            panic_runtime = PanicRuntime("unwind"),
-            deny_lints = ctx.attrs.deny_lints,
-            doctests = ctx.attrs.doctests,
-            nightly_features = ctx.attrs.nightly_features,
-            report_unused_deps = ctx.attrs.report_unused_deps,
-            rustc_binary_flags = ctx.attrs.rustc_binary_flags,
-            rustc_flags = ctx.attrs.rustc_flags,
-            rustc_target_triple = ctx.attrs.rustc_target_triple,
-            rustc_test_flags = ctx.attrs.rustc_test_flags,
             rustdoc = RunInfo(args = ["rustdoc"]),
-            rustdoc_flags = ctx.attrs.rustdoc_flags,
-            warn_lints = ctx.attrs.warn_lints,
+            clippy_driver = RunInfo(args = ["clippy-driver"]),
         ),
     ]
 
 system_rust_toolchain = rule(
     impl = _system_rust_toolchain_impl,
-    attrs = {
-        "allow_lints": attrs.list(attrs.string(), default = []),
-        "clippy_toml": attrs.option(attrs.dep(providers = [DefaultInfo]), default = None),
-        "default_edition": attrs.option(attrs.string(), default = None),
-        "deny_lints": attrs.list(attrs.string(), default = []),
-        "doctests": attrs.bool(default = False),
-        "nightly_features": attrs.bool(default = True),
-        "report_unused_deps": attrs.bool(default = False),
-        "rustc_binary_flags": attrs.list(attrs.arg(), default = []),
-        "rustc_flags": attrs.list(attrs.arg(), default = []),
-        "rustc_target_triple": attrs.string(default = _DEFAULT_TRIPLE),
-        "rustc_test_flags": attrs.list(attrs.arg(), default = []),
-        "rustdoc_flags": attrs.list(attrs.arg(), default = []),
-        "warn_lints": attrs.list(attrs.string(), default = []),
-    },
+    attrs = RUST_TOOLCHAIN_ATTRS,
     is_toolchain_rule = True,
 )

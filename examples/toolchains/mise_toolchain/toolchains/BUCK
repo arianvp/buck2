@@ -1,0 +1,77 @@
+load("@prelude//toolchains:dex.bzl", "system_noop_dex_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load(
+    "@prelude//toolchains/mise:defs.bzl",
+    "mise_cxx_zig_toolchain",
+    "mise_erlang_toolchain",
+    "mise_go_toolchain",
+    "mise_java_toolchains",
+    "mise_python_toolchain",
+    "mise_rust_toolchain",
+    "mise_tool",
+)
+load("@prelude//toolchains:zip_file.bzl", "zip_file_toolchain")
+load("@root//:mise.lock.toml", mise_lock = "value")
+
+mise_cxx_zig_toolchain(
+    name = "cxx",
+    lock = mise_lock,
+)
+
+mise_erlang_toolchain(
+    name = "erlang-default",
+    lock = mise_lock,
+)
+
+# Also defines `:go_bootstrap`.
+mise_go_toolchain(
+    name = "go",
+    lock = mise_lock,
+)
+
+# `:java`, `:java_bootstrap`, `:kotlin`, `:prebuilt_jar`, ... and the JDK, `:jdk`.
+mise_java_toolchains(
+    lock = mise_lock,
+)
+
+# Also defines `:python_bootstrap`.
+mise_python_toolchain(
+    name = "python",
+    lock = mise_lock,
+)
+
+mise_rust_toolchain(
+    name = "rust",
+    default_edition = "2021",
+    lock = mise_lock,
+)
+
+# Any other tool in the lock file, with its executables as sub-targets.
+mise_tool(
+    name = "node",
+    bins = {"node": "bin/node{exe}"},
+    lock = mise_lock,
+    tool = "node",
+    visibility = ["PUBLIC"],
+)
+
+# Toolchains the JVM rules need that don't involve any tools.
+system_noop_dex_toolchain(
+    name = "dex",
+    visibility = ["PUBLIC"],
+)
+
+system_noop_dex_toolchain(
+    name = "empty_dex",
+    visibility = ["PUBLIC"],
+)
+
+zip_file_toolchain(
+    name = "zip_file",
+    visibility = ["PUBLIC"],
+)
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)

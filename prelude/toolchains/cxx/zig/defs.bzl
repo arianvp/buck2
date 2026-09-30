@@ -322,34 +322,52 @@ def _get_linker_type(os: str) -> LinkerType:
     else:
         fail("Cannot determine linker type: Unknown OS '{}'".format(os))
 
+# zig rejects response files that refer to other response files
+# (`NestedResponseFile`), and the C++ rules pass an argsfile made of `@argsfile`
+# lines. Inline such argsfiles, recursively, so that zig only sees argsfiles
+# with plain arguments.
+_FLATTEN_ARGSFILES = """
+flatten() {
+  local a f l
+  for a in "$@"; do
+    f="${a#@}"
+    if [[ "$a" == @* && -f "$f" ]] && ! grep -qv '^@[^[:space:]"'"'"']*$' "$f"; then
+      while IFS= read -r l || [[ -n "$l" ]]; do
+        [[ -n "$l" ]] && flatten "$l"
+      done < "$f"
+    else
+      args+=("$a")
+    fi
+  done
+}
+args=()
+flatten "$@"
+"""
+
+def _zig_script(actions: AnalysisActions, name: str, cmd: cmd_args, os: str) -> cmd_args:
+    if os == "windows":
+        return cmd_script(actions = actions, name = name, cmd = cmd, language = ScriptLanguage("bat"))
+    wrapper, _ = actions.write(
+        actions.declare_output(name + ".sh", has_content_based_path = False),
+        [
+            "#!/usr/bin/env bash",
+            _FLATTEN_ARGSFILES,
+            cmd_args(cmd_args(cmd_args(cmd, quote = "shell"), delimiter = " "), format = 'exec {} "${args[@]}"'),
+        ],
+        is_executable = True,
+        allow_args = True,
+        has_content_based_path = False,
+    )
+    return cmd_args(wrapper, hidden = cmd)
+
 def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
     dist = ctx.attrs.distribution[ZigDistributionInfo]
     zig = ctx.attrs.distribution[RunInfo]
     target = ["-target", ctx.attrs.target] if ctx.attrs.target else []
-    zig_cc = cmd_script(
-        actions = ctx.actions,
-        name = "zig_cc",
-        cmd = cmd_args(zig, "cc"),
-        language = ScriptLanguage("bat" if dist.os == "windows" else "sh"),
-    )
-    zig_cxx = cmd_script(
-        actions = ctx.actions,
-        name = "zig_cxx",
-        cmd = cmd_args(zig, "c++"),
-        language = ScriptLanguage("bat" if dist.os == "windows" else "sh"),
-    )
-    zig_ar = cmd_script(
-        actions = ctx.actions,
-        name = "zig_ar",
-        cmd = cmd_args(zig, "ar"),
-        language = ScriptLanguage("bat" if dist.os == "windows" else "sh"),
-    )
-    zig_ranlib = cmd_script(
-        actions = ctx.actions,
-        name = "zig_ranlib",
-        cmd = cmd_args(zig, "ranlib"),
-        language = ScriptLanguage("bat" if dist.os == "windows" else "sh"),
-    )
+    zig_cc = _zig_script(ctx.actions, "zig_cc", cmd_args(zig, "cc"), dist.os)
+    zig_cxx = _zig_script(ctx.actions, "zig_cxx", cmd_args(zig, "c++"), dist.os)
+    zig_ar = _zig_script(ctx.actions, "zig_ar", cmd_args(zig, "ar"), dist.os)
+    zig_ranlib = _zig_script(ctx.actions, "zig_ranlib", cmd_args(zig, "ranlib"), dist.os)
     return [ctx.attrs.distribution[DefaultInfo]] + cxx_toolchain_infos(
         internal_tools = ctx.attrs._cxx_internal_tools[CxxInternalTools],
         platform_name = dist.arch,
@@ -415,7 +433,14 @@ def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         header_mode = HeaderMode("symlink_tree_only"),  # header map modes require mk_hmap
         # headers_as_raw_headers_mode = None,
         # asm_compiler_info = None,
-        # as_compiler_info = None,
+        # `zig cc` (clang) assembles `.s` and preprocesses and assembles `.S`,
+        # e.g. for cgo.
+        as_compiler_info = CCompilerInfo(
+            compiler = RunInfo(args = cmd_args(zig_cc)),
+            compiler_type = "clang",
+            compiler_flags = cmd_args(target),
+            preprocessor_flags = cmd_args(),
+        ),
         # hip_compiler_info = None,
         # cuda_compiler_info = None,
         # mk_hmap = None,

@@ -1,0 +1,10 @@
+erlang_application(
+    name = "hello",
+    srcs = ["src/hello.erl"],
+)
+
+erlang_escript(
+    name = "script",
+    main_module = "hello",
+    deps = [":hello"],
+)

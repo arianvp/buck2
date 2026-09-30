@@ -1,0 +1,22 @@
+[tools]
+erlang = "28.0.2"
+go = "1.24.4"
+java = "temurin-21.0.8+9.0.LTS"
+node = "22.18.0"
+python = "3.13.6"
+zig = "0.14.1"
+
+# `core:rust` installs through rustup and locks no download, so pin the
+# standalone installers. Their checksums are published at `<url>.sha256`.
+[tools."http:rust"]
+version = "1.89.0"
+
+[tools."http:rust".platforms]
+linux-arm64 = { url = "https://static.rust-lang.org/dist/rust-{{version}}-aarch64-unknown-linux-gnu.tar.xz", checksum = "sha256:ae6f35b027cb32339fa4ac94dab37a21194e9a5c680491d01e54aa61e9da4de7" }
+linux-x64 = { url = "https://static.rust-lang.org/dist/rust-{{version}}-x86_64-unknown-linux-gnu.tar.xz", checksum = "sha256:c4f2796b10ee886001f0799bc40caea38746403a33c379d77878c4f4683f9b51" }
+macos-arm64 = { url = "https://static.rust-lang.org/dist/rust-{{version}}-aarch64-apple-darwin.tar.xz", checksum = "sha256:a62f8ae2011321297319e9e30e06f3c14bbbb67fabf273e6b9e1fd4e1143c86f" }
+macos-x64 = { url = "https://static.rust-lang.org/dist/rust-{{version}}-x86_64-apple-darwin.tar.xz", checksum = "sha256:6b6803b37f5b954e15a647778edf60676c7201cf2b83945cbb8aaf4c333c492a" }
+
+[settings]
+lockfile = true
+lockfile_platforms = ["linux-arm64", "linux-x64", "macos-arm64", "macos-x64", "windows-x64"]
