@@ -270,6 +270,9 @@ fn starlark_site(text: &str, offset: usize) -> Option<Site<'_>> {
                     used,
                     prefix,
                 },
+                Some(StringArgument::Pattern) if !prefix.contains(char::is_whitespace) => {
+                    SiteKind::TargetString { prefix }
+                }
                 Some(StringArgument::Query(dialect)) => {
                     let context = scan_query(prefix);
                     return Some(Site {
@@ -277,8 +280,10 @@ fn starlark_site(text: &str, offset: usize) -> Option<Site<'_>> {
                         kind: SiteKind::Query { dialect, context },
                     });
                 }
-                None if looks_like_pattern(prefix) => SiteKind::TargetString { prefix },
-                None => return None,
+                Some(StringArgument::Pattern) | None if looks_like_pattern(prefix) => {
+                    SiteKind::TargetString { prefix }
+                }
+                Some(StringArgument::Pattern) | None => return None,
             };
             Some(Site { start, kind })
         }
@@ -441,10 +446,27 @@ enum StringArgument<'a> {
     },
     /// The query of `ctx.cquery().eval(...)` (or `uquery`, `aquery`).
     Query(QueryDialect),
+    /// The targets of a method of the BXL context that takes target patterns first
+    /// (`ctx.configured_targets(...)`): a pattern even if it does not look like one yet
+    /// (`"<TAB>`, `"lib:<TAB>`).
+    Pattern,
 }
 
 /// The query contexts' method that evaluates a query, and its parameter.
 const QUERY_EVAL: (&str, &str) = ("eval", "query");
+
+/// The methods of the BXL context whose first parameter takes target patterns, and the names of
+/// that parameter.
+const PATTERN_METHODS: &[&str] = &[
+    "analysis",
+    "build",
+    "configured_targets",
+    "target_exists",
+    "target_universe",
+    "unconfigured_sub_targets",
+    "unconfigured_targets",
+];
+const PATTERN_PARAMETERS: &[&str] = &["label", "labels"];
 
 /// What the string `tokens[string]` (the last token) is an argument of, if it is a whole
 /// argument of a `load`, or the query of a query context's `eval`.
@@ -496,7 +518,14 @@ fn string_argument<'a>(
         None => before.is_empty(),
         Some(keyword) => keyword == QUERY_EVAL.1,
     };
+    let first = match keyword {
+        None => before.is_empty(),
+        Some(keyword) => PATTERN_PARAMETERS.contains(&keyword),
+    };
     match steps.as_slice() {
+        [.., Step::Attr(method)] if first && PATTERN_METHODS.contains(method) => {
+            Some(StringArgument::Pattern)
+        }
         [.., Step::Attr(method), Step::Call, Step::Attr(eval)]
             if query && *eval == QUERY_EVAL.0 =>
         {
@@ -1305,6 +1334,24 @@ mod tests {
         assert_eq!(site("f(a = b▮"), name_at(6, "b"));
         assert_eq!(site("f(*▮"), name_at(3, ""));
         assert_eq!(site("f(a ▮"), None);
+    }
+
+    #[test]
+    fn test_pattern_arguments() {
+        assert_eq!(site("ctx.configured_targets(\"▮"), target_string_at(24, ""));
+        assert_eq!(site("ctx.analysis(\"lib:a▮"), target_string_at(14, "lib:a"));
+        assert_eq!(
+            site("x.unconfigured_targets(labels = \"li▮"),
+            target_string_at(33, "li")
+        );
+        // Other arguments: only strings that look like patterns.
+        assert_eq!(site("ctx.configured_targets(x, \"li▮"), None);
+        assert_eq!(
+            site("ctx.configured_targets(x, target_platform = \"//p▮"),
+            target_string_at(45, "//p")
+        );
+        assert_eq!(site("ctx.configured_targets(\"a b▮"), None);
+        assert_eq!(site("ctx.output.print(\"li▮"), None);
     }
 
     #[test]

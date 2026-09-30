@@ -134,12 +134,10 @@ impl Completion {
         self.status == repl_completions::Status::Ok
     }
 
-    /// Adds the candidates of `other` (e.g. keywords to names). Its status and message are
-    /// kept if this one's are fine.
+    /// Adds the candidates of `other`, which completes the same word in another way (target
+    /// patterns to query functions). Its message is kept if this one has none; the status is
+    /// this one's.
     fn merge(&mut self, other: Completion) {
-        if self.is_ok() && !other.is_ok() {
-            self.status = other.status;
-        }
         if self.message.is_empty() {
             self.message = other.message;
         }
@@ -398,10 +396,26 @@ impl Completer {
     }
 
     /// Modules to load, with one of the `extensions`: labels (`//pkg:x.bzl`, `:x.bzl`) by the
-    /// daemon, paths relative to the working directory here.
+    /// daemon, paths relative to the working directory here (and the cells a word without a
+    /// slash may start, by the daemon).
     fn load_paths(&self, start: usize, word: &str, extensions: &[&str]) -> Completion {
         if !is_label(word) {
-            return Completion::new(start, paths(&self.cwd, word, extensions));
+            let mut completion = Completion::new(start, paths(&self.cwd, word, extensions));
+            if !word.contains('/') {
+                let mut cells = self.listing(
+                    start,
+                    ReplComplete {
+                        kind: repl_complete::Kind::LoadPath as i32,
+                        prefix: word.to_owned(),
+                        ..ReplComplete::default()
+                    },
+                );
+                cells
+                    .candidates
+                    .retain(|c| c.kind() == repl_candidate::Kind::Cell);
+                completion.merge(cells);
+            }
+            return completion;
         }
         let prefix = load_listing(word).unwrap_or(word);
         let mut completion = self.listing(

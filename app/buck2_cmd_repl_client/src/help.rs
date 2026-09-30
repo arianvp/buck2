@@ -227,10 +227,16 @@ Key bindings:
   Enter                 Submit the input if it is complete, otherwise start a new line
   Alt-Enter, Esc Enter  Start a new line
   Tab                   Indent (at the start of a line), otherwise complete: commands,
-                        names, attributes (also after calls: `ctx.cquery().de`), target
-                        patterns (after :build, :run, ... and in strings: `\"//pkg:`),
-                        the files of :load and :bxl, and the functions of a file
-                        after `:bxl x.bxl:`
+                        names, attributes (also after calls: `ctx.cquery().de`),
+                        keyword arguments (`ctx.configured_targets(tar`), target
+                        patterns and subtargets (after :build, :run, ... and in
+                        strings: `\"//pkg:`, `\"//pkg:x[`), query functions and
+                        targets (after :cquery, ... and in `ctx.cquery().eval(\"`),
+                        modules and symbols to load (`load(\"//pkg:`, :load), the
+                        files of :bxl and the functions of a file (`:bxl x.bxl:`).
+                        Words that start the same are offered first, then words that
+                        start the same ignoring case, then words with the letters typed
+                        in order (`ctx.cfgt` completes `configured_targets(`)
   Ctrl-C                Clear the input; while an input runs, interrupt it (a third
                         press ends the session)
   Ctrl-D                End the session (on an empty line)
