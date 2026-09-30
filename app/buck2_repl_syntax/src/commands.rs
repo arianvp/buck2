@@ -17,6 +17,10 @@
 use std::borrow::Cow;
 use std::fmt;
 
+/// The `root` of a `NAME` completion request for the argument of `:who`: the names `:who` lists
+/// (the session's own bindings, without the globals, the prelude's symbols, `ctx` and `_`).
+pub const WHO_NAMES_ROOT: &str = ":who";
+
 /// Every meta-command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandId {

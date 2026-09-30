@@ -38,6 +38,22 @@ pub fn is_loadable_dir(word: &str, drop_dot_slash: bool) -> bool {
     }
 }
 
+/// Whether the directories of `word`, a path relative to the working directory being typed,
+/// go up (`../`, `../../lib/`): `:load` and `load()` at the prompt take such paths (they turn
+/// them into labels), which buck2 does not. As for [`is_loadable_dir`], `drop_dot_slash` drops
+/// leading `./`; the other parts are directory names.
+pub fn is_upward_dir(word: &str, drop_dot_slash: bool) -> bool {
+    let mut word = word;
+    while drop_dot_slash && let Some(rest) = word.strip_prefix("./") {
+        word = rest;
+    }
+    let Some(dir) = word.rfind('/').and_then(|i| word.get(..i)) else {
+        return false;
+    };
+    let parts = || dir.split('/');
+    parts().any(|part| part == "..") && parts().all(|part| !part.is_empty() && part != ".")
+}
+
 /// The end of the cell part of a pattern (`cell//`, `//`), or 0.
 fn after_cell(word: &str) -> usize {
     word.find("//").map_or(0, |i| i + 2)
@@ -156,6 +172,28 @@ mod tests {
         assert!(is_loadable_dir("././pkg/he", true));
         assert!(!is_loadable_dir("./../x", true));
         assert!(!is_loadable_dir("pkg/./x", true));
+    }
+
+    #[test]
+    fn test_is_upward_dir() {
+        for yes in ["../", "../x", "../../lib/he", "a/../b", "../a/"] {
+            assert!(is_upward_dir(yes, false), "{yes}");
+        }
+        for no in [
+            "",
+            "..",
+            "a",
+            "pkg/",
+            "./../x",
+            ".././/x",
+            "/../x",
+            "..//x",
+            "pkg/./../x",
+        ] {
+            assert!(!is_upward_dir(no, false), "{no}");
+        }
+        assert!(is_upward_dir("./../x", true));
+        assert!(!is_upward_dir("./pkg/x", true));
     }
 
     #[test]

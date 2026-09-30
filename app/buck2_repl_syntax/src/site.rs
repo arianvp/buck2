@@ -559,9 +559,8 @@ enum StringArgument<'a> {
 const QUERY_EVAL: (&str, &str) = ("eval", "query");
 
 /// The methods of the BXL context whose first parameter takes target patterns, and the names of
-/// that parameter.
+/// that parameter. (Not `analysis`, which takes labels and nodes, not strings.)
 const PATTERN_METHODS: &[&str] = &[
-    "analysis",
     "build",
     "configured_targets",
     "target_exists",
@@ -1083,7 +1082,10 @@ mod tests {
 
     #[test]
     fn test_20_relative_target_string() {
-        assert_eq!(site("ctx.analysis(\":gr▮"), target_string_at(14, ":gr"));
+        assert_eq!(site("ctx.build(\":gr▮"), target_string_at(11, ":gr"));
+        // `ctx.analysis` takes no strings (a string that looks like a pattern still completes
+        // as one, as anywhere).
+        assert_eq!(site("ctx.analysis(\"lib:a▮"), None);
     }
 
     #[test]
@@ -1491,7 +1493,7 @@ mod tests {
     #[test]
     fn test_pattern_arguments() {
         assert_eq!(site("ctx.configured_targets(\"▮"), target_string_at(24, ""));
-        assert_eq!(site("ctx.analysis(\"lib:a▮"), target_string_at(14, "lib:a"));
+        assert_eq!(site("ctx.build(\"lib:a▮"), target_string_at(11, "lib:a"));
         assert_eq!(
             site("x.unconfigured_targets(labels = \"li▮"),
             target_string_at(33, "li")

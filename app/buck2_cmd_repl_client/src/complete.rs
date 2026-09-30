@@ -52,6 +52,7 @@ use buck2_core::buck2_env;
 use buck2_repl_syntax::candidates::insertion;
 use buck2_repl_syntax::candidates::is_label;
 use buck2_repl_syntax::candidates::is_loadable_dir;
+use buck2_repl_syntax::candidates::is_upward_dir;
 use buck2_repl_syntax::candidates::load_listing;
 use buck2_repl_syntax::candidates::short_display;
 use buck2_repl_syntax::candidates::target_listing;
@@ -61,6 +62,7 @@ use buck2_repl_syntax::commands::HELP_TOPICS;
 use buck2_repl_syntax::commands::QueryDialect;
 use buck2_repl_syntax::commands::SETTINGS;
 use buck2_repl_syntax::commands::SettingSide;
+use buck2_repl_syntax::commands::WHO_NAMES_ROOT;
 use buck2_repl_syntax::commands::setting;
 use buck2_repl_syntax::commands::split_bxl_function;
 use buck2_repl_syntax::lexer::KEYWORDS;
@@ -452,12 +454,13 @@ impl Completer {
                 if word.is_empty() || word.contains(['*', '?']) {
                     Completion::new(start, Vec::new())
                 } else {
-                    // The names of the session, not called.
+                    // The names `:who` lists, not called.
                     let mut completion = self.ask(
                         start,
                         ReplComplete {
                             kind: repl_complete::Kind::Name as i32,
                             prefix: (*word).to_owned(),
+                            root: WHO_NAMES_ROOT.to_owned(),
                             ..ReplComplete::default()
                         },
                         self.starlark_timeout(),
@@ -609,7 +612,10 @@ impl Completer {
     fn load_paths(&self, start: usize, word: &str, site: ModuleSite) -> Completion {
         let extensions = site.extensions();
         if !is_label(word) {
-            if !is_loadable_dir(word, site == ModuleSite::LoadCommand) {
+            let drop_dot_slash = site == ModuleSite::LoadCommand;
+            // `:load` and `load()` take paths that go up (`../x.bzl`), not `:bxl`.
+            let upward = site != ModuleSite::Bxl && is_upward_dir(word, drop_dot_slash);
+            if !upward && !is_loadable_dir(word, drop_dot_slash) {
                 return Completion::new(start, Vec::new());
             }
             let mut completion = Completion::new(start, paths(&self.cwd, word, extensions));
@@ -1105,6 +1111,22 @@ impl ReplCompleter {
     }
 }
 
+/// `text` with its control characters escaped (`\u{1b}`).
+fn printable(text: String) -> String {
+    if !text.chars().any(char::is_control) {
+        return text;
+    }
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 impl rustyline::completion::Completer for ReplCompleter {
     type Candidate = Pair;
 
@@ -1114,7 +1136,13 @@ impl rustyline::completion::Completer for ReplCompleter {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let completion = self.completer.complete(line, pos);
+        let mut completion = self.completer.complete(line, pos);
+        // Names come from files and values (a file name, a field of a struct): rustyline writes
+        // them to the terminal as they are, where control characters would be sequences it
+        // runs. A candidate that inserts one is left out; one that shows one shows it escaped.
+        completion
+            .candidates
+            .retain(|c| !c.replacement.chars().any(char::is_control));
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = completion
             .candidates
             .iter()
@@ -1124,7 +1152,7 @@ impl rustyline::completion::Completer for ReplCompleter {
             .candidates
             .into_iter()
             .map(|c| Pair {
-                display: c.display,
+                display: printable(c.display),
                 replacement: c.replacement,
             })
             .collect();

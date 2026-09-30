@@ -14,6 +14,8 @@
 //! strings are always written as literals (`:cquery deps(:lib)` is
 //! `ctx.cquery().eval("deps(:lib)")`).
 
+use std::borrow::Cow;
+
 use buck2_cli_proto::repl_error;
 use buck2_repl_syntax::commands::ArgError;
 use buck2_repl_syntax::commands::CommandId;
@@ -37,6 +39,16 @@ use crate::repl::render::ReplFailure;
 use crate::repl::settings::SetWork;
 use crate::repl::settings::set_work;
 use crate::repl::thread::EvalKind;
+
+/// Deepest nesting of parentheses in the query of `:uquery`, `:cquery` and `:aquery`. buck2's
+/// query parser recurses on it: a few thousand levels run out of native stack, which aborts the
+/// daemon (as `buck2 cquery` does with them).
+const MAX_QUERY_DEPTH: usize = 500;
+
+/// Most `/`-separated parts of a target pattern given to a command. buck2 resolves a pattern
+/// recursively on its parts: a few thousand run out of native stack, which aborts the daemon (as
+/// `buck2 targets` does with them).
+const MAX_PATTERN_PARTS: usize = 1000;
 
 /// What a meta-command asks of the session.
 pub(crate) enum CommandWork {
@@ -76,9 +88,18 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
         }
         CommandId::Reload => eval(EvalKind::Reload { edited: None }, String::new()),
         CommandId::Reset => Ok(CommandWork::Reset),
-        CommandId::Uquery => eval(EvalKind::Sugar, query_code(QueryDialect::Uquery, arg)),
-        CommandId::Cquery => eval(EvalKind::Sugar, query_code(QueryDialect::Cquery, arg)),
-        CommandId::Aquery => eval(EvalKind::Sugar, query_code(QueryDialect::Aquery, arg)),
+        CommandId::Uquery => eval(
+            EvalKind::Sugar,
+            query_code(QueryDialect::Uquery, &query(arg)?),
+        ),
+        CommandId::Cquery => eval(
+            EvalKind::Sugar,
+            query_code(QueryDialect::Cquery, &query(arg)?),
+        ),
+        CommandId::Aquery => eval(
+            EvalKind::Sugar,
+            query_code(QueryDialect::Aquery, &query(arg)?),
+        ),
         CommandId::Providers => {
             let target = match split_args(arg) {
                 Ok(words) => match <[String; 1]>::try_from(words) {
@@ -95,6 +116,7 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
                 },
                 Err(e) => return Err(usage_error(command, &e)),
             };
+            check_pattern(&target)?;
             eval(EvalKind::Sugar, providers_code(&target))
         }
         CommandId::Build => {
@@ -105,6 +127,7 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
             if patterns.is_empty() {
                 return Err(usage_error(command, &ArgError::MissingTarget));
             }
+            patterns.iter().try_for_each(|p| check_pattern(p))?;
             Ok(CommandWork::Build(BuildSpec {
                 patterns,
                 run: None,
@@ -112,6 +135,7 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
         }
         CommandId::Run => {
             let args = parse_run_args(arg).map_err(|e| usage_error(command, &e))?;
+            check_pattern(&args.target)?;
             Ok(CommandWork::Build(BuildSpec {
                 patterns: vec![args.target],
                 run: Some(RunSpec {
@@ -129,7 +153,7 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
             }))
         }
         CommandId::Info => Ok(CommandWork::Inspect(InspectSpec::Info {
-            target: one_word(command)?,
+            target: check_pattern_word(one_word(command)?)?,
         })),
         CommandId::Ls => {
             let words = split_args(arg).map_err(|e| usage_error(command, &e))?;
@@ -138,10 +162,11 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
                 Err(words) if words.is_empty() => String::new(),
                 Err(_) => return Err(one_argument(command)),
             };
+            check_pattern(&package)?;
             Ok(CommandWork::Inspect(InspectSpec::Ls { package }))
         }
         CommandId::Locate => Ok(CommandWork::Inspect(InspectSpec::Locate {
-            what: one_word(command)?,
+            what: check_pattern_word(one_word(command)?)?,
         })),
         CommandId::Edited => eval(
             EvalKind::Reload {
@@ -172,6 +197,57 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
             })
         }
     }
+}
+
+/// The query of a query command: its argument, unless it is one word quoted as on the shell
+/// (`:cquery 'deps(//x)'`), which is unquoted (the command takes the query as it is typed: the
+/// quoted text would be one target literal). Fails if its parentheses nest too deeply.
+fn query(arg: &str) -> Result<Cow<'_, str>, ReplFailure> {
+    let trimmed = arg.trim();
+    let quote = trimmed.chars().next().filter(|c| matches!(c, '\'' | '"'));
+    let unquoted = match quote {
+        Some(quote) if trimmed.len() >= 2 && trimmed.ends_with(quote) => split_args(trimmed)
+            .ok()
+            .and_then(|words| <[String; 1]>::try_from(words).ok())
+            .map(|[word]| word),
+        _ => None,
+    };
+    let query = unquoted.map_or(Cow::Borrowed(arg), Cow::Owned);
+    let mut depth = 0usize;
+    for c in query.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                if depth > MAX_QUERY_DEPTH {
+                    return Err(ReplFailure::new(
+                        repl_error::Kind::Usage,
+                        &format_args!(
+                            "the query nests more than {MAX_QUERY_DEPTH} levels of parentheses"
+                        ),
+                    ));
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(query)
+}
+
+/// Fails if the target pattern has too many parts to resolve safely.
+fn check_pattern(pattern: &str) -> Result<(), ReplFailure> {
+    if pattern.split('/').count() > MAX_PATTERN_PARTS {
+        return Err(ReplFailure::new(
+            repl_error::Kind::Usage,
+            &format_args!("the pattern has more than {MAX_PATTERN_PARTS} `/`-separated parts"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_pattern_word(word: String) -> Result<String, ReplFailure> {
+    check_pattern(&word)?;
+    Ok(word)
 }
 
 /// The one word of the argument (shell-split).
@@ -254,6 +330,21 @@ fn providers_code(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query() {
+        assert_eq!(query("deps(//a)").ok().as_deref(), Some("deps(//a)"));
+        assert_eq!(query("'deps(//a)'").ok().as_deref(), Some("deps(//a)"));
+        assert_eq!(query(" \"deps(//a)\" ").ok().as_deref(), Some("deps(//a)"));
+        assert_eq!(query("'a' + 'b'").ok().as_deref(), Some("'a' + 'b'"));
+        assert_eq!(query("'").ok().as_deref(), Some("'"));
+        let deep = format!("{}//a{}", "deps(".repeat(500), ")".repeat(500));
+        assert!(query(&deep).is_ok());
+        let deeper = format!("{}//a{}", "deps(".repeat(501), ")".repeat(501));
+        assert!(query(&deeper).is_err());
+        assert!(check_pattern(&"a/".repeat(999)).is_ok());
+        assert!(check_pattern(&"a/".repeat(1000)).is_err());
+    }
 
     #[test]
     fn test_sugar() {

@@ -254,7 +254,7 @@ async fn file_paths(
 }
 
 /// The build file of a target, at the line where the target is defined: as buck2 recorded it
-/// (with `--target-call-stacks`), else the first line with `name = "<target>"`.
+/// (with `--stack`), else the first line with `name = "<target>"`.
 async fn target_location(
     sctx: &dyn ServerCommandContextTrait,
     dc: &mut DiceComputations<'_>,

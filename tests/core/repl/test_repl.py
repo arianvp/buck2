@@ -365,7 +365,7 @@ async def test_repl_complete_names(buck: Buck) -> None:
         "ctx.output.p",
         ":b //",
         ":b //:",
-        'ctx.analysis("//pkg:l',
+        'ctx.configured_targets("//pkg:l',
         "nope.x",
     )
     assert {"cquery(", "configured_targets(", "cell_root("} <= set(answers[0])

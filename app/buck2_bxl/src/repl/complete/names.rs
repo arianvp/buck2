@@ -27,6 +27,7 @@ use buck2_cli_proto::repl_chain_step;
 use buck2_cli_proto::repl_complete;
 use buck2_cli_proto::repl_completions;
 use buck2_interpreter::factory::BuckStarlarkModule;
+use buck2_repl_syntax::commands::WHO_NAMES_ROOT;
 use buck2_repl_syntax::lexer::is_ident_continue;
 use buck2_repl_syntax::lexer::is_ident_start;
 use buck2_repl_syntax::matching::match_tier;
@@ -46,6 +47,7 @@ use starlark::values::Value;
 use crate::repl::complete::candidates::Candidates;
 use crate::repl::complete::candidates::completions_status;
 use crate::repl::complete::private::PrivateBindings;
+use crate::repl::complete::private::is_prelude_id;
 use crate::repl::complete::signature;
 use crate::repl::complete::types::TypeIndex;
 
@@ -66,11 +68,17 @@ pub(crate) fn complete_starlark(
 ) -> ReplCompletions {
     let mut candidates = Candidates::default();
     match req.kind() {
-        repl_complete::Kind::Name => names(env, private, globals, &req.prefix, &mut candidates),
+        // The argument of `:who`: the names it lists.
+        repl_complete::Kind::Name if req.root == WHO_NAMES_ROOT => {
+            names(env, private, None, &req.prefix, &mut candidates, true)
+        }
+        repl_complete::Kind::Name => {
+            names(env, private, globals, &req.prefix, &mut candidates, false)
+        }
         repl_complete::Kind::Attr => attributes(env, private, globals, types, req, &mut candidates),
         repl_complete::Kind::Kwarg => {
             keyword_arguments(env, private, globals, types, req, &mut candidates);
-            names(env, private, globals, &req.prefix, &mut candidates);
+            names(env, private, globals, &req.prefix, &mut candidates, false);
         }
         _ => {
             return completions_status(
@@ -97,8 +105,12 @@ fn binding<'v>(
 
 /// Whether `name` may be a candidate for `prefix`. Names starting with `_` are private: they
 /// are candidates only when the prefix starts with `_` too, except `_` itself (the last value).
+/// A name that is not an identifier (a field of `struct(**{"a b": 1})`) cannot be typed after a
+/// dot, and may hold control characters, which would be written to the terminal as they are.
 fn visible(prefix: &str, name: &str) -> bool {
-    name == "_" || !name.starts_with('_') || prefix.starts_with('_')
+    let identifier =
+        name.chars().next().is_some_and(is_ident_start) && name.chars().all(is_ident_continue);
+    identifier && (name == "_" || !name.starts_with('_') || prefix.starts_with('_'))
 }
 
 /// What a value is, as a candidate.
@@ -156,10 +168,20 @@ fn names(
     globals: Option<&Globals>,
     prefix: &str,
     candidates: &mut Candidates,
+    who: bool,
 ) {
     let mut bound = HashSet::new();
     for (name, visibility) in env.names_and_visibilities() {
         if !visible(prefix, name) || match_tier(prefix, name).is_none() {
+            continue;
+        }
+        // What `:who` leaves out: every session has them.
+        if who
+            && (name == "ctx"
+                || name == "_"
+                || (visibility == Visibility::Private
+                    && private.find(name).is_some_and(|(id, _)| is_prelude_id(id))))
+        {
             continue;
         }
         match binding(env, private, visibility, name) {
