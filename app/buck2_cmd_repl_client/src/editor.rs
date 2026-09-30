@@ -41,6 +41,7 @@ use buck2_repl_syntax::site::Step;
 use buck2_repl_syntax::site::chain_key;
 use buck2_repl_syntax::site::enclosing_call;
 use buck2_repl_syntax::terminal::Position;
+use buck2_repl_syntax::terminal::blanked;
 use buck2_repl_syntax::terminal::editor_position;
 use dupe::Dupe;
 use rustyline::Cmd;
@@ -257,11 +258,17 @@ struct ReplHelper {
 /// rustyline calls the highlighter only when colour is on (see [`color_mode`]).
 impl Highlighter for ReplHelper {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+        let listing = &self.completer.listing;
+        listing.listing_next.set(false);
+        let blank_later_lines = listing.blank_later_lines.take();
         let spans = highlight::spans(line, self.syntax.brackets.get().then_some(pos));
-        let painted = if spans.is_empty() {
-            Cow::Borrowed(line)
-        } else {
-            Cow::Owned(highlight::paint(line, &spans, highlight::ansi_style))
+        let painted = match blank_later_lines
+            .then(|| self.completer.paint_without_later_lines(line, pos, &spans))
+            .flatten()
+        {
+            Some(painted) => Cow::Owned(painted),
+            None if spans.is_empty() => Cow::Borrowed(line),
+            None => Cow::Owned(highlight::paint(line, &spans, highlight::ansi_style)),
         };
         *self.syntax.shown.borrow_mut() = spans;
         painted
@@ -296,6 +303,13 @@ impl Highlighter for ReplHelper {
     fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
         let brackets = kind != CmdKind::ForcedRefresh;
         self.syntax.brackets.set(brackets);
+        let listing = &self.completer.listing;
+        if listing.listing_next.take() && kind == CmdKind::MoveCursor {
+            // rustyline moves the cursor to the end of its line before it lists candidates: the
+            // input is drawn again, without the lines after the cursor's (see [`Listing`]).
+            listing.blank_later_lines.set(true);
+            return true;
+        }
         let spans = highlight::spans(line, brackets.then_some(pos));
         if spans.iter().any(|s| s.class == Class::MatchingBracket) {
             return true;
@@ -348,15 +362,30 @@ impl ConditionalEventHandler for TabIndent {
 /// cursor and writes the list on the rows under it, over what they show, without erasing it.
 /// Those rows hold the signature hint (drawn under the input) and the lines of the input after
 /// the cursor's, which would be left between the candidates. So before the list is drawn,
-/// [`ListingCompleter`] erases them, and when rustyline first inserts the candidates' common
-/// prefix (it then draws the input again, hint included, just before the list), the
-/// signature hint is hidden until the input changes or the cursor moves.
+/// [`ListingCompleter`] erases them.
+///
+/// rustyline may draw the input again before it lists, after that erasing:
+/// - When it first inserts the candidates' common prefix, it draws the whole input, hint
+///   included. Then the signature hint is hidden until the input changes or the cursor moves;
+///   and if lines of the input follow the cursor's, only the prefix is inserted (the completer
+///   gives it as the one candidate): the next Tab, which has nothing to insert, lists.
+/// - When colour is on and the cursor is not at the end of its line, rustyline moves it there,
+///   and draws the input again (without its hint) if what is highlighted changes (a bracket at
+///   the cursor and the one it matches). If lines of the input follow the cursor's, the input
+///   is then always drawn again, with blanks in place of those lines that take the same room
+///   (the editor's cursor movements count on it); they are drawn again under the list.
 #[derive(Default)]
 struct Listing {
     /// The input and the cursor for which the hint is hidden.
     hide_hint_at: RefCell<Option<(String, usize)>>,
     /// The hint last given to the editor, which it shows under the input, is a signature.
     signature_shown: Cell<bool>,
+    /// The completer gave several candidates for an input with lines after the cursor's: if
+    /// rustyline moves the cursor next (to the end of its line, before listing), the input is
+    /// drawn with `blank_later_lines`. Cleared when the input is drawn or highlighted.
+    listing_next: Cell<bool>,
+    /// The next drawing of the input shows blanks in place of the lines after the cursor's.
+    blank_later_lines: Cell<bool>,
 }
 
 impl Listing {
@@ -404,9 +433,24 @@ impl rustyline::completion::Completer for ListingCompleter {
                 && let (Some(before), Some(after)) = (line.get(..start), line.get(pos..))
             {
                 // rustyline inserts the common prefix (`update`) and draws the input again.
+                if after.contains('\n') {
+                    // That draws the lines after the cursor's again, where the list would be
+                    // written over them: only the prefix is inserted, the next Tab lists.
+                    let prefix = prefix.to_owned();
+                    return Ok((
+                        start,
+                        vec![Pair {
+                            display: prefix.clone(),
+                            replacement: prefix,
+                        }],
+                    ));
+                }
                 *self.listing.hide_hint_at.borrow_mut() =
                     Some((format!("{before}{prefix}{after}"), start + prefix.len()));
             }
+            self.listing
+                .listing_next
+                .set(line.get(pos..).is_some_and(|after| after.contains('\n')));
             self.erase_under_line(line, pos);
         }
         Ok((start, candidates))
@@ -424,6 +468,31 @@ impl rustyline::completion::Completer for ListingCompleter {
 }
 
 impl ListingCompleter {
+    /// The input `line` painted with its highlighted parts `spans`, but with blanks in place of
+    /// the lines after the one of the cursor (at `pos`): they take the room that the editor
+    /// counts for those lines (it moves the cursor back up from where they end) and show nothing
+    /// (the editor has cleared the rows). `None` if no line follows the cursor's or the width of
+    /// the terminal is not known.
+    fn paint_without_later_lines(&self, line: &str, pos: usize, spans: &[Span]) -> Option<String> {
+        let line_end = pos + line.get(pos..)?.find('\n')?;
+        let (shown, later) = (line.get(..line_end)?, line.get(line_end..)?);
+        let columns = render::terminal_columns()?;
+        let spans: Vec<Span> = spans
+            .iter()
+            .filter(|s| s.start < line_end)
+            .map(|s| Span {
+                end: s.end.min(line_end),
+                ..*s
+            })
+            .collect();
+        let mode = self.grapheme_mode;
+        let mut painted = highlight::paint(shown, &spans, highlight::ansi_style);
+        painted.push_str(&blanked(later, 0, columns, self.tab_stop, |g| {
+            usize::from(mode.width(g))
+        }));
+        Some(painted)
+    }
+
     /// Erases the rows under the end of the line of the cursor (of the input `line`, the cursor
     /// at `pos`), to the end of the screen, and puts the cursor back. Where the input is drawn is
     /// computed as the editor computes it: after the prompt, wrapped at the terminal's width.

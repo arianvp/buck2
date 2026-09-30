@@ -63,36 +63,15 @@ pub fn editor_position(
     width: impl Fn(&str) -> usize,
 ) -> Position {
     let columns = columns.max(1);
-    let tab_stop = tab_stop.max(1);
     let mut pos = start;
-    let mut escape = Escape::None;
+    let mut measure = EditorMeasure::new(tab_stop, width);
     for g in text.graphemes(true) {
         if g == "\n" {
             pos.row += 1;
             pos.col = 0;
             continue;
         }
-        let w = if g == "\t" {
-            tab_stop - pos.col % tab_stop
-        } else {
-            match escape {
-                Escape::Started => {
-                    escape = if g == "[" { Escape::Csi } else { Escape::None };
-                    0
-                }
-                Escape::Csi => {
-                    if !(g == ";" || g.bytes().next().is_some_and(|b| b.is_ascii_digit())) {
-                        escape = Escape::None;
-                    }
-                    0
-                }
-                Escape::None if g == "\x1b" => {
-                    escape = Escape::Started;
-                    0
-                }
-                Escape::None => width(g),
-            }
-        };
+        let w = measure.columns(g, pos.col);
         pos.col += w;
         if pos.col > columns {
             pos.row += 1;
@@ -104,6 +83,86 @@ pub fn editor_position(
         pos.row += 1;
     }
     pos
+}
+
+/// Blanks in place of `text`, written from the column `start_col` of a terminal `columns` wide:
+/// they move the terminal's cursor as the line editor computes that `text` does (see
+/// [`editor_position`]) and show nothing (spaces, over rows that the editor has cleared). A
+/// newline stays; a grapheme cluster of `w` columns becomes `w` spaces, and when the editor
+/// puts it at the start of the next row (it does not fit), the row is filled with spaces first
+/// so that the terminal goes to the next row too; escape sequences are left out.
+pub fn blanked(
+    text: &str,
+    start_col: usize,
+    columns: usize,
+    tab_stop: usize,
+    width: impl Fn(&str) -> usize,
+) -> String {
+    let columns = columns.max(1);
+    let mut out = String::new();
+    let mut col = start_col;
+    let mut measure = EditorMeasure::new(tab_stop, width);
+    for g in text.graphemes(true) {
+        if g == "\n" {
+            out.push('\n');
+            col = 0;
+            continue;
+        }
+        let w = measure.columns(g, col);
+        if w == 0 {
+            continue;
+        }
+        if col + w > columns {
+            // The terminal waits at the end of a full row: the next character goes to the next.
+            out.extend(std::iter::repeat_n(' ', columns.saturating_sub(col)));
+            col = 0;
+        }
+        out.extend(std::iter::repeat_n(' ', w));
+        col += w;
+    }
+    out
+}
+
+/// The columns that the line editor counts for each grapheme cluster of a text (see
+/// [`editor_position`]).
+struct EditorMeasure<W> {
+    tab_stop: usize,
+    width: W,
+    escape: Escape,
+}
+
+impl<W: Fn(&str) -> usize> EditorMeasure<W> {
+    fn new(tab_stop: usize, width: W) -> Self {
+        EditorMeasure {
+            tab_stop: tab_stop.max(1),
+            width,
+            escape: Escape::None,
+        }
+    }
+
+    /// The columns of `g` (not a newline), written at the column `col`.
+    fn columns(&mut self, g: &str, col: usize) -> usize {
+        if g == "\t" {
+            return self.tab_stop - col % self.tab_stop;
+        }
+        match self.escape {
+            Escape::Started => {
+                self.escape = if g == "[" { Escape::Csi } else { Escape::None };
+                0
+            }
+            Escape::Csi => {
+                if !(g == ";" || g.bytes().next().is_some_and(|b| b.is_ascii_digit())) {
+                    self.escape = Escape::None;
+                }
+                0
+            }
+            Escape::None if g == "\x1b" => {
+                self.escape = Escape::Started;
+                0
+            }
+            Escape::None => (self.width)(g),
+        }
+    }
 }
 
 /// Writes text to a terminal `columns` wide as the terminal does, counting the rows it takes:
@@ -349,5 +408,40 @@ mod tests {
         assert_eq!(editor_position("a\tb", p(0, 0), 20, 8, w), p(0, 9));
         // A grapheme cluster (e + a combining accent) moves as one.
         assert_eq!(editor_position("e\u{301}", p(0, 0), 10, 8, w), p(0, 1));
+    }
+
+    #[test]
+    fn test_blanked() {
+        let w = |g: &str| g.chars().map(char_width).sum::<usize>();
+        assert_eq!(blanked("\nabc\nde", 0, 10, 8, w), "\n   \n  ");
+        // Escape sequences and characters of no width are left out.
+        assert_eq!(blanked("\x1b[1mab\x1b[0m\u{301}", 0, 10, 8, w), "  ");
+        // A wide character that does not fit goes to the next row: the row is filled first.
+        assert_eq!(
+            blanked("abcdefghi界", 0, 10, 8, w),
+            format!("{}{}", " ".repeat(10), "  ")
+        );
+        assert_eq!(blanked("界", 9, 10, 8, w), "   ");
+        // A tab as the editor counts it.
+        assert_eq!(blanked("a\tb", 0, 20, 8, w), " ".repeat(9));
+        // Blanks take the rows that the text takes, and end where it ends.
+        let p = |row, col| Position { row, col };
+        for text in [
+            "\nQQQ ZZZ ZZZ ZZZ ZZZ)",
+            "\n界界界界界界\n\tx\n",
+            "\nabcdefghij\nk",
+            "\na\x1b[31mb界界界界c\u{301}d",
+        ] {
+            // (A tab is 8 columns wide at most: narrower terminals are not considered.)
+            for columns in [8, 9, 10, 13, 80] {
+                let blanks = blanked(text, 0, columns, 8, w);
+                assert!(blanks.chars().all(|c| c == ' ' || c == '\n'), "{blanks:?}");
+                assert_eq!(
+                    editor_position(&blanks, p(0, 0), columns, 8, w),
+                    editor_position(text, p(0, 0), columns, 8, w),
+                    "{text:?} at {columns} columns",
+                );
+            }
+        }
     }
 }

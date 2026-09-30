@@ -391,10 +391,12 @@ Tab completes what is being typed, asking the daemon when needed:
 - the files and functions of `:bxl` (`:bxl //tools/helpers.bxl:`);
 - paths after `:!`, `:edit` and `:load`.
 
-When there are several candidates, Tab inserts what they share and lists them.
-The candidates are the names that start with what you typed; if there are none,
-those that do ignoring case; if there are still none, those that contain its
-letters in order (`ctx.cfgt` → `configured_targets(`).
+When there are several candidates, Tab inserts what they share and lists them
+(in an input of several lines, when lines follow the one being completed, the
+first Tab inserts what they share and the next one lists them). The candidates
+are the names that start with what you typed; if there are none, those that do
+ignoring case; if there are still none, those that contain its letters in order
+(`ctx.cfgt` → `configured_targets(`).
 
 While the cursor is in the parentheses of a call of a function that Tab offered,
 its signature is shown under the input, with the parameter being typed in bold.
