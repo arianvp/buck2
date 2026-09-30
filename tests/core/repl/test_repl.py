@@ -148,7 +148,7 @@ async def test_repl_limits(buck: Buck) -> None:
     # A long value is cut.
     result = await buck.repl("-e", "list(range(200000))")
     assert len(result.stdout) < 70000
-    assert "truncated" in result.stdout
+    assert "cut at 64 KiB" in result.stdout
 
     # A value nested too deeply to format is not formatted.
     result = await buck.repl(
@@ -160,6 +160,54 @@ async def test_repl_limits(buck: Buck) -> None:
     await expect_failure(
         buck.repl("--max-heap-mb", "64", "-e", "y = [str(i) for i in range(5000000)]"),
         stderr_regex="--max-heap-mb",
+    )
+
+    # The daemon is still there.
+    result = await buck.repl("-e", "1 + 1")
+    assert result.stdout == "2\n"
+
+
+@buck_test()
+async def test_repl_no_stack_overflow(buck: Buck) -> None:
+    # Inputs that would overflow the native stack (which aborts the daemon) fail instead.
+    failure = await expect_failure(
+        buck.repl(
+            "--continue-on-error",
+            "-e",
+            'x = cmd_args("a")',
+            "-e",
+            'for i in range(100000): x = cmd_args(x, "b")',
+            "-e",
+            ":j x",
+            "-e",
+            "y = []",
+            "-e",
+            "y.append(y)",
+            "-e",
+            "ctx.output.print_json(y)",
+            "-e",
+            "c = cmd_args(y)",
+            "-e",
+            'z = ctx.lazy.unconfigured_target_node("//:hello")',
+            "-e",
+            "for i in range(1000): z = z.catch()",
+            "-e",
+            ":cq " + "deps(" * 5000 + "//:hello" + ")" * 5000,
+        ),
+        exit_code=ExitCodeV2.USER_ERROR,
+    )
+    assert "nested too deeply" in failure.stderr
+    assert "Cycle detected" in failure.stderr
+    assert "contains itself" in failure.stderr
+    assert "Lazy operations nest too deeply" in failure.stderr
+    assert "more than 500 levels" in failure.stderr
+
+    # An int too large to format quickly is shown as its size.
+    result = await buck.repl(
+        "-e", "n = 1 << 1000", "-e", "for i in range(12): n = n * n", "-e", "[n]"
+    )
+    assert (
+        "<value holding an int of 4096001 bits: too large to display>" in result.stdout
     )
 
     # The daemon is still there.
