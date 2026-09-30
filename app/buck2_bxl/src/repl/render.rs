@@ -89,7 +89,7 @@ pub(crate) const MAX_STREAM_BYTES: usize = 16 << 20;
 /// request does not stop by itself, and a value can cost much more than the size of its
 /// rendering: every level of nesting in the pretty (`{:#}`) form adds work to every byte below
 /// it, and some values (sets, providers, ...) are not looked into beforehand.
-const MAX_RENDER_TIME: Duration = Duration::from_secs(10);
+pub(crate) const MAX_RENDER_TIME: Duration = Duration::from_secs(10);
 
 /// `:print` shows a value nested deeper than this on one line (`{}`, which costs no more than
 /// its size) rather than pretty-printed: 16 MiB pretty-printed 16 deep take about 6 seconds.
@@ -188,6 +188,16 @@ impl<'a> RenderBudget<'a> {
         RenderBudget {
             deadline: Instant::now() + MAX_RENDER_TIME,
             cancelled,
+        }
+    }
+
+    /// Whether work that renders many values goes on: fails when the request was interrupted,
+    /// `false` when the time is up.
+    pub(crate) fn go_on(&self) -> Result<bool, ReplFailure> {
+        match self.check() {
+            Ok(()) => Ok(true),
+            Err(Stop::Interrupted) => Err(ReplFailure::interrupted()),
+            Err(Stop::TimeUp) => Ok(false),
         }
     }
 

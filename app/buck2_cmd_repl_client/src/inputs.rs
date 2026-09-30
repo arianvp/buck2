@@ -380,6 +380,7 @@ impl Inputs {
                 }
                 CommandId::Hist => {
                     return match parse_count(&command.arg) {
+                        Ok(Some(0)) => Next::Continue,
                         Ok(count) => {
                             let text = self.history.render(count);
                             self.print(&text)

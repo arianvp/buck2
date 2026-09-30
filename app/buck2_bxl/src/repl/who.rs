@@ -22,6 +22,7 @@ use starlark::syntax::ast::Visibility;
 use crate::bxl::starlark_defs::context::BxlContextCoreData;
 use crate::repl::complete::private::PrivateBindings;
 use crate::repl::complete::private::is_prelude_id;
+use crate::repl::render::MAX_RENDER_TIME;
 use crate::repl::render::MAX_STREAM_BYTES;
 use crate::repl::render::RenderBudget;
 use crate::repl::render::ReplFailure;
@@ -54,7 +55,13 @@ pub(crate) fn who(
     budget: &RenderBudget<'_>,
 ) -> Result<String, ReplFailure> {
     let mut rows = Vec::new();
+    // Each preview is short, but there may be many: the budget is checked for each.
+    let mut stopped = false;
     for (name, visibility) in env.names_and_visibilities() {
+        if !budget.go_on()? {
+            stopped = true;
+            break;
+        }
         // Every session has them.
         if name == "ctx" || name == "_" {
             continue;
@@ -131,5 +138,18 @@ pub(crate) fn who(
         // A `CappedString` never fails.
         let _ignored = write!(out, "{newline}{}", line.trim_end());
     }
-    Ok(out.into_string())
+    let truncated = out.truncated();
+    let mut out = out.into_string();
+    if truncated {
+        out.push_str(&format!(
+            "\n… (the listing was cut after {} MiB)",
+            MAX_STREAM_BYTES >> 20
+        ));
+    } else if stopped {
+        out.push_str(&format!(
+            "\n… (stopped after {} seconds: not every binding is listed)",
+            MAX_RENDER_TIME.as_secs()
+        ));
+    }
+    Ok(out)
 }

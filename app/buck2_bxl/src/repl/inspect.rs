@@ -295,7 +295,7 @@ async fn info(
     if deps.len() > MAX_DEPS_SHOWN {
         let _ignored = write!(out, " and {} more", deps.len() - MAX_DEPS_SHOWN);
     }
-    Ok(out.into_string())
+    Ok(with_cut_note(out))
 }
 
 /// A writer that fails once the `CappedString` under it is full, which ends the formatting.
@@ -343,26 +343,25 @@ async fn ls(
     )
     .await
     .map_err(buck)?;
+    // The packages are loaded concurrently, as `buck2 targets` does.
+    let packages = dc
+        .compute_join(resolved.specs, async |dc, (package, spec)| {
+            let results = dc.get_interpreter_results(package.package.dupe()).await?;
+            let (targets, missing) = results.apply_spec(spec);
+            if let Some(missing) = missing
+                && let Some(e) = missing.into_all_errors().next()
+            {
+                return Err(buck2_error::Error::from(e));
+            }
+            Ok(targets
+                .values()
+                .map(|node| (node.label().to_string(), node.rule_type().name().to_owned()))
+                .collect::<Vec<_>>())
+        })
+        .await;
     let mut rows: Vec<(String, String)> = Vec::new();
-    let mut errors = Vec::new();
-    for (package, spec) in resolved.specs {
-        let results = dc
-            .get_interpreter_results(package.package.dupe())
-            .await
-            .map_err(buck)?;
-        let (targets, missing) = results.apply_spec(spec);
-        if let Some(missing) = missing {
-            errors.extend(missing.into_all_errors().map(buck2_error::Error::from));
-        }
-        for node in targets.values() {
-            rows.push((node.label().to_string(), node.rule_type().name().to_owned()));
-        }
-        if rows.len() > MAX_STREAM_BYTES / 8 {
-            break;
-        }
-    }
-    if let Some(e) = errors.into_iter().next() {
-        return Err(buck(e));
+    for package in packages {
+        rows.extend(package.map_err(buck)?);
     }
     rows.sort();
     let width = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0).min(60);
@@ -374,7 +373,17 @@ async fn ls(
         let newline = if i == 0 { "" } else { "\n" };
         let _ignored = write!(out, "{newline}{label:<width$}  {rule}");
     }
-    Ok(out.into_string())
+    Ok(with_cut_note(out))
+}
+
+/// The text, with a last line that says so if it was cut.
+fn with_cut_note(out: CappedString) -> String {
+    let truncated = out.truncated();
+    let mut out = out.into_string();
+    if truncated {
+        out.push_str("\n… (the rest was cut)");
+    }
+    out
 }
 
 #[cfg(test)]
