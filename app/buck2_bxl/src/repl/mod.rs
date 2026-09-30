@@ -10,96 +10,54 @@
 
 //! Server side of `buck2 repl`.
 //!
-//! This is the protocol stub: it answers `Open` with `Ready`, echoes every `Eval` input back as a
-//! string value (cut to 64 KiB) and answers every `Complete` with no candidates. The session
-//! proper replaces it.
+//! A session is one command. Its [`driver`] answers the client's requests; each input is
+//! evaluated in a transaction of its own by the session [`thread`], which owns the Starlark
+//! module that keeps the session's bindings (see [`session`]).
 
-use buck2_cli_proto::ReplDone;
-use buck2_cli_proto::ReplError;
 use buck2_cli_proto::ReplMessage;
-use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::ReplResponse;
-use buck2_cli_proto::ReplValue;
-use buck2_cli_proto::repl_completions;
-use buck2_cli_proto::repl_done;
-use buck2_cli_proto::repl_error;
-use buck2_cli_proto::repl_message;
-use buck2_cli_proto::repl_request;
 use buck2_events::dispatch::span_async;
-use buck2_repl_syntax::text::truncate_to_bytes;
 use buck2_server_ctx::commands::command_end;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
-use futures::StreamExt;
+use dupe::Dupe;
 
-/// Most text in a `ReplValue`.
-const MAX_VALUE_BYTES: usize = 64 << 10;
+use crate::repl::driver::Driver;
+use crate::repl::output::ReplEmitter;
+
+mod cancel;
+mod driver;
+mod line_ctx;
+mod output;
+mod prep;
+mod render;
+mod session;
+mod thread;
 
 pub(crate) async fn repl_command(
     sctx: &dyn ServerCommandContextTrait,
-    prd: PartialResultDispatcher<ReplMessage>,
+    // The session's messages go to the same event dispatcher through `ReplEmitter`, which, unlike
+    // this, the session thread can hold too.
+    _prd: PartialResultDispatcher<ReplMessage>,
     req: StreamingRequestHandler<ReplRequest>,
 ) -> buck2_error::Result<ReplResponse> {
     let start = sctx
         .command_start_event(buck2_data::ReplCommandStart {}.into())
         .await?;
+    let emitter = ReplEmitter::new(sctx.events().dupe());
     span_async(start, async move {
-        let result = stub_loop(prd, req).await;
+        // Cancellation of the command (e.g. the client going away) is observed by the driver,
+        // which winds the session down; the session is never dropped midway (INV-8).
+        let result = sctx
+            .cancellation_context()
+            .with_structured_cancellation(|observer| {
+                Driver::new(sctx, req, observer, emitter).run()
+            })
+            .await;
         let end = command_end(&result, buck2_data::ReplCommandEnd {});
         (result, end)
     })
     .await
-}
-
-async fn stub_loop(
-    mut prd: PartialResultDispatcher<ReplMessage>,
-    mut req: StreamingRequestHandler<ReplRequest>,
-) -> buck2_error::Result<ReplResponse> {
-    // EOF, a stream error and `Hangup` all end the session.
-    while let Some(Ok(request)) = req.next().await {
-        let id = request.id;
-        let message = match request.request {
-            Some(repl_request::Request::Open(_)) => repl_message::Message::Ready(ReplReady {
-                cwd: String::new(),
-                target_platform: String::new(),
-                prelude_loaded: false,
-            }),
-            Some(repl_request::Request::Eval(eval)) => {
-                let text = truncate_to_bytes(&eval.input, MAX_VALUE_BYTES);
-                repl_message::Message::Done(ReplDone {
-                    outcome: Some(repl_done::Outcome::Value(ReplValue {
-                        r#type: "str".to_owned(),
-                        text: text.to_owned(),
-                        truncated: text.len() < eval.input.len(),
-                        json: None,
-                    })),
-                    ..ReplDone::default()
-                })
-            }
-            Some(repl_request::Request::Complete(_)) => {
-                repl_message::Message::Completions(buck2_cli_proto::ReplCompletions {
-                    status: repl_completions::Status::Ok as i32,
-                    candidates: Vec::new(),
-                    message: String::new(),
-                })
-            }
-            // Nothing is ever in flight, so there is nothing to interrupt.
-            Some(repl_request::Request::Interrupt(_)) => continue,
-            Some(repl_request::Request::Hangup(_)) => break,
-            None => repl_message::Message::Done(ReplDone {
-                outcome: Some(repl_done::Outcome::Error(ReplError {
-                    kind: repl_error::Kind::Internal as i32,
-                    message: "error: malformed repl request (no request)".to_owned(),
-                })),
-                ..ReplDone::default()
-            }),
-        };
-        prd.emit(ReplMessage {
-            id,
-            message: Some(message),
-        });
-    }
-    Ok(ReplResponse {})
 }

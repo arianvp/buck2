@@ -55,6 +55,7 @@ use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::BxlContextError;
 use crate::bxl::starlark_defs::context::BxlContextType;
 use crate::bxl::starlark_defs::context::NotATargetLabelString;
+use crate::bxl::starlark_defs::context::ReplUnsupported;
 use crate::bxl::starlark_defs::context::actions::BxlActions;
 use crate::bxl::starlark_defs::context::actions::resolve_bxl_execution_platform;
 use crate::bxl::starlark_defs::context::actions::validate_action_instantiation;
@@ -433,6 +434,11 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
         >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<BxlActions<'v>> {
+        if this.is_repl() {
+            // Artifacts owned by the session's synthetic key could never be built: resolving
+            // them re-evaluates the key's .bxl file, which does not exist.
+            return Err(buck2_error::Error::from(ReplUnsupported::BxlActions).into());
+        }
         let heap = eval.heap();
         Ok(this.via_dice(eval, |ctx| {
             ctx.via(|ctx| {

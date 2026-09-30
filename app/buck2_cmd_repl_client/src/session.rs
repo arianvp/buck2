@@ -17,12 +17,16 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::ReplDone;
+use buck2_cli_proto::ReplHangup;
 use buck2_cli_proto::ReplMessage;
 use buck2_cli_proto::ReplNotice;
 use buck2_cli_proto::ReplOpen;
@@ -38,7 +42,10 @@ use buck2_client_ctx::events_ctx::PartialResultCtx;
 use buck2_client_ctx::events_ctx::PartialResultHandler;
 use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
+use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
+use buck2_events::BuckEvent;
 use buck2_util::threads::thread_spawn;
+use dupe::Dupe;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::ReplCommand;
@@ -48,6 +55,85 @@ use crate::script::ScriptOutcome;
 
 /// The id of the `Open` request. Later requests count up from here.
 pub(crate) const OPEN_ID: u64 = 1;
+
+/// Hangs the session up when the daemon announces that it is shutting down (e.g. `buck2 kill`).
+///
+/// The daemon waits for its open streams before it exits, and an idle session would otherwise
+/// keep its stream open until the daemon gives up waiting and is killed.
+#[derive(Clone, Debug, Default, Dupe)]
+pub(crate) struct ShutdownHangup(Arc<Mutex<ShutdownState>>);
+
+#[derive(Debug, Default)]
+struct ShutdownState {
+    /// Where to send the hangup, once the session has started. Weak, so that it does not keep
+    /// the request stream open.
+    requests: Option<(
+        tokio::sync::mpsc::WeakUnboundedSender<ReplRequest>,
+        Arc<AtomicU64>,
+    )>,
+    /// Why the daemon is shutting down, once it has said so.
+    reason: Option<String>,
+}
+
+impl ShutdownHangup {
+    fn state(&self) -> std::sync::MutexGuard<'_, ShutdownState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn arm(
+        &self,
+        req_tx: &tokio::sync::mpsc::UnboundedSender<ReplRequest>,
+        next_id: Arc<AtomicU64>,
+    ) {
+        self.state().requests = Some((req_tx.downgrade(), next_id));
+    }
+
+    fn hang_up(&self, reason: &str) {
+        let mut state = self.state();
+        if state.reason.is_none() {
+            state.reason = Some(reason.to_owned());
+        }
+        if let Some((req_tx, next_id)) = state.requests.take()
+            && let Some(req_tx) = req_tx.upgrade()
+        {
+            // Fails only if the call is already over.
+            let _ignored = req_tx.send(ReplRequest {
+                id: next_id.fetch_add(1, Ordering::Relaxed),
+                request: Some(repl_request::Request::Hangup(ReplHangup {})),
+            });
+        }
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.state().reason.clone()
+    }
+
+    pub(crate) fn subscriber(&self) -> Box<dyn EventSubscriber> {
+        Box::new(ShutdownSubscriber(self.dupe()))
+    }
+}
+
+struct ShutdownSubscriber(ShutdownHangup);
+
+#[async_trait]
+impl EventSubscriber for ShutdownSubscriber {
+    fn name(&self) -> &'static str {
+        "repl-shutdown"
+    }
+
+    async fn handle_events(&mut self, events: &[Arc<BuckEvent>]) -> buck2_error::Result<()> {
+        for event in events {
+            if let buck2_data::buck_event::Data::Instant(instant) = event.data() {
+                if let Some(buck2_data::instant_event::Data::DaemonShutdown(shutdown)) =
+                    &instant.data
+                {
+                    self.0.hang_up(&shutdown.reason);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// What the input thread learns from the daemon.
 pub(crate) enum UiEvent {
@@ -125,6 +211,7 @@ pub(crate) async fn run(
     let (compl_tx, compl_rx) = std::sync::mpsc::channel::<(u64, ReplCompletions)>();
     let (outcome_tx, mut outcome_rx) = tokio::sync::oneshot::channel::<ScriptOutcome>();
     let next_id = Arc::new(AtomicU64::new(OPEN_ID + 1));
+    cmd.shutdown.arm(&req_tx, next_id.dupe());
 
     let open = ReplRequest {
         id: OPEN_ID,
@@ -138,6 +225,7 @@ pub(crate) async fn run(
     // Cannot fail: `req_rx` is alive.
     let _ignored = req_tx.send(open);
 
+    let shutdown = cmd.shutdown.dupe();
     let inputs = if cmd.eval.is_empty() {
         ScriptInputs::Stdin
     } else {
@@ -181,9 +269,13 @@ pub(crate) async fn run(
     match result {
         Err(e) => ExitResult::err(e),
         Ok(CommandOutcome::Failure(exit)) => exit,
-        Ok(CommandOutcome::Success(_)) => match outcome {
-            Some(outcome) => outcome.exit_result(),
-            None => ExitResult::err(buck2_error::buck2_error!(
+        Ok(CommandOutcome::Success(_)) => match (outcome, shutdown.reason()) {
+            (Some(outcome), _) => outcome.exit_result(),
+            (None, Some(reason)) => ExitResult::err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::InterruptedByDaemonShutdown,
+                "the buck2 daemon was shut down, which ended the repl session: {reason}"
+            )),
+            (None, None) => ExitResult::err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Tier0,
                 "the daemon ended the repl session before all inputs were evaluated"
             )),

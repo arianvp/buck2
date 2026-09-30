@@ -89,6 +89,18 @@ enum BxlContextError {
     RequireSameExecutionPlatformAsRoot,
 }
 
+/// Features of `ctx` that `buck2 repl` does not support.
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
+pub(crate) enum ReplUnsupported {
+    #[error(
+        "`ctx.bxl_actions()` is not available in `buck2 repl`: actions declared at the prompt are \
+         not owned by a real .bxl file and cannot be built. Put this code in a .bxl file and run \
+         it with `buck2 bxl` (or `:bxl` once available)."
+    )]
+    BxlActions,
+}
+
 #[derive(buck2_error::Error, Debug)]
 #[error("Expected a single target as a string literal, not a target pattern")]
 #[buck2(tag = Input)]
@@ -204,6 +216,8 @@ pub(crate) struct BxlContextCoreData {
     project_fs: ProjectRoot,
     #[derivative(Debug = "ignore")]
     artifact_fs: ArtifactFs,
+    /// Set for the `ctx` of `buck2 repl`: the directory the session was started in.
+    repl_cwd: Option<CellPath>,
 }
 
 impl BxlContextCoreData {
@@ -240,7 +254,27 @@ impl BxlContextCoreData {
             cell_alias_resolver,
             project_fs,
             artifact_fs: artifact_fs.dupe(),
+            repl_cwd: None,
         })
+    }
+
+    /// Marks this as the data of a `buck2 repl` session started in `cwd`.
+    pub(crate) fn with_repl_cwd(self, cwd: CellPath) -> Self {
+        Self {
+            repl_cwd: Some(cwd),
+            ..self
+        }
+    }
+
+    /// Whether this is the data of a `buck2 repl` session, whose synthetic `BxlKey` must not
+    /// own artifacts.
+    pub(crate) fn is_repl(&self) -> bool {
+        self.repl_cwd.is_some()
+    }
+
+    /// The directory the `buck2 repl` session was started in, if this is one.
+    pub(crate) fn repl_cwd(&self) -> Option<&CellPath> {
+        self.repl_cwd.as_ref()
     }
 
     pub(crate) fn key(&self) -> &BxlKey {

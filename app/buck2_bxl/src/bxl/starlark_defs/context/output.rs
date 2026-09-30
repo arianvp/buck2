@@ -191,6 +191,32 @@ impl OutputStreamState {
 
     pub(crate) fn take_state(&self) -> buck2_error::Result<OutputStreamOutcome> {
         let state = self.inner.try_lock().unwrap().take().unwrap();
+        Self::into_outcome(state)
+    }
+
+    /// Takes everything written so far and leaves the state empty but usable, unlike
+    /// [`take_state`](Self::take_state), which can be called once. `buck2 repl` shares one state
+    /// across its whole session and drains it after every input.
+    ///
+    /// The state is emptied even when the conversion of the ensured artifacts fails.
+    pub(crate) fn drain(&self) -> buck2_error::Result<OutputStreamOutcome> {
+        let state = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *guard, Some(OutputStreamStateInner::default()))
+        };
+        match state {
+            Some(state) => Self::into_outcome(state),
+            None => Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "the output stream state was taken"
+            )),
+        }
+    }
+
+    fn into_outcome(state: OutputStreamStateInner) -> buck2_error::Result<OutputStreamOutcome> {
         let artifacts = state
             .artifacts_to_ensure
             .into_iter()

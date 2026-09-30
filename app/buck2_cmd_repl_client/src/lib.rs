@@ -25,6 +25,7 @@ use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
+use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 
 mod render;
 mod script;
@@ -65,6 +66,9 @@ pub struct ReplCommand {
 
     #[clap(flatten)]
     common_opts: CommonCommandOptions,
+
+    #[clap(skip)]
+    shutdown: session::ShutdownHangup,
 }
 
 #[async_trait(?Send)]
@@ -114,6 +118,10 @@ impl StreamingCommand for ReplCommand {
 
     fn starlark_opts(&self) -> &CommonStarlarkOptions {
         &self.common_opts.starlark_opts
+    }
+
+    fn extra_subscribers(&self) -> Vec<Box<dyn EventSubscriber>> {
+        vec![self.shutdown.subscriber()]
     }
 
     fn should_expect_spans(&self) -> bool {
