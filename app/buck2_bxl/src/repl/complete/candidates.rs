@@ -8,7 +8,8 @@
  * above-listed licenses.
  */
 
-//! [`Candidates`]: the answer to a completion request, sorted and bounded.
+//! [`Candidates`]: the answer to a completion request, sorted and bounded, with the
+//! candidates that match the word typed best ([`MatchTier`]).
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,8 @@ use buck2_cli_proto::ReplCandidate;
 use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::repl_candidate;
 use buck2_cli_proto::repl_completions;
+use buck2_repl_syntax::matching::MatchTier;
+use buck2_repl_syntax::matching::match_tier;
 use buck2_repl_syntax::text::truncate_to_bytes;
 
 /// Most candidates in an answer.
@@ -37,15 +40,45 @@ const MAX_DETAIL_BYTES: usize = 128;
 #[derive(Default)]
 pub(crate) struct Candidates {
     by_replacement: BTreeMap<String, (repl_candidate::Kind, String)>,
+    /// How the candidates offered match the word typed ([`offer`](Self::offer)).
+    tier: Option<MatchTier>,
     /// Some candidates were left out.
     truncated: bool,
 }
 
 impl Candidates {
     /// Whether the answer holds as many candidates as it can: when candidates are added in
-    /// order, the later ones are not needed.
+    /// order, the later ones are not needed (unless they would match the word better).
     pub(crate) fn is_full(&self) -> bool {
         self.by_replacement.len() >= MAX_CANDIDATES
+            && self.tier.is_none_or(|tier| tier == MatchTier::Prefix)
+    }
+
+    /// Adds a candidate whose `name` completes `word` (the part of the word typed that it
+    /// replaces), if it matches it at least as well as the candidates offered so far; those
+    /// are dropped if it matches better. Candidates that start with the word come first; the
+    /// others only when none does.
+    pub(crate) fn offer(
+        &mut self,
+        word: &str,
+        name: &str,
+        replacement: String,
+        kind: repl_candidate::Kind,
+        detail: &str,
+    ) {
+        let Some(tier) = match_tier(word, name) else {
+            return;
+        };
+        match self.tier {
+            Some(best) if tier > best => return,
+            Some(best) if tier < best => {
+                self.by_replacement.clear();
+                self.truncated = false;
+            }
+            _ => {}
+        }
+        self.tier = Some(tier);
+        self.add(replacement, kind, detail);
     }
 
     /// Records that some candidates were left out.
@@ -71,12 +104,6 @@ impl Candidates {
                 self.truncated = true;
             }
         }
-    }
-
-    /// Keeps only the candidates that start with `prefix`.
-    pub(crate) fn retain_prefix(&mut self, prefix: &str) {
-        self.by_replacement
-            .retain(|replacement, _| replacement.starts_with(prefix));
     }
 
     pub(crate) fn into_completions(self) -> ReplCompletions {

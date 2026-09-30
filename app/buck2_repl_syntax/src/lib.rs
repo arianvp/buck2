@@ -20,11 +20,17 @@
 //! - [`text`]: dedent, input prechecks, string literals and output capping.
 //! - [`commands`]: the meta-command table and its parser.
 //! - [`site`]: what the cursor is on, for completion.
+//! - [`query`]: where the cursor is in a query, for completion.
+//! - [`matching`]: how well a completion candidate matches the word typed.
+//! - [`candidates`]: text helpers for completion candidates.
 
+pub mod candidates;
 pub mod chunker;
 pub mod commands;
 pub mod completeness;
 pub mod lexer;
+pub mod matching;
 mod nesting;
+pub mod query;
 pub mod site;
 pub mod text;

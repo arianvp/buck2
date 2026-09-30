@@ -83,6 +83,9 @@ use crate::repl::cancel::EvalCancel;
 use crate::repl::commands::CommandWork;
 use crate::repl::commands::command_work;
 use crate::repl::complete::candidates::completions_status;
+use crate::repl::complete::loads::complete_load_symbols;
+use crate::repl::complete::query::query_functions;
+use crate::repl::complete::targets::complete_load_paths;
 use crate::repl::complete::targets::complete_targets;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
@@ -185,6 +188,14 @@ enum DiceCompletion {
     Targets { prefix: String },
     /// A function of a `.bxl` file (`:bxl <file.bxl>:<prefix>`).
     BxlFunctions { module: String, prefix: String },
+    /// A module to load.
+    LoadPaths { prefix: String },
+    /// A symbol of a module to load, but the `used` ones.
+    LoadSymbols {
+        module: String,
+        prefix: String,
+        used: Vec<String>,
+    },
 }
 
 /// The first line of `input`, cut to [`MAX_TITLE_BYTES`].
@@ -352,7 +363,7 @@ impl<'a> Driver<'a> {
                 }
                 Work::CompleteDice { id, what } => {
                     let cancel = Arc::new(EvalCancel::new());
-                    let fut = run_dice_completion(self.sctx, what, cancel.dupe());
+                    let fut = run_dice_completion(self.sctx, &target_cfg, what, cancel.dupe());
                     let answer = self.in_flight(id, &cancel, Some(&thread), fut).await;
                     self.emitter
                         .emit(id, repl_message::Message::Completions(answer));
@@ -519,10 +530,12 @@ impl<'a> Driver<'a> {
     ///
     /// While an input runs, other requests get `BUSY` (INV-14). A completion (`completion` is
     /// the session thread, which it does not use) gives way instead: an input cancels it and runs
-    /// next, and names and attributes are completed meanwhile (by the thread, while `fut` is
-    /// still polled, so that its timeout and its preemption by other commands keep working);
-    /// only another completion from DICE (a target pattern, a BXL function) gets `BUSY` (the one
-    /// in flight keeps loading, so the next one is fast). The answer to a thread completion is sent whenever it comes.
+    /// next, names, attributes and keyword arguments are completed meanwhile (by the thread,
+    /// while `fut` is still polled, so that its timeout and its preemption by other commands keep
+    /// working), and the functions of the query languages at once; only another completion from
+    /// DICE (a target pattern, a module to load, a BXL function) gets `BUSY` (the one in flight
+    /// keeps loading, so the next one is fast). The answer to a thread completion is sent
+    /// whenever it comes.
     async fn in_flight<T>(
         &mut self,
         id: u64,
@@ -587,13 +600,20 @@ impl<'a> Driver<'a> {
                     self.queued = Some(request);
                 }
                 (Some(repl_request::Request::Complete(complete)), Some(thread))
-                    if matches!(
-                        complete.kind(),
-                        repl_complete::Kind::Name | repl_complete::Kind::Attr
-                    ) =>
+                    if is_thread_completion(complete.kind()) =>
                 {
                     // The thread is not used by a completion from DICE.
                     self.start_thread_completion(thread, request.id, complete.clone());
+                }
+                (Some(repl_request::Request::Complete(complete)), Some(_))
+                    if complete.kind() == repl_complete::Kind::Query =>
+                {
+                    self.emitter.emit(
+                        request.id,
+                        repl_message::Message::Completions(query_functions(
+                            complete.query_dialect(),
+                        )),
+                    );
                 }
                 (Some(repl_request::Request::Complete(_)), _) => self.emitter.emit(
                     request.id,
@@ -863,9 +883,11 @@ fn classify(request: ReplRequest) -> Work {
             },
         },
         repl_request::Request::Complete(req) => match req.kind() {
-            repl_complete::Kind::Name | repl_complete::Kind::Attr => {
-                Work::CompleteStarlark { id, req }
-            }
+            kind if is_thread_completion(kind) => Work::CompleteStarlark { id, req },
+            repl_complete::Kind::Query => Work::Reply {
+                id,
+                message: repl_message::Message::Completions(query_functions(req.query_dialect())),
+            },
             repl_complete::Kind::TargetPattern => Work::CompleteDice {
                 id,
                 what: DiceCompletion::Targets { prefix: req.prefix },
@@ -875,6 +897,18 @@ fn classify(request: ReplRequest) -> Work {
                 what: DiceCompletion::BxlFunctions {
                     module: req.load_module,
                     prefix: req.prefix,
+                },
+            },
+            repl_complete::Kind::LoadPath => Work::CompleteDice {
+                id,
+                what: DiceCompletion::LoadPaths { prefix: req.prefix },
+            },
+            repl_complete::Kind::LoadSymbol => Work::CompleteDice {
+                id,
+                what: DiceCompletion::LoadSymbols {
+                    module: req.load_module,
+                    prefix: req.prefix,
+                    used: req.used_kwargs,
                 },
             },
             _ => Work::Reply {
@@ -888,6 +922,14 @@ fn classify(request: ReplRequest) -> Work {
         repl_request::Request::Interrupt(_) => Work::Interrupt,
         repl_request::Request::Hangup(_) => Work::Hangup,
     }
+}
+
+/// Whether the session thread answers completions of this kind (from the session's module).
+fn is_thread_completion(kind: repl_complete::Kind) -> bool {
+    matches!(
+        kind,
+        repl_complete::Kind::Name | repl_complete::Kind::Attr | repl_complete::Kind::Kwarg
+    )
 }
 
 /// Evaluates an input in a transaction of its own: the only place an evaluation takes one.
@@ -1101,12 +1143,13 @@ async fn run_bxl_request(
         .await
 }
 
-/// Completes a target pattern or a BXL function in a transaction of its own, taken with the
-/// completion policy (it never waits for commands that use another state, and gives way to
-/// them). The work races the cancellation of the request and a timeout: it is DICE computations,
-/// which are safe to drop.
+/// Completes a target pattern, a module to load, a symbol of one, or a BXL function in a
+/// transaction of its own, taken with the completion policy (it never waits for commands that
+/// use another state, and gives way to them). The work races the cancellation of the request
+/// and a timeout: it is DICE computations, which are safe to drop.
 async fn run_dice_completion(
     sctx: &dyn ServerCommandContextTrait,
+    target_cfg: &TargetCfg,
     what: DiceCompletion,
     cancel: Arc<EvalCancel>,
 ) -> ReplCompletions {
@@ -1121,17 +1164,25 @@ async fn run_dice_completion(
             }
             let mut dc = txn.ctx();
             let work = async {
+                let cwd = dc
+                    .get_cell_resolver()
+                    .await?
+                    .get_cell_path(sctx.working_dir());
                 match &what {
                     DiceCompletion::Targets { prefix } => {
-                        let cwd = dc
-                            .get_cell_resolver()
-                            .await?
-                            .get_cell_path(sctx.working_dir());
-                        complete_targets(&mut dc, &cwd, prefix).await
+                        complete_targets(&mut dc, sctx, target_cfg, &cwd, prefix).await
                     }
                     DiceCompletion::BxlFunctions { module, prefix } => {
                         complete_bxl_functions(&mut dc, sctx.working_dir(), module, prefix).await
                     }
+                    DiceCompletion::LoadPaths { prefix } => {
+                        complete_load_paths(&mut dc, &cwd, prefix).await
+                    }
+                    DiceCompletion::LoadSymbols {
+                        module,
+                        prefix,
+                        used,
+                    } => complete_load_symbols(&mut dc, &cwd, module, prefix, used).await,
                 }
             };
             Ok(tokio::select! {

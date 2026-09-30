@@ -20,6 +20,7 @@ use buck2_common::dice::cells::HasCellResolver;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::paths::module::StarlarkModulePath;
+use buck2_repl_syntax::matching::match_tier;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use dice::DiceComputations;
 use dice::DiceTransaction;
@@ -80,8 +81,8 @@ pub(crate) async fn run_bxl(
 }
 
 /// The BXL functions of the file `module` (as `:bxl` takes it: a label, or a path relative to
-/// `cwd`) whose names start with `prefix`, as `<module>:<name>`. Names that start with `_` only
-/// if `prefix` does.
+/// `cwd`) whose names match `prefix`, as `<module>:<name>`. Names that start with `_` only if
+/// `prefix` does.
 pub(crate) async fn complete_bxl_functions(
     dc: &mut DiceComputations<'_>,
     cwd: &ProjectRelativePath,
@@ -106,14 +107,17 @@ pub(crate) async fn complete_bxl_functions(
         .await?;
     let env = loaded.env();
     for name in env.names() {
-        if !name.starts_with(prefix) || (name.starts_with('_') && !prefix.starts_with('_')) {
+        if match_tier(prefix, name).is_none() || (name.starts_with('_') && !prefix.starts_with('_'))
+        {
             continue;
         }
         let Ok(Some(value)) = env.get_option_ref(name) else {
             continue;
         };
         if value.value().downcast_ref::<FrozenBxlFunction>().is_some() {
-            candidates.add(
+            candidates.offer(
+                prefix,
+                name,
                 format!("{module}:{name}"),
                 repl_candidate::Kind::Function,
                 "",

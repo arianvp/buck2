@@ -8,7 +8,11 @@
 
 def _write_file(ctx):
     out = ctx.actions.write(ctx.attrs.out, ctx.attrs.content)
-    return [DefaultInfo(default_output = out)]
+    return [DefaultInfo(
+        default_output = out,
+        # For the completion of subtargets (`//:hello[`).
+        sub_targets = {"out": [DefaultInfo(default_output = out)]},
+    )]
 
 write_file = rule(
     impl = _write_file,

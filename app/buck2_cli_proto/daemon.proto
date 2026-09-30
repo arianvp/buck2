@@ -935,10 +935,20 @@ message ReplComplete {
     KIND_UNSPECIFIED = 0;
     NAME = 1;
     ATTR = 2;
+    // A target pattern; `//x:y[` completes the subtargets of `//x:y`.
     TARGET_PATTERN = 3;
+    // An argument of a call of the chain `root` + `steps`: its keyword
+    // parameters (`name=`) not in `used_kwargs` (and not filled by the first
+    // `positional_args` arguments), and the names of NAME.
     KWARG = 4;
+    // A module to load (a label: `//pkg:x.bzl`, `:x.bzl`).
     LOAD_PATH = 5;
+    // The public symbols of the module `load_module` (resolved as `load()` at
+    // the prompt resolves it) whose names start with `prefix`.
     LOAD_SYMBOL = 6;
+    // The functions of the query language `query_dialect` (every one: the
+    // client filters them), as `name(`, with the types of their arguments in
+    // `detail`.
     QUERY = 7;
     // The BXL functions of the `.bxl` file `load_module` (as `:bxl` takes it)
     // whose names start with `prefix`.
@@ -959,6 +969,8 @@ message ReplComplete {
   repeated string used_kwargs = 5;
   string load_module = 6;
   QueryDialect query_dialect = 7;
+  // KWARG: the number of positional arguments before the cursor.
+  uint32 positional_args = 8;
 }
 
 message ReplChainStep {

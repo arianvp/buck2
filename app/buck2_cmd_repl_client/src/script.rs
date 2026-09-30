@@ -282,6 +282,8 @@ impl Session {
 
     /// Sends an input to the daemon and waits for its result. `None` if the session ended.
     fn request(&mut self, input: String) -> Option<ReplDone> {
+        // The input may change what the daemon listed for completion.
+        self.completer.clear_listings();
         self.number = self.number.saturating_add(1);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = ReplRequest {

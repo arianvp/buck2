@@ -78,7 +78,7 @@ use crate::repl::thread::heap_bytes;
 
 /// The synthetic `.bxl` file of the session, in its working directory. It is never read; loads
 /// resolve relative to it.
-const REPL_FILE_NAME: &str = "__repl__.bxl";
+pub(crate) const REPL_FILE_NAME: &str = "__repl__.bxl";
 
 /// Most names a notice about loaded modules lists.
 const MAX_NOTICE_NAMES: usize = 64;
