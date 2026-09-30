@@ -171,7 +171,10 @@ def _command_alias_write_trampoline_unix(
 SCRIPT_PATH="$0"
 if [ -L "$SCRIPT_PATH" ]; then
     TARGET="$(readlink "$SCRIPT_PATH")"
-    SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$TARGET"
+    case "$TARGET" in
+        /*) SCRIPT_PATH="$TARGET" ;;
+        *) SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$TARGET" ;;
+    esac
 fi
 """,
     )
