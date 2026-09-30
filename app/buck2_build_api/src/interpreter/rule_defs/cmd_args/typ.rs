@@ -11,6 +11,7 @@
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Debug;
@@ -88,6 +89,9 @@ pub enum CommandLineError {
     #[error("Artifact(s) {0:?} cannot be used with ignore_artifacts as they are content-based")]
     #[buck2(input)]
     ContentBasedIgnoreArtifacts(BuckIndexSet<String>),
+    #[error("`cmd_args` was given a list that contains itself")]
+    #[buck2(input)]
+    CyclicList,
 }
 
 /// Fields of `cmd_args`. Abstract mutable and frozen versions.
@@ -716,31 +720,60 @@ pub enum StarlarkCommandLineValueUnpack<'v> {
     CommandLineArg(CommandLineArg<'v>),
 }
 
+/// Pushes the `CommandLineArgLike` values of `value`, a value or nested lists of them, in order,
+/// onto `out`. The lists are walked without recursion, so that lists nested very deeply do not
+/// exhaust the native stack, and a list that contains itself is an error rather than a walk that
+/// never ends.
+fn flatten_into<'v>(
+    value: StarlarkCommandLineValueUnpack<'v>,
+    out: &mut Vec<CommandLineArg<'v>>,
+) -> buck2_error::Result<()> {
+    let list = match value {
+        StarlarkCommandLineValueUnpack::List(list) => list,
+        StarlarkCommandLineValueUnpack::CommandLineArg(arg) => {
+            out.push(arg);
+            return Ok(());
+        }
+    };
+    out.reserve(list.len());
+    // The lists being walked, outermost first, with the index of their next value; and their
+    // addresses (a list does not move while it is alive, and no code runs that could change it).
+    let mut path: Vec<(&'v ListRef<'v>, usize)> = vec![(list, 0)];
+    let mut on_path: HashSet<*const ListRef<'v>> = HashSet::from([list as *const _]);
+    while let Some((list, next)) = path.last_mut() {
+        let list = *list;
+        let Some(value) = list.content().get(*next) else {
+            on_path.remove(&(list as *const _));
+            path.pop();
+            continue;
+        };
+        *next += 1;
+        match StarlarkCommandLineValueUnpack::unpack_value_err(*value)? {
+            StarlarkCommandLineValueUnpack::List(inner) => {
+                if !on_path.insert(inner as *const _) {
+                    return Err(CommandLineError::CyclicList.into());
+                }
+                path.push((inner, 0));
+            }
+            StarlarkCommandLineValueUnpack::CommandLineArg(arg) => out.push(arg),
+        }
+    }
+    Ok(())
+}
+
 impl<'v> StarlarkCommandLineData<'v> {
     fn add_value(&mut self, value: Value<'v>) -> buck2_error::Result<()> {
         self.add_value_typed(StarlarkCommandLineValueUnpack::unpack_value_err(value)?)
     }
 
+    /// Check the types of a value, and modify `data` accordingly
+    ///
+    /// The value must be one of: CommandLineArgLike or a list thereof (nested).
     fn add_value_typed(
         &mut self,
         value: StarlarkCommandLineValueUnpack<'v>,
     ) -> buck2_error::Result<()> {
-        match value {
-            StarlarkCommandLineValueUnpack::List(values) => self.add_values(values.content())?,
-            StarlarkCommandLineValueUnpack::CommandLineArg(value) => self.items.push(value),
-        }
-        Ok(())
-    }
-
-    /// Check the types of a list of values, and modify `data` accordingly
-    ///
-    /// The values must be one of: CommandLineArgLike or a list thereof.
-    fn add_values(&mut self, values: &[Value<'v>]) -> buck2_error::Result<()> {
-        self.items.reserve(values.len());
-        for value in values {
-            self.add_value(*value)?
-        }
-        Ok(())
+        flatten_into(value, &mut self.items)
     }
 
     fn add_from_iterator(
@@ -757,17 +790,7 @@ impl<'v> StarlarkCommandLineData<'v> {
 
     /// Add values to the artifact that don't show up on the command line, but do for dependency
     fn add_hidden(&mut self, value: StarlarkCommandLineValueUnpack<'v>) -> buck2_error::Result<()> {
-        match value {
-            StarlarkCommandLineValueUnpack::List(values) => {
-                for value in values.content() {
-                    self.add_hidden(StarlarkCommandLineValueUnpack::unpack_value_err(*value)?)?
-                }
-            }
-            StarlarkCommandLineValueUnpack::CommandLineArg(arg) => {
-                self.hidden.push(arg);
-            }
-        }
-        Ok(())
+        flatten_into(value, &mut self.hidden)
     }
 }
 

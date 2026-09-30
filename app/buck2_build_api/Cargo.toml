@@ -63,6 +63,7 @@ serde_json.workspace = true
 setsketch.workspace = true
 smallvec.workspace = true
 sorted_vector_map.workspace = true
+stacker.workspace = true
 starlark.workspace = true
 starlark_map.workspace = true
 strong_hash.workspace = true

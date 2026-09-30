@@ -9,6 +9,7 @@
  */
 
 use std::convert::Infallible;
+use std::fmt;
 use std::fmt::Display;
 
 use allocative::Allocative;
@@ -31,11 +32,47 @@ use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 
+/// Native stack left free while a value is formatted for its serialization.
+const SERIALIZE_STACK_RESERVE: usize = 256 << 10;
+
+/// Serializes `v` as the string of its `Display`.
+///
+/// The `Display` of a `cmd_args` recurses on the `cmd_args` in it, which can nest as deeply as
+/// Starlark code builds them: formatting stops with an error when the native stack runs low,
+/// rather than overflowing it (which aborts the process). The string is built here: the
+/// type-erased serializers that serialize Starlark values implement `collect_str` with
+/// `to_string`, which formats with no such check (and panics when formatting fails).
 fn serialize_as_display<V: Display, S>(v: &V, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    s.collect_str(v)
+    struct StackChecked {
+        text: String,
+        too_deep: bool,
+    }
+
+    impl fmt::Write for StackChecked {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            if stacker::remaining_stack().is_some_and(|left| left < SERIALIZE_STACK_RESERVE) {
+                self.too_deep = true;
+                return Err(fmt::Error);
+            }
+            self.text.push_str(s);
+            Ok(())
+        }
+    }
+
+    let mut out = StackChecked {
+        text: String::new(),
+        too_deep: false,
+    };
+    match fmt::write(&mut out, format_args!("{v}")) {
+        Ok(()) => s.serialize_str(&out.text),
+        Err(fmt::Error) if out.too_deep => Err(serde::ser::Error::custom(
+            "value is nested too deeply to serialize without running out of stack",
+        )),
+        Err(fmt::Error) => Err(serde::ser::Error::custom("formatting the value failed")),
+    }
 }
 
 /// A tiny wrapper around `Value` that proxies `CommandLineArgLike` calls.

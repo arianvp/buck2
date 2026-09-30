@@ -17,7 +17,10 @@
 //!
 //! One cost is not bounded here: the `Display` of a string builds its whole `repr` before
 //! writing it. A top-level string is cut to the cap first; a huge string inside a container
-//! still costs a few times its size, as it does anywhere in Starlark.
+//! still costs a few times its size, as it does anywhere in Starlark. An int is worse (its
+//! conversion to decimal takes time that grows faster than its size), so an int of more than
+//! [`MAX_SHOWN_INT_BITS`] is not formatted where the depth check sees it: it is shown as its
+//! size.
 //!
 //! `:doc` asks values for their documentation, which formats nothing of the session's values
 //! except for its functions and namespaces, which are documented otherwise (see
@@ -39,6 +42,7 @@ use buck2_error::starlark_error::NativeErrorHandling;
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::truncate_to_bytes;
+use num_bigint::BigInt;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
 use starlark::docs::DocModule;
@@ -48,6 +52,7 @@ use starlark::docs::DocStringKind;
 use starlark::docs::markdown::render_doc_item_no_link;
 use starlark::typing::Ty;
 use starlark::values::Heap;
+use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::dict::DictRef;
 use starlark::values::list::ListRef;
@@ -80,6 +85,17 @@ const RENDER_STACK_RESERVE: usize = 256 << 10;
 
 /// Shown instead of a value that is nested too deeply to format.
 pub(crate) const TOO_DEEP: &str = "<value nested too deeply to display>";
+
+/// An int of more bits than this is not formatted (nor converted to JSON): its `Display` (and
+/// its JSON form) converts the whole number to decimal before writing any of it, in time that
+/// grows faster than its size, which neither the cap nor the budget can stop (an int of 64
+/// million bits takes half a minute). This many bits are about 79000 digits, more than an echo
+/// shows.
+const MAX_SHOWN_INT_BITS: u64 = 256 << 10;
+
+/// Deepest nesting of containers the check before a conversion to JSON looks into: the
+/// serializer runs out of native stack (and stops) long before.
+const MAX_JSON_DEPTH: usize = 1024;
 
 /// Longest JSON form of a value (`ReplValue.json`, for `buck2 repl --json`). It is the one part of
 /// a message that may make it longer than 64 KiB.
@@ -395,6 +411,11 @@ fn render_value(
     if let Some(text) = summary(v, core) {
         return Ok(Rendering::complete(text));
     }
+    if let Some(bits) = huge_int_bits(v) {
+        return Ok(Rendering::complete(format!(
+            "<int of {bits} bits: too large to display>"
+        )));
+    }
     if let Some(s) = v.unpack_str()
         && s.len() > cap
     {
@@ -411,7 +432,15 @@ fn render_value(
     // and it stops at the cap, so it never visits more than this.
     let max_visits = cap.saturating_add(1);
     let depth = match nesting_depth(v, MAX_DISPLAY_DEPTH, max_visits, budget) {
-        Ok(depth) => depth,
+        Ok(Nesting {
+            huge_int: Some(bits),
+            ..
+        }) => {
+            return Ok(Rendering::complete(format!(
+                "<value holding an int of {bits} bits: too large to display>"
+            )));
+        }
+        Ok(Nesting { depth, .. }) => depth,
         Err(Stop::Interrupted) => return Err(Stop::Interrupted),
         // Nothing was rendered yet.
         Err(Stop::TimeUp) => {
@@ -498,10 +527,20 @@ fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
         let _ignored = fmt::write(&mut out, format_args!("  # type() is \"{type_name}\""));
     }
     let truncated = out.truncated();
+    let mut text = out.into_string();
+    if truncated {
+        // Said here: the client's note on a cut value points to `:print _`, and `:type` does not
+        // bind `_`.
+        const CUT: &str = "… (the type is cut at 64 KiB)";
+        text = format!(
+            "{}{CUT}",
+            truncate_to_bytes(&text, MAX_TEXT_BYTES - CUT.len())
+        );
+    }
     RenderedValue {
         type_name,
-        text: out.into_string(),
-        truncated,
+        text,
+        truncated: false,
         json: None,
     }
 }
@@ -539,31 +578,45 @@ fn type_too_large<'v>(v: Value<'v>, heap: Heap<'v>) -> bool {
 /// `:json`: the value as pretty JSON. Fails if the value (or a value in it) has no JSON form,
 /// or when the request is interrupted.
 fn render_json(v: Value, budget: &RenderBudget<'_>) -> Result<RenderedText, ReplFailure> {
-    let mut out = CappedBytes {
-        buf: Vec::new(),
-        cap: MAX_STREAM_BYTES,
-        full: false,
-        budget,
-        writes: 0,
-        stopped: None,
+    let no_json = |why: &dyn fmt::Display| {
+        ReplFailure::new(
+            repl_error::Kind::Eval,
+            &format_args!(
+                "the value (of type `{}`) cannot be converted to JSON: {why}",
+                truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES)
+            ),
+        )
     };
-    // The serializer of Starlark values stops at cycles and before it runs out of native stack.
-    // The writer stops it at the cap and when the budget is spent (by failing).
+    match json_obstacle(v, MAX_STREAM_BYTES, budget) {
+        Ok(None) => {}
+        Ok(Some(why)) => return Err(no_json(&why)),
+        Err(Stop::Interrupted) => return Err(ReplFailure::interrupted()),
+        Err(Stop::TimeUp) => {
+            return Ok(Rendering {
+                text: String::new(),
+                truncated: false,
+                timed_out: true,
+            }
+            .into_text());
+        }
+    }
+    let mut out = CappedBytes::new(MAX_STREAM_BYTES, budget);
+    // The serializer of Starlark values stops at cycles, and before it runs out of native stack
+    // in the containers it serializes itself; a `cmd_args` serializes its `Display` (which
+    // recurses on the `cmd_args` in it) with a check of its own. The writer stops it (by failing)
+    // at the cap, when the budget is spent, and when the native stack runs low anyway.
     let result = serde_json::to_writer_pretty(&mut out, &v);
     if out.stopped == Some(Stop::Interrupted) {
         return Err(ReplFailure::interrupted());
+    }
+    if out.stack_exhausted {
+        return Err(no_json(&"it is nested too deeply"));
     }
     if let Err(e) = result
         && !out.full
         && out.stopped.is_none()
     {
-        return Err(ReplFailure::new(
-            repl_error::Kind::Eval,
-            &format_args!(
-                "the value (of type `{}`) cannot be converted to JSON: {e}",
-                truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES)
-            ),
-        ));
+        return Err(no_json(&e));
     }
     let text = match String::from_utf8(out.buf) {
         Ok(text) => text,
@@ -578,6 +631,27 @@ fn render_json(v: Value, budget: &RenderBudget<'_>) -> Result<RenderedText, Repl
     .into_text())
 }
 
+/// Why `v` is not converted to JSON, found before trying, in time bounded by `cap` (the most
+/// bytes the conversion writes): it holds an int too large to convert (see
+/// [`MAX_SHOWN_INT_BITS`]), or its containers nest too deeply. Fails when the budget is spent.
+fn json_obstacle(v: Value, cap: usize, budget: &RenderBudget<'_>) -> Result<Option<String>, Stop> {
+    if let Some(bits) = huge_int_bits(v) {
+        return Ok(Some(format!("an int of {bits} bits is too large")));
+    }
+    // Like the formatter, the serializer writes at least one byte before every value it visits
+    // below the top one.
+    let nesting = nesting_depth(v, MAX_JSON_DEPTH, cap.saturating_add(1), budget)?;
+    Ok(if let Some(bits) = nesting.huge_int {
+        Some(format!(
+            "it holds an int of {bits} bits, which is too large"
+        ))
+    } else if nesting.depth > MAX_JSON_DEPTH {
+        Some("it is nested too deeply".to_owned())
+    } else {
+        None
+    })
+}
+
 /// The JSON form of a value for `buck2 repl --json`: compact JSON, if the value has one (as for
 /// `:json`) of at most [`MAX_JSON_BYTES`], and if it is done within the budget. An ensured
 /// artifact is its path (as it is echoed); the other values shown as a summary (`ctx`, target
@@ -589,36 +663,54 @@ fn json_form(v: Value, core: &BxlContextCoreData, budget: &RenderBudget<'_>) -> 
     if summary(v, core).is_some() {
         return None;
     }
-    let mut out = CappedBytes {
-        buf: Vec::new(),
-        cap: MAX_JSON_BYTES,
-        full: false,
-        budget,
-        writes: 0,
-        stopped: None,
-    };
-    // The serializer of Starlark values stops at cycles and before it runs out of native stack;
-    // the writer stops it at the cap and when the budget is spent.
+    if !matches!(json_obstacle(v, MAX_JSON_BYTES, budget), Ok(None)) {
+        return None;
+    }
+    let mut out = CappedBytes::new(MAX_JSON_BYTES, budget);
+    // Stopped as for `:json` (see `render_json`).
     serde_json::to_writer(&mut out, &v).ok()?;
-    if out.full || out.stopped.is_some() {
+    if out.full || out.stopped.is_some() || out.stack_exhausted {
         return None;
     }
     String::from_utf8(out.buf).ok()
 }
 
-/// A byte buffer that keeps at most `cap` bytes, and fails the write that reaches the cap (or
-/// that finds the budget spent), which stops the serializer writing into it.
+/// A byte buffer that keeps at most `cap` bytes, and fails the write that reaches the cap, or
+/// that finds the budget spent or the native stack low (the backstop of [`RenderWriter`] too),
+/// which stops the serializer writing into it. Every later write fails too.
 struct CappedBytes<'a> {
     buf: Vec<u8>,
     cap: usize,
     full: bool,
+    stack_exhausted: bool,
     budget: &'a RenderBudget<'a>,
     writes: u32,
     stopped: Option<Stop>,
 }
 
+impl<'a> CappedBytes<'a> {
+    fn new(cap: usize, budget: &'a RenderBudget<'a>) -> Self {
+        CappedBytes {
+            buf: Vec::new(),
+            cap,
+            full: false,
+            stack_exhausted: false,
+            budget,
+            writes: 0,
+            stopped: None,
+        }
+    }
+}
+
 impl std::io::Write for CappedBytes<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.full || self.stack_exhausted || self.stopped.is_some() {
+            return Err(std::io::Error::other("rendering stopped"));
+        }
+        if stacker::remaining_stack().is_some_and(|left| left < RENDER_STACK_RESERVE) {
+            self.stack_exhausted = true;
+            return Err(std::io::Error::other("value nested too deeply"));
+        }
         self.writes = self.writes.wrapping_add(1);
         if self.writes.is_multiple_of(BUDGET_CHECK_INTERVAL)
             && let Err(stop) = self.budget.check()
@@ -957,8 +1049,28 @@ impl<'v> Frame<'v> {
     }
 }
 
-/// How deep formatting `root` recurses into containers (`limit + 1` if deeper than `limit`),
-/// checked without recursion. Fails when the budget is spent.
+/// The number of bits of `v` if it is an int too large to format (more than
+/// [`MAX_SHOWN_INT_BITS`]).
+fn huge_int_bits(v: Value) -> Option<u64> {
+    if v.unpack_i32().is_some() || v.get_type() != "int" {
+        return None;
+    }
+    // A copy of the number (its size is not otherwise available): fast next to formatting it.
+    let bits = BigInt::unpack_value(v).ok().flatten()?.bits();
+    (bits > MAX_SHOWN_INT_BITS).then_some(bits)
+}
+
+/// What the depth check found.
+struct Nesting {
+    /// How deep formatting recurses into containers (`limit + 1` if deeper than `limit`).
+    depth: usize,
+    /// The number of bits of an int visited that is too large to format
+    /// ([`MAX_SHOWN_INT_BITS`]): the check stops there.
+    huge_int: Option<u64>,
+}
+
+/// How deep formatting `root` recurses into containers, checked without recursion, and whether
+/// it would format an int too large to format. Fails when the budget is spent.
 ///
 /// Walks the value the way the formatter does: depth first, children in order, and a value that
 /// is already on the path is not entered again (the formatter shows it as `[...]`). The walk
@@ -969,15 +1081,18 @@ impl<'v> Frame<'v> {
 /// its depth does not matter.
 ///
 /// Values the walk does not look into (sets, providers, ...) are left to the stack check of
-/// [`RenderWriter`].
+/// [`RenderWriter`] (and the ints in them are formatted).
 fn nesting_depth(
     root: Value,
     limit: usize,
     max_visits: usize,
     budget: &RenderBudget<'_>,
-) -> Result<usize, Stop> {
+) -> Result<Nesting, Stop> {
     let Some(frame) = Frame::enter(root) else {
-        return Ok(0);
+        return Ok(Nesting {
+            depth: 0,
+            huge_int: None,
+        });
     };
     let mut on_path = HashSet::from([root.identity()]);
     let mut path = vec![frame];
@@ -996,6 +1111,12 @@ fn nesting_depth(
         if visits.is_multiple_of(CHILDREN_CHUNK * BUDGET_CHECK_INTERVAL as usize) {
             budget.check()?;
         }
+        if let Some(bits) = huge_int_bits(child) {
+            return Ok(Nesting {
+                depth: deepest,
+                huge_int: Some(bits),
+            });
+        }
         if on_path.contains(&child.identity()) {
             continue;
         }
@@ -1003,11 +1124,17 @@ fn nesting_depth(
             continue;
         };
         if path.len() >= limit {
-            return Ok(limit + 1);
+            return Ok(Nesting {
+                depth: limit + 1,
+                huge_int: None,
+            });
         }
         on_path.insert(child.identity());
         path.push(frame);
         deepest = deepest.max(path.len());
     }
-    Ok(deepest)
+    Ok(Nesting {
+        depth: deepest,
+        huge_int: None,
+    })
 }
