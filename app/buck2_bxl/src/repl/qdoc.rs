@@ -15,11 +15,13 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use buck2_cli_proto::repl_error;
+use buck2_cli_proto::repl_output;
 use buck2_query::query::syntax::simple::functions::description::QUERY_ENVIRONMENT_DESCRIPTION_BY_TYPE;
 use buck2_query::query::syntax::simple::functions::description::QueryType;
 use buck2_query::query::syntax::simple::functions::docs::FunctionDescription;
 use buck2_query::query::syntax::simple::functions::docs::MarkdownOptions;
 use buck2_query::query::syntax::simple::functions::docs::QueryEnvironmentDescription;
+use buck2_repl_syntax::markdown;
 use buck2_repl_syntax::matching::Ranked;
 use buck2_repl_syntax::matching::match_tier;
 
@@ -37,8 +39,9 @@ struct Function<'a> {
     dialects: Vec<usize>,
 }
 
-/// The text of `:qdoc <arg>`, or why there is none.
-pub(crate) fn qdoc(arg: &str) -> Result<String, ReplFailure> {
+/// The text of `:qdoc <arg>` (a listing is plain text, a function's documentation Markdown), or
+/// why there is none.
+pub(crate) fn qdoc(arg: &str) -> Result<(String, repl_output::Format), ReplFailure> {
     let describe = QUERY_ENVIRONMENT_DESCRIPTION_BY_TYPE
         .get()
         .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Internal, &e))?;
@@ -66,19 +69,25 @@ pub(crate) fn qdoc(arg: &str) -> Result<String, ReplFailure> {
     let arg = arg.trim();
     let name = arg.trim_end_matches("()").trim_end_matches('(');
     if arg.is_empty() {
-        return Ok(listing(
-            "Query functions (u: uquery, c: cquery, a: aquery; `:qdoc <function>` shows one):",
-            functions.values(),
+        return Ok((
+            listing(
+                "Query functions (u: uquery, c: cquery, a: aquery; `:qdoc <function>` shows one):",
+                functions.values(),
+            ),
+            repl_output::Format::Plain,
         ));
     }
     if let Some(dialect) = DIALECTS.iter().position(|(d, _)| *d == arg) {
-        return Ok(listing(
-            &format!("The functions of {arg} (`:qdoc <function>` shows one):"),
-            functions.values().filter(|f| f.dialects.contains(&dialect)),
+        return Ok((
+            listing(
+                &format!("The functions of {arg} (`:qdoc <function>` shows one):"),
+                functions.values().filter(|f| f.dialects.contains(&dialect)),
+            ),
+            repl_output::Format::Plain,
         ));
     }
     match functions.get(name) {
-        Some(function) => Ok(details(function)),
+        Some(function) => Ok((details(function), repl_output::Format::Markdown)),
         None => {
             let mut similar = Ranked::default();
             for candidate in functions.keys() {
@@ -134,12 +143,14 @@ fn listing<'a>(heading: &str, functions: impl Iterator<Item = &'a Function<'a>>)
             (
                 signature(f.description),
                 dialect_marks(f),
-                f.description
-                    .short_help
-                    .as_deref()
-                    .and_then(|h| h.lines().next())
-                    .unwrap_or("")
-                    .to_owned(),
+                // The help is Markdown: the listing shows it as plain text.
+                markdown::inline_plain(
+                    f.description
+                        .short_help
+                        .as_deref()
+                        .and_then(|h| h.lines().next())
+                        .unwrap_or(""),
+                ),
             )
         })
         .collect();

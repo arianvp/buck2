@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 
 use buck2_cli_proto::repl_error;
+use buck2_cli_proto::repl_output;
 use buck2_repl_syntax::commands::ArgError;
 use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::Handler;
@@ -64,8 +65,8 @@ pub(crate) enum CommandWork {
     Inspect(InspectSpec),
     /// `:set`, for the settings of the daemon.
     Set(SetWork),
-    /// Text made at once, without DICE (`:qdoc`).
-    Text(String),
+    /// Text made at once, without DICE (`:qdoc`), and how the client shows it.
+    Text(String, repl_output::Format),
 }
 
 /// The work of a meta-command, or why it cannot be done.
@@ -182,7 +183,10 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
             let args = parse_set_args(arg).map_err(|e| usage_error(command, &e))?;
             Ok(CommandWork::Set(set_work(args)?))
         }
-        CommandId::Qdoc => Ok(CommandWork::Text(qdoc(arg)?)),
+        CommandId::Qdoc => {
+            let (text, format) = qdoc(arg)?;
+            Ok(CommandWork::Text(text, format))
+        }
         _ => {
             let name = command.spec.display_name();
             Err(match command.spec.handler {

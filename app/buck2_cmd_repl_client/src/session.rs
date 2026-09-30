@@ -38,9 +38,11 @@ use buck2_cli_proto::ReplInterrupt;
 use buck2_cli_proto::ReplMessage;
 use buck2_cli_proto::ReplNotice;
 use buck2_cli_proto::ReplOpen;
+use buck2_cli_proto::ReplOutput;
 use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_message;
+use buck2_cli_proto::repl_output;
 use buck2_cli_proto::repl_request;
 use buck2_client_ctx::command_outcome::CommandOutcome;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
@@ -52,6 +54,8 @@ use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 use buck2_error::ExitCode;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_events::BuckEvent;
+use buck2_repl_syntax::markdown;
+use buck2_repl_syntax::markdown::Styling;
 use buck2_util::threads::thread_spawn;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
@@ -69,6 +73,7 @@ use crate::inputs::Inputs;
 use crate::inputs::Mode;
 use crate::inputs::SessionIo;
 use crate::json::JsonCapture;
+use crate::render::DOC_COLUMNS;
 use crate::run::RunEnv;
 use crate::script::ScriptMode;
 
@@ -165,6 +170,9 @@ pub(crate) enum UiEvent {
     Ready(ReplReady),
     Done(u64, ReplDone),
     Notice(ReplNotice),
+    /// Markdown output of the input that runs (documentation), all of it: the input thread
+    /// renders it, for the terminal or as plain text.
+    Markdown(repl_output::Channel, String),
     /// The daemon call is over (or abandoned): nothing else will arrive.
     SessionEnded,
 }
@@ -354,6 +362,67 @@ struct ReplHandler {
     console: ReplConsole,
     /// With `--json`, the output goes into the record of its input instead.
     json: Option<JsonCapture>,
+    /// Markdown output that has arrived, held until all of it has (see [`ReplHandler::flush_markdown`]).
+    markdown: Option<HeldMarkdown>,
+}
+
+/// Consecutive Markdown chunks of the output of a request.
+struct HeldMarkdown {
+    id: u64,
+    channel: repl_output::Channel,
+    data: Vec<u8>,
+}
+
+/// Most Markdown held before it is rendered (the daemon sends at most 16 MiB of documentation):
+/// past this, what was held is rendered and the rest held anew.
+const MAX_HELD_MARKDOWN: usize = 32 << 20;
+
+impl ReplHandler {
+    /// Holds Markdown output: it is rendered once all of it has arrived, since a chunk may end
+    /// anywhere (in a code block, in a word).
+    async fn hold_markdown(&mut self, id: u64, output: ReplOutput) -> buck2_error::Result<()> {
+        let channel = output.channel();
+        let same = self.markdown.as_ref().is_some_and(|held| {
+            held.id == id
+                && held.channel == channel
+                && held.data.len().saturating_add(output.data.len()) <= MAX_HELD_MARKDOWN
+        });
+        if !same {
+            self.flush_markdown().await?;
+        }
+        match &mut self.markdown {
+            Some(held) => held.data.extend_from_slice(&output.data),
+            None => {
+                self.markdown = Some(HeldMarkdown {
+                    id,
+                    channel,
+                    data: output.data,
+                })
+            }
+        }
+        Ok(())
+    }
+
+    /// Passes on the Markdown held, once something else arrives: to the input thread, which
+    /// renders it as it renders results, or, with `--json`, as plain text into the record.
+    async fn flush_markdown(&mut self) -> buck2_error::Result<()> {
+        let Some(held) = self.markdown.take() else {
+            return Ok(());
+        };
+        let text = String::from_utf8_lossy(&held.data).into_owned();
+        match &self.json {
+            Some(capture) => capture.write_line(
+                held.channel,
+                &markdown::render(&text, DOC_COLUMNS, Styling::Plain),
+            ),
+            None => {
+                // The live progress of the input is erased before the input thread prints.
+                self.console.before_notice().await?;
+                let _ignored = self.ui_tx.send(UiEvent::Markdown(held.channel, text));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -372,8 +441,20 @@ impl PartialResultHandler for ReplHandler {
         message: Self::PartialResult,
     ) -> buck2_error::Result<()> {
         let id = message.id;
+        let message = match message.message {
+            Some(repl_message::Message::Output(output))
+                if output.format() == repl_output::Format::Markdown =>
+            {
+                return self.hold_markdown(id, output).await;
+            }
+            message => message,
+        };
+        // Held Markdown comes before whatever else of the session arrives next.
+        if !matches!(message, Some(repl_message::Message::Completions(_)) | None) {
+            self.flush_markdown().await?;
+        }
         // Send errors mean the input thread is gone, which the call's result reports.
-        match message.message {
+        match message {
             Some(repl_message::Message::Output(output)) => match &self.json {
                 Some(capture) => capture.write(output.channel(), &output.data),
                 None => self.console.write_output(&output).await?,
@@ -585,6 +666,7 @@ pub(crate) async fn run(
         compl_tx,
         console: console.dupe(),
         json,
+        markdown: None,
     };
     let result = {
         let mut client = buckd.with_flushing();
@@ -602,6 +684,8 @@ pub(crate) async fn run(
             () = sigint => None,
         }
     };
+    // Documentation that the session's end cut off is shown as far as it came.
+    let _ignored = handler.flush_markdown().await;
     // Nothing is drawn after the call: the terminal is the input thread's (and the messages
     // below are printed after the progress of an input that was cut off).
     let _ignored = console.end().await;

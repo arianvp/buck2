@@ -15,6 +15,7 @@
 //! what a failing input does ([`Mode`]).
 
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,6 +44,7 @@ use buck2_repl_syntax::commands::parse_count;
 use buck2_repl_syntax::commands::parse_set_args;
 use buck2_repl_syntax::commands::split_args;
 use buck2_repl_syntax::commands::split_command_token;
+use buck2_repl_syntax::markdown::Styling;
 use buck2_repl_syntax::text::truncate_to_bytes;
 use dupe::Dupe;
 
@@ -277,6 +279,20 @@ impl Inputs {
         )
     }
 
+    /// How documentation (Markdown) is shown on stdout: with bold, italic and colours when
+    /// colour is on (by default, when stdout and stderr are terminals and `NO_COLOR` is not
+    /// set), as plain text otherwise.
+    fn doc_styling(&self) -> Styling {
+        let color = match self.settings.color {
+            Switch::Auto => {
+                self.interactive() && Style::default_color() && std::io::stdout().is_terminal()
+            }
+            Switch::On => true,
+            Switch::Off => false,
+        };
+        if color { Styling::Ansi } else { Styling::Plain }
+    }
+
     /// `:set color`.
     pub(crate) fn color_setting(&self) -> Switch {
         self.settings.color
@@ -317,7 +333,7 @@ impl Inputs {
                     self.outcome.failed = true;
                     return None;
                 }
-                Ok(UiEvent::Done(..)) => {}
+                Ok(UiEvent::Done(..) | UiEvent::Markdown(..)) => {}
                 Ok(UiEvent::SessionEnded) | Err(_) => {
                     self.outcome.lost = true;
                     return None;
@@ -629,6 +645,10 @@ impl Inputs {
                         let printed = render::print_notice(self.style(), &notice);
                         self.output(printed);
                     }
+                }
+                Ok(UiEvent::Markdown(channel, text)) => {
+                    let printed = render::print_markdown(channel, &text, self.doc_styling());
+                    self.output(printed);
                 }
                 Ok(UiEvent::Done(..) | UiEvent::Ready(_)) => {}
                 Ok(UiEvent::SessionEnded) | Err(_) => return None,

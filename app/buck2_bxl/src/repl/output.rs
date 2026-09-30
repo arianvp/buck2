@@ -90,12 +90,24 @@ impl ReplEmitter {
 
     /// Sends `data` in chunks of at most [`MAX_OUTPUT_CHUNK`] bytes.
     pub(crate) fn output(&self, id: u64, channel: repl_output::Channel, data: &[u8]) {
+        self.output_as(id, channel, repl_output::Format::Plain, data)
+    }
+
+    /// Sends `data`, in `format`, in chunks of at most [`MAX_OUTPUT_CHUNK`] bytes.
+    pub(crate) fn output_as(
+        &self,
+        id: u64,
+        channel: repl_output::Channel,
+        format: repl_output::Format,
+        data: &[u8],
+    ) {
         for chunk in data.chunks(MAX_OUTPUT_CHUNK) {
             self.emit(
                 id,
                 repl_message::Message::Output(ReplOutput {
                     channel: channel as i32,
                     data: chunk.to_vec(),
+                    format: format as i32,
                 }),
             );
         }

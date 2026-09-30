@@ -262,6 +262,27 @@ async def test_repl_type_of_callables(buck: Buck) -> None:
 
 
 @buck_test()
+async def test_repl_doc_rendered(buck: Buck) -> None:
+    # Documentation (Markdown) is shown as plain text in scripts: no heading marks, code
+    # fences or escapes; code is indented.
+    result = await buck.repl("-e", ":doc ctx.configured_targets")
+    lines = result.stdout.splitlines()
+    assert lines[0] == "ctx.configured_targets", lines[:3]
+    assert "    def ctx.configured_targets(" in lines
+    assert "```" not in result.stdout
+    assert "\\_" not in result.stdout
+    assert not any(line.startswith("#") for line in lines)
+
+    result = await buck.repl("-e", ":qdoc rdeps")
+    assert result.stdout.startswith("rdeps(universe: target expression, "), result.stdout
+
+    # With `--json`, the record holds the text as shown.
+    result = await buck.repl("--json", "-e", ":doc len")
+    [record] = _json_lines(result.stdout)
+    assert record["stdout"].startswith("len\n\n    def len("), record["stdout"]
+
+
+@buck_test()
 async def test_repl_load_command(buck: Buck) -> None:
     result = await buck.repl(
         "-e", ":l //pkg:helpers.bxl", "-e", "double(2)", "-e", ":r", "-e", "double(3)"

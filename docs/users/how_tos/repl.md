@@ -205,6 +205,41 @@ root//foo> ctx.cquery().deps(ctx.configured_targets(":server"), 1)
 `:qdoc` lists the query functions of the three languages, and `:qdoc rdeps` shows
 one.
 
+### Types and documentation
+
+`:type` (`:t`) shows the type of a value as the type checker sees it, and what
+`type()` returns when that differs. A function, a lambda or a method (such as
+`ctx.configured_targets`) shows its signature, with default values shown as
+`...`; a value whose signature is not known, such as a `partial`, is just
+`function`:
+
+```text
+root//> :t "a".join
+def(_: typing.Iterable[str], /) -> str  # type() is "function"
+root//> :t partial(len)
+function
+```
+
+`:doc` (`:d`) shows the documentation of a function, a type or a namespace (for
+any other value, of its type), and `:qdoc rdeps` that of a query function. The
+documentation is written in Markdown and shown as text: headings are bold, code
+is highlighted and indented, and paragraphs are wrapped (plain text, without
+colours, when colour is off, in scripts and with `--json`):
+
+```text
+root//> :doc ctx.cquery().deps
+ctx.cquery().deps
+
+    def ctx.cquery().deps(
+        universe: ConfiguredTargetLabel | TargetLabel | ... | str],
+        depth: None | int = None,
+        filter: None | str = None,
+    ) -> target_set
+
+The deps query for finding the transitive closure of dependencies.
+...
+```
+
 ### Inspecting targets
 
 ```text

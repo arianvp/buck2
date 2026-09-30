@@ -25,6 +25,8 @@
 //! - [`matching`]: how well a completion candidate matches the word typed.
 //! - [`candidates`]: text helpers for completion candidates.
 //! - [`signature`]: signatures of functions, for the hint shown in a call.
+//! - [`markdown`]: documentation (Markdown) rendered for the terminal.
+//! - [`terminal`]: the columns and rows that text takes on a terminal.
 
 pub mod candidates;
 pub mod chunker;
@@ -32,9 +34,11 @@ pub mod commands;
 pub mod completeness;
 pub mod highlight;
 pub mod lexer;
+pub mod markdown;
 pub mod matching;
 mod nesting;
 pub mod query;
 pub mod signature;
 pub mod site;
+pub mod terminal;
 pub mod text;

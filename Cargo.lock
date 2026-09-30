@@ -2953,6 +2953,8 @@ name = "buck2_repl_syntax"
 version = "0.1.0"
 dependencies = [
  "shlex",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

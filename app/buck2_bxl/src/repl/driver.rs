@@ -141,6 +141,7 @@ enum Work {
     Text {
         id: u64,
         text: String,
+        format: repl_output::Format,
     },
     /// `:reset`: a new session, started like the first one.
     Reset {
@@ -444,8 +445,8 @@ impl<'a> Driver<'a> {
                     self.answer_eval(id, outcome);
                 }
                 Work::Set { id, work, title } => self.set(id, work, title, &mut target_cfg).await,
-                Work::Text { id, text } => {
-                    self.send_text(id, &text);
+                Work::Text { id, text, format } => {
+                    self.send_text_as(id, &text, format);
                     self.done_without_value(id);
                 }
                 Work::Reset { id } => {
@@ -935,7 +936,7 @@ impl<'a> Driver<'a> {
                     (Err(failure), _, _) => Some(repl_done::Outcome::Error(failure_proto(failure))),
                     (Ok(Rendered::Text(text)), Ok(_), Materialized::Done) => {
                         // After the output of the evaluation, as a value would be.
-                        self.send_text(id, &text.text);
+                        self.send_text_as(id, &text.text, text.format);
                         if let Some(incomplete) = text.incomplete {
                             self.emitter
                                 .notice(id, repl_notice::Level::Warning, incomplete);
@@ -973,12 +974,17 @@ impl<'a> Driver<'a> {
         self.emitter.done(id, done);
     }
 
-    /// Sends text to the client's stdout, ending with a newline.
+    /// Sends plain text to the client's stdout, ending with a newline.
     fn send_text(&self, id: u64, text: &str) {
-        self.emitter
-            .output(id, repl_output::Channel::Stdout, text.as_bytes());
+        self.send_text_as(id, text, repl_output::Format::Plain)
+    }
+
+    /// Sends text in `format` to the client's stdout, ending with a newline.
+    fn send_text_as(&self, id: u64, text: &str, format: repl_output::Format) {
+        let stdout = repl_output::Channel::Stdout;
+        self.emitter.output_as(id, stdout, format, text.as_bytes());
         if !text.ends_with('\n') {
-            self.emitter.output(id, repl_output::Channel::Stdout, b"\n");
+            self.emitter.output_as(id, stdout, format, b"\n");
         }
     }
 }
@@ -1040,7 +1046,7 @@ fn classify(request: ReplRequest) -> Work {
                     work,
                     title: title(&eval.input),
                 },
-                Ok(CommandWork::Text(text)) => Work::Text { id, text },
+                Ok(CommandWork::Text(text, format)) => Work::Text { id, text, format },
                 Err(failure) => Work::Reply {
                     id,
                     message: repl_message::Message::Done(ReplDone {

@@ -1016,9 +1016,19 @@ message ReplOutput {
     STDOUT = 0;
     STDERR = 1;
   }
+  // How the client shows `data`.
+  enum Format {
+    // As it is, as soon as it arrives.
+    PLAIN = 0;
+    // Markdown (the documentation of `:doc` and `:qdoc <function>`): the
+    // client renders it for the terminal once the request's consecutive
+    // MARKDOWN chunks have all arrived.
+    MARKDOWN = 1;
+  }
   Channel channel = 1;
   // At most 16 KiB.
   bytes data = 2;
+  Format format = 3;
 }
 
 message ReplDone {

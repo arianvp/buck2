@@ -116,7 +116,7 @@ fn command(spec: &CommandSpec) -> String {
 }
 
 /// Width of the paragraphs of help on a command, and of the table of commands.
-const WRAP_COLUMNS: usize = 88;
+pub(crate) const WRAP_COLUMNS: usize = 88;
 
 /// The summaries in the table of commands are at least this wide.
 const MIN_SUMMARY_COLUMNS: usize = 36;
@@ -185,7 +185,8 @@ fn details(id: CommandId) -> &'static str {
         CommandId::Doc => {
             "Shows the documentation of a function, type or namespace (`:doc len`, \
              `:doc ctx.cquery`), or, for any other value, of its type: `:doc ctx` shows every \
-             method and attribute of bxl.Context."
+             method and attribute of bxl.Context. The documentation is written in Markdown and \
+             shown as text: with colour, headings are bold and code is highlighted."
         }
         CommandId::Load => {
             "With symbols, loads them from the module: `:load //pkg:defs.bzl f g` is \

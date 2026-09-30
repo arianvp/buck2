@@ -20,10 +20,16 @@ use buck2_cli_proto::ReplValue;
 use buck2_cli_proto::repl_done;
 use buck2_cli_proto::repl_error;
 use buck2_cli_proto::repl_notice;
+use buck2_cli_proto::repl_output;
+use buck2_repl_syntax::markdown;
+use buck2_repl_syntax::markdown::Styling;
 use buck2_repl_syntax::text::truncate_lines;
 
 /// Most lines of a value the interactive editor shows.
 const MAX_VALUE_LINES: usize = 40;
+
+/// Documentation (`:doc`, `:qdoc`) is wrapped at the width of `:help`'s text.
+pub(crate) const DOC_COLUMNS: usize = crate::help::WRAP_COLUMNS;
 
 /// An input that takes this long (waiting for the daemon plus evaluating) shows its duration.
 const SHOW_DURATION: Duration = Duration::from_secs(1);
@@ -220,6 +226,19 @@ fn print_duration(done: &ReplDone, style: Style) -> buck2_error::Result<()> {
     print_note(style, &text)
 }
 
+/// Prints documentation (Markdown) rendered with `styling`, on its own lines.
+pub(crate) fn print_markdown(
+    channel: repl_output::Channel,
+    text: &str,
+    styling: Styling,
+) -> buck2_error::Result<()> {
+    let rendered = markdown::render(text, DOC_COLUMNS, styling);
+    match channel {
+        repl_output::Channel::Stdout => println_stdout(&rendered),
+        repl_output::Channel::Stderr => buck2_client_ctx::eprintln!("{}", rendered),
+    }
+}
+
 /// Prints `message` on stderr, on its own line (in red on a terminal).
 pub(crate) fn print_error(style: Style, message: &str) -> buck2_error::Result<()> {
     buck2_client_ctx::eprintln!("{}", style.paint(RED, message.trim_end_matches('\n')))
@@ -240,4 +259,14 @@ pub(crate) fn print_notice(style: Style, notice: &ReplNotice) -> buck2_error::Re
 
 pub(crate) fn flush() -> buck2_error::Result<()> {
     buck2_client_ctx::stdio::flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_doc_columns() {
+        assert_eq!(DOC_COLUMNS, 88);
+    }
 }

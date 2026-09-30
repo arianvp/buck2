@@ -38,6 +38,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use buck2_cli_proto::repl_error;
+use buck2_cli_proto::repl_output;
 use buck2_error::starlark_error::NativeErrorHandling;
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_repl_syntax::text::CappedString;
@@ -192,6 +193,8 @@ pub(crate) struct RenderedText {
     pub(crate) text: String,
     /// Why the text is incomplete, if it is (a warning shown after it).
     pub(crate) incomplete: Option<String>,
+    /// How the client shows it: documentation is Markdown, which it renders for the terminal.
+    pub(crate) format: repl_output::Format,
 }
 
 impl RenderedText {
@@ -200,6 +203,20 @@ impl RenderedText {
             text,
             incomplete: truncated
                 .then(|| format!("the output was cut after {} MiB", MAX_STREAM_BYTES >> 20)),
+            format: repl_output::Format::Plain,
+        }
+    }
+
+    /// Complete plain text.
+    pub(crate) fn plain(text: String) -> Self {
+        RenderedText::new(text, false)
+    }
+
+    /// The same text, as Markdown.
+    fn markdown(self) -> Self {
+        RenderedText {
+            format: repl_output::Format::Markdown,
+            ..self
         }
     }
 }
@@ -823,7 +840,8 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
                         truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES)
                     ),
                     false,
-                );
+                )
+                .markdown();
             }
         },
     };
@@ -832,7 +850,7 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
     if truncated {
         text = truncate_to_bytes(&text, MAX_STREAM_BYTES).to_owned();
     }
-    RenderedText::new(text, truncated)
+    RenderedText::new(text, truncated).markdown()
 }
 
 /// What `:doc` knows of a value.

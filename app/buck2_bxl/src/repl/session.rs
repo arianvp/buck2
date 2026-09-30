@@ -525,10 +525,7 @@ impl Session {
                 let cancelled = || liveness.is_cancelled();
                 let budget = RenderBudget::new(&cancelled);
                 let text = who(env, &self.private, globs, &core, &budget)?;
-                return Ok(Rendered::Text(RenderedText {
-                    text,
-                    incomplete: None,
-                }));
+                return Ok(Rendered::Text(RenderedText::plain(text)));
             }
             EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) => {}
         }
