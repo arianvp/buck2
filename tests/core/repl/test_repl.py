@@ -246,6 +246,22 @@ async def test_repl_commands(buck: Buck) -> None:
 
 
 @buck_test()
+async def test_repl_type_of_callables(buck: Buck) -> None:
+    # A native method bound to its object shows its signature, as a native function does.
+    for expr in ["ctx.configured_targets", "ctx.cquery().deps", "len"]:
+        result = await buck.repl("-e", f":t {expr}")
+        assert result.stdout.startswith("def("), (expr, result.stdout)
+        assert result.stdout.endswith('  # type() is "function"\n'), (expr, result.stdout)
+    result = await buck.repl("-e", ":t ctx.configured_targets")
+    assert "target_platform: None | TargetLabel | str = ..." in result.stdout
+    # A def: its default values are never shown.
+    result = await buck.repl("-e", "def f(a, b = [1, 2]): return a", "-e", ":t f")
+    assert result.stdout == (
+        'def(a: typing.Any, b: typing.Any = ...) -> typing.Any  # type() is "function"\n'
+    )
+
+
+@buck_test()
 async def test_repl_load_command(buck: Buck) -> None:
     result = await buck.repl(
         "-e", ":l //pkg:helpers.bxl", "-e", "double(2)", "-e", ":r", "-e", "double(3)"

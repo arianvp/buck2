@@ -168,8 +168,10 @@ fn details(id: CommandId) -> &'static str {
         }
         CommandId::Type => {
             "Evaluates the expression and prints its type as the type checker sees it (for \
-             example `list[str]`, or the signature of a function), followed by what `type()` \
-             returns when that differs. The value does not become `_`."
+             example `list[str]`, or the signature of a function or a method, with default \
+             values shown as `...`; `function` when the signature is not known, as for a \
+             `partial`), followed by what `type()` returns when that differs. The value does \
+             not become `_`."
         }
         CommandId::Print => {
             "Evaluates the expression and prints all of its value (up to 16 MiB), where the \

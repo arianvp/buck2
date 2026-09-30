@@ -42,15 +42,21 @@ use buck2_error::starlark_error::NativeErrorHandling;
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::truncate_to_bytes;
+use dupe::Dupe;
 use num_bigint::BigInt;
+use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
 use starlark::docs::DocModule;
+use starlark::docs::DocParam;
 use starlark::docs::DocProperty;
 use starlark::docs::DocString;
 use starlark::docs::DocStringKind;
 use starlark::docs::markdown::render_doc_item_no_link;
+use starlark::typing::ParamIsRequired;
+use starlark::typing::ParamSpec;
 use starlark::typing::Ty;
+use starlark::util::ArcStr;
 use starlark::values::Heap;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
@@ -504,8 +510,8 @@ pub(crate) fn preview(
     Ok(text)
 }
 
-/// `:type`: the type the type checker gives the value (`list[str]`, `def(x: int) -> str`, ...),
-/// and what `type()` returns when that differs.
+/// `:type`: the type the type checker gives the value (`list[str]`, `def(x: int) -> str`, ...,
+/// see [`checker_type`]), and what `type()` returns when that differs.
 fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
     let type_name = truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES).to_owned();
     let mut out = CappedString::new(MAX_TEXT_BYTES);
@@ -522,7 +528,7 @@ fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
         };
     }
     // A `CappedString` never fails; an error from a `Display` impl just ends the text.
-    let _ignored = fmt::write(&mut out, format_args!("{}", Ty::of_value(v)));
+    let _ignored = fmt::write(&mut out, format_args!("{}", checker_type(v)));
     if out.as_str() != type_name {
         let _ignored = fmt::write(&mut out, format_args!("  # type() is \"{type_name}\""));
     }
@@ -543,6 +549,49 @@ fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
         truncated: false,
         json: None,
     }
+}
+
+/// The type of `v` for `:type`: the type checker's (`Ty::of_value`), which is the signature of
+/// a function (a `def`, a `lambda`, a native function such as `len`: `def(_: typing.Any, /) ->
+/// int`) and a type for other values. The type checker knows a native method bound to its
+/// object (`ctx.configured_targets`, `ctx.cquery().deps`) only as `function`: its signature is
+/// taken from its documentation, which is static text, and shown in the same form. A value of
+/// type `function` whose signature is not known (a `partial`) is `function`.
+///
+/// Default values are never formatted (they show as `...`): the documentation of a `def`
+/// formats them, but a `def` has the type of a function, so its documentation is not read.
+fn checker_type(v: Value) -> Ty {
+    let ty = Ty::of_value(v);
+    if v.get_type() != "function" || ty.as_name() != Some("function") {
+        return ty;
+    }
+    match v.documentation() {
+        DocItem::Member(DocMember::Function(function)) => signature_type(&function).unwrap_or(ty),
+        _ => ty,
+    }
+}
+
+/// The type of a function whose documentation is `function`, as the type checker writes the
+/// type of a native function.
+fn signature_type(function: &DocFunction) -> Option<Ty> {
+    let required = |p: &DocParam| {
+        if p.default_value.is_some() {
+            ParamIsRequired::No
+        } else {
+            ParamIsRequired::Yes
+        }
+    };
+    let named = |p: &DocParam| (ArcStr::from(p.name.as_str()), required(p), p.typ.dupe());
+    let params = &function.params;
+    let spec = ParamSpec::new_parts(
+        params.pos_only.iter().map(|p| (required(p), p.typ.dupe())),
+        params.pos_or_named.iter().map(named),
+        params.args.as_ref().map(|p| p.typ.dupe()),
+        params.named_only.iter().map(named),
+        params.kwargs.as_ref().map(|p| p.typ.dupe()),
+    )
+    .ok()?;
+    Some(Ty::function(spec, function.ret.typ.dupe()))
 }
 
 /// Whether the type checker's type of `v` is too large to compute safely: the type of a struct
@@ -1137,4 +1186,60 @@ fn nesting_depth(
         depth: deepest,
         huge_int: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use starlark::docs::DocFunction;
+    use starlark::docs::DocParam;
+    use starlark::docs::DocParams;
+    use starlark::docs::DocReturn;
+    use starlark::typing::Ty;
+
+    use super::signature_type;
+
+    fn param(name: &str, typ: Ty, default_value: Option<&str>) -> DocParam {
+        DocParam {
+            name: name.to_owned(),
+            docs: None,
+            typ,
+            default_value: default_value.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn test_signature_type() {
+        // As the type checker writes a native function: positional-only parameters are
+        // unnamed, and default values (never formatted) are `...`.
+        let function = DocFunction {
+            docs: None,
+            params: DocParams {
+                pos_only: vec![param("labels", Ty::int(), None)],
+                pos_or_named: vec![param("target_platform", Ty::string(), Some("\"x\""))],
+                args: None,
+                named_only: vec![param("modifiers", Ty::none(), Some("None"))],
+                kwargs: Some(param("kwargs", Ty::any(), None)),
+            },
+            ret: DocReturn {
+                docs: None,
+                typ: Ty::bool(),
+            },
+        };
+        assert_eq!(
+            signature_type(&function).map(|t| t.to_string()).as_deref(),
+            Some(
+                "def(_: int, /, target_platform: str = ..., *, modifiers: None = ..., \
+                 **kwargs: typing.Any) -> bool"
+            )
+        );
+        // Parameters with the same name make no signature.
+        let function = DocFunction {
+            params: DocParams {
+                pos_or_named: vec![param("a", Ty::int(), None), param("a", Ty::int(), None)],
+                ..DocParams::default()
+            },
+            ..DocFunction::default()
+        };
+        assert_eq!(signature_type(&function), None);
+    }
 }
