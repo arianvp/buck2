@@ -83,10 +83,14 @@ pub fn load_listing(word: &str) -> Option<&str> {
 
 /// What the list of candidates shows for a candidate: for a path (a target, a directory, a
 /// package, a file), its last part (`a` for `//lib:a`, `sub/` for `//lib/sub/`, `[x]` for
-/// `//lib:a[x]`, without a closing quote); for anything else, the candidate itself.
+/// `//lib:a[x]`, without a closing quote); for anything else, the candidate itself (without a
+/// closing quote).
 pub fn short_display(replacement: &str, is_path: bool) -> String {
     if !is_path {
-        return replacement.to_owned();
+        // A candidate in a string (a symbol of `load`) ends with the closing quote, which the
+        // listing does not show.
+        let body = replacement.trim_end_matches(['"', '\'']);
+        return if body.is_empty() { replacement } else { body }.to_owned();
     }
     let body = replacement.trim_end_matches(['"', '\'']);
     if body.ends_with(']')
@@ -230,6 +234,8 @@ mod tests {
         assert_eq!(short_display("", true), "");
         assert_eq!(short_display("ctx", false), "ctx");
         assert_eq!(short_display("a:b", false), "a:b");
+        assert_eq!(short_display("platform\"", false), "platform");
+        assert_eq!(short_display("\"", false), "\"");
     }
 
     #[test]

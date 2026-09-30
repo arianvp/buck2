@@ -24,11 +24,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 use std::time::Instant;
 
 use buck2_cli_proto::ReplRun;
 use buck2_cli_proto::repl_output;
-use buck2_util::threads::thread_spawn_scoped;
+use buck2_util::threads::thread_spawn;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_UUID_ENV_VAR;
 use buck2_wrapper_common::BUCK2_WRAPPER_ENV_VAR;
@@ -211,9 +213,17 @@ fn run_child(
     result
 }
 
+/// How long the output of a program is still read once it has exited: a program it started in
+/// the background (`:!server &`) may keep its pipes open.
+const CAPTURE_GRACE: Duration = Duration::from_millis(500);
+
+/// How often a program that runs with its output captured is checked for its end.
+const CAPTURE_POLL: Duration = Duration::from_millis(50);
+
 /// Runs a program with an empty stdin and what it writes captured into `capture`, as it
 /// writes it: past what the capture keeps, the output is read and dropped, so that a program
-/// that writes without end (`:!yes`) does not fill the client's memory.
+/// that writes without end (`:!yes`) does not fill the client's memory. Once the program has
+/// exited, its output is read for [`CAPTURE_GRACE`] more at most, until both pipes are closed.
 fn run_captured(
     command: &mut std::process::Command,
     capture: &JsonCapture,
@@ -223,35 +233,90 @@ fn run_captured(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    // Both pipes are read at once: a program may fill one while the other is read.
-    let drained = std::thread::scope(|scope| {
-        if let Some(stderr) = stderr {
-            thread_spawn_scoped("repl-capture", scope, move || {
-                drain(stderr, capture, repl_output::Channel::Stderr)
-            })?;
+    // Both pipes are read at once (a program may fill one while the other is read), each by a
+    // thread that sends what it reads here, and `None` at its end. A thread still reading when
+    // this gives up ends at its next read, as nobody receives what it sends.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(repl_output::Channel, Vec<u8>)>>();
+    let mut open = 0;
+    let pipes: [(Option<Box<dyn Read + Send>>, repl_output::Channel); 2] = [
+        (
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            repl_output::Channel::Stdout,
+        ),
+        (
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            repl_output::Channel::Stderr,
+        ),
+    ];
+    for (pipe, channel) in pipes {
+        let Some(pipe) = pipe else {
+            continue;
+        };
+        let tx = tx.clone();
+        let spawned = thread_spawn("repl-capture", move || {
+            drain(pipe, |data| tx.send(Some((channel, data.to_vec()))).is_ok());
+            let _ignored = tx.send(None);
+        });
+        if let Err(e) = spawned {
+            let _ignored = child.kill();
+            let _ignored = child.wait();
+            return Err(e);
         }
-        if let Some(stdout) = stdout {
-            drain(stdout, capture, repl_output::Channel::Stdout);
-        }
-        Ok::<(), std::io::Error>(())
-    });
-    if let Err(e) = drained {
-        let _ignored = child.kill();
-        let _ignored = child.wait();
-        return Err(e);
+        open += 1;
     }
-    child.wait()
+    drop(tx);
+    let mut exited = None;
+    let mut deadline: Option<Instant> = None;
+    while open > 0 {
+        let timeout = match deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default(),
+            None => CAPTURE_POLL,
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(Some((channel, data))) => capture.write(channel, &data),
+            Ok(None) => open -= 1,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        match deadline {
+            Some(deadline) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            None => {
+                if let Some(status) = child.try_wait()? {
+                    exited = Some(status);
+                    deadline = Some(Instant::now() + CAPTURE_GRACE);
+                }
+            }
+        }
+    }
+    match exited {
+        Some(status) => Ok(status),
+        None => child.wait(),
+    }
 }
 
-/// Reads `pipe` to its end into `capture`.
-fn drain(mut pipe: impl Read, capture: &JsonCapture, channel: repl_output::Channel) {
+/// Reads `pipe` to its end, passing what it reads to `sink`, until `sink` returns false.
+fn drain(mut pipe: impl Read, mut sink: impl FnMut(&[u8]) -> bool) {
     let mut buf = vec![0; 64 << 10];
     loop {
         match pipe.read(&mut buf) {
             Ok(0) => return,
-            Ok(n) => capture.write(channel, buf.get(..n).unwrap_or_default()),
+            Ok(n) => {
+                if !sink(buf.get(..n).unwrap_or_default()) {
+                    return;
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // The program's output cannot be read: what it writes next is lost.
             Err(_) => return,
