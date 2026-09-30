@@ -52,6 +52,23 @@ pub fn match_tier(word: &str, candidate: &str) -> Option<MatchTier> {
     Some(MatchTier::Subsequence)
 }
 
+/// How `candidate` matches `word` when it completes the last part of it: the part after the
+/// last `/`, `:` or `[` of a path, a target, a label (`//pkg:y` completes `y`, as the daemon
+/// matches the names it lists). The candidate must start with what comes before that part
+/// exactly, and its rest is matched with [`match_tier`]. A leading `@` (of a cell, `@root//`)
+/// is ignored on both sides.
+pub fn match_last_part(word: &str, candidate: &str) -> Option<MatchTier> {
+    let (word, candidate) = (without_at(word), without_at(candidate));
+    let head = word.rfind(['/', ':', '[']).map_or(0, |i| i + 1);
+    let fragment = word.get(head..)?;
+    let rest = candidate.strip_prefix(word.get(..head)?)?;
+    match_tier(fragment, rest)
+}
+
+fn without_at(s: &str) -> &str {
+    s.strip_prefix('@').unwrap_or(s)
+}
+
 /// Items of the best tier offered so far.
 #[derive(Debug, Clone)]
 pub struct Ranked<T> {
@@ -138,6 +155,68 @@ mod tests {
         assert_eq!(match_tier("ét", "éxt"), Some(MatchTier::Subsequence));
         assert_eq!(match_tier("xé", "x"), None);
         assert_eq!(match_tier("a", "é"), None);
+    }
+
+    #[test]
+    fn test_match_last_part() {
+        // The last part is matched, and the rest must be there as typed.
+        assert_eq!(
+            match_last_part("//pkg:hel", "//pkg:helpers.bxl\""),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(match_last_part("//pkg:y", "//pkg:typed.bxl"), None);
+        assert_eq!(match_last_part("//pkg:l", "//pkg:helpers.bxl"), None);
+        assert_eq!(match_last_part("//big:9", "//big:t9"), None);
+        assert_eq!(
+            match_last_part("//big:t9", "//big:t90"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(
+            match_last_part("//lib:C", "//lib:c"),
+            Some(MatchTier::CaseInsensitivePrefix)
+        );
+        assert_eq!(
+            match_last_part("//lb", "//lib/"),
+            Some(MatchTier::Subsequence)
+        );
+        assert_eq!(match_last_part("//pkg:sub/x", "//pkg:sub.bzl"), None);
+        assert_eq!(
+            match_last_part("//x:y[o", "//x:y[out]"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(
+            match_last_part("//x:y.bxl:MA", "//x:y.bxl:main"),
+            Some(MatchTier::CaseInsensitivePrefix)
+        );
+        assert_eq!(match_last_part(":cq", ":cquery"), Some(MatchTier::Prefix));
+        assert_eq!(match_last_part(":x", ":fix"), None);
+        // Names, and cells with or without `@`.
+        assert_eq!(
+            match_last_part("rdp", "rdeps("),
+            Some(MatchTier::Subsequence)
+        );
+        assert_eq!(
+            match_last_part("pre", "@prelude//"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(
+            match_last_part("@pre", "@prelude//"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(match_last_part("", "@prelude//"), Some(MatchTier::Prefix));
+        assert_eq!(match_last_part("x", "@prelude//"), None);
+        assert_eq!(
+            match_last_part("root//pk", "@root//pkg/"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(
+            match_last_part("root//pkg:h", "@root//pkg:helpers.bxl"),
+            Some(MatchTier::Prefix)
+        );
+        assert_eq!(match_last_part("root//pkg:h", "@other//pkg:h.bzl"), None);
+        // Not ASCII.
+        assert_eq!(match_last_part("é/", "é/a"), Some(MatchTier::Prefix));
+        assert_eq!(match_last_part("a/é", "b/é"), None);
     }
 
     #[test]

@@ -50,7 +50,11 @@ const LOAD_EXTENSIONS: &[&str] = &[".bzl", ".bxl"];
 enum Listing {
     /// Target patterns: `dir/`, `pkg:`, `pkg:target`, `dir/...`.
     Targets,
-    /// Modules to load: `dir/`, `dir:`, `dir:file.bzl`, `dir:sub/`.
+    /// Modules to load: `@cell//`, `dir/`, `dir:`, `dir:file.bzl`. After the colon comes a file
+    /// name, never a path (`//pkg:sub/x.bzl` is rejected by buck2), and a label that is not
+    /// relative to the working directory names its cell (`//pkg:x.bzl`, not `pkg:x.bzl`, which
+    /// buck2 rejects too). `load()` takes a cell only with an `@` (`@cell//x:y.bzl`; `:bxl`
+    /// takes both).
     LoadFiles,
 }
 
@@ -110,6 +114,26 @@ async fn complete_paths(
         None => ("", cwd.clone(), prefix),
     };
 
+    if listing_kind == Listing::LoadFiles && typed_cell.is_empty() && !prefix.starts_with(':') {
+        // Not a label buck2 loads (`pkg:x.bzl`, `@ro`): only the start of a cell (the client
+        // completes paths relative to the working directory).
+        if !prefix.contains(['/', ':']) {
+            let resolver = dc.get_cell_alias_resolver(cwd.cell()).await?;
+            let typed = prefix.strip_prefix('@').unwrap_or(prefix);
+            for (alias, _) in resolver.mappings() {
+                let cell = format!("{}//", alias.as_str());
+                candidates.offer(
+                    typed,
+                    &cell,
+                    format!("@{cell}"),
+                    repl_candidate::Kind::Cell,
+                    "",
+                );
+            }
+        }
+        return Ok(candidates);
+    }
+
     if let Some((package, name_prefix)) = rest.split_once(':') {
         let typed_package = prefix.get(..prefix.len() - name_prefix.len()).unwrap_or("");
         let Some(dir) = join(&base, package) else {
@@ -142,35 +166,25 @@ async fn complete_paths(
                 }
             }
             Listing::LoadFiles => {
-                // Files of a directory, possibly in a subdirectory (`//pkg:sub/x.bzl`).
-                let (sub, fragment) = split_last_slash(name_prefix);
-                let Some(dir) = join(&dir, sub) else {
+                // The modules of the directory (a file name, not a path, follows the colon).
+                if name_prefix.contains('/') {
                     return Ok(candidates);
-                };
-                let typed = prefix.get(..prefix.len() - fragment.len()).unwrap_or("");
+                }
                 let listing = DiceFileComputations::read_dir(dc, dir.as_ref()).await?;
                 for entry in listing.included.iter() {
                     let name = entry.file_name.as_str();
-                    if name.starts_with('.') && !fragment.starts_with('.') {
+                    if (name.starts_with('.') && !name_prefix.starts_with('.'))
+                        || !is_load_file(entry)
+                    {
                         continue;
                     }
-                    if entry.file_type == FileType::Directory {
-                        candidates.offer(
-                            fragment,
-                            name,
-                            format!("{typed}{name}/"),
-                            repl_candidate::Kind::Directory,
-                            "",
-                        );
-                    } else if is_load_file(entry) {
-                        candidates.offer(
-                            fragment,
-                            name,
-                            format!("{typed}{name}"),
-                            repl_candidate::Kind::File,
-                            "",
-                        );
-                    }
+                    candidates.offer(
+                        name_prefix,
+                        name,
+                        format!("{typed_package}{name}"),
+                        repl_candidate::Kind::File,
+                        "",
+                    );
                 }
             }
         }

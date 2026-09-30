@@ -19,6 +19,25 @@ pub fn is_label(word: &str) -> bool {
     word.contains("//") || word.contains(':') || word.starts_with('@')
 }
 
+/// Whether the directories of `word`, a path relative to the working directory being typed
+/// (the part before its last `/`), may be part of a module to load: buck2 takes only forward
+/// relative paths (no `..`, `.` or empty parts). `:load` drops leading `./` before it loads
+/// (`drop_dot_slash`).
+pub fn is_loadable_dir(word: &str, drop_dot_slash: bool) -> bool {
+    let mut word = word;
+    while drop_dot_slash && let Some(rest) = word.strip_prefix("./") {
+        word = rest;
+    }
+    match word.rfind('/') {
+        Some(i) => word
+            .get(..i)
+            .unwrap_or("")
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".."),
+        None => true,
+    }
+}
+
 /// The end of the cell part of a pattern (`cell//`, `//`), or 0.
 fn after_cell(word: &str) -> usize {
     word.find("//").map_or(0, |i| i + 2)
@@ -37,13 +56,13 @@ pub fn target_listing(word: &str) -> Option<&str> {
 }
 
 /// The part of a module label that names a listing of the daemon: the files of a directory
-/// (`//pkg:` for `//pkg:x.b`, `//pkg:sub/` for `//pkg:sub/x`). `None` if the label names
-/// directories.
+/// (`//pkg:` for `//pkg:x.b`). `None` if the label names directories. After the colon of a
+/// label comes a file name, never a path (buck2 rejects `//pkg:sub/x.bzl`): `//pkg:sub/x` is
+/// listed as `//pkg:`, and nothing in it matches.
 pub fn load_listing(word: &str) -> Option<&str> {
     let after_cell = after_cell(word);
     let colon = word.get(after_cell..)?.find(':')? + after_cell;
-    let end = word.rfind('/').filter(|&i| i > colon).unwrap_or(colon);
-    word.get(..end + 1)
+    word.get(..colon + 1)
 }
 
 /// What the list of candidates shows for a candidate: for a path (a target, a directory, a
@@ -126,6 +145,20 @@ mod tests {
     }
 
     #[test]
+    fn test_is_loadable_dir() {
+        for yes in ["", "a", "pkg/", "pkg/he", "a/b/c.bzl", ".hidden", ".."] {
+            assert!(is_loadable_dir(yes, false), "{yes}");
+        }
+        for no in ["../", "../x", "a/../b", "./", "./x", "a/./b", "/a", "a//b"] {
+            assert!(!is_loadable_dir(no, false), "{no}");
+        }
+        assert!(is_loadable_dir("./", true));
+        assert!(is_loadable_dir("././pkg/he", true));
+        assert!(!is_loadable_dir("./../x", true));
+        assert!(!is_loadable_dir("pkg/./x", true));
+    }
+
+    #[test]
     fn test_listings() {
         assert_eq!(target_listing("//pkg:na"), Some("//pkg:"));
         assert_eq!(target_listing(":na"), Some(":"));
@@ -136,7 +169,8 @@ mod tests {
         assert_eq!(target_listing("cell//"), None);
         assert_eq!(target_listing(""), None);
         assert_eq!(load_listing("//pkg:he"), Some("//pkg:"));
-        assert_eq!(load_listing("//pkg:sub/x"), Some("//pkg:sub/"));
+        assert_eq!(load_listing("//pkg:sub/x"), Some("//pkg:"));
+        assert_eq!(load_listing("@cell//a:b"), Some("@cell//a:"));
         assert_eq!(load_listing(":x"), Some(":"));
         assert_eq!(load_listing("//pk"), None);
         assert_eq!(load_listing("//a/b"), None);

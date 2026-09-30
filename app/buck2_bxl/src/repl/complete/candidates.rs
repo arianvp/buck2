@@ -87,7 +87,9 @@ impl Candidates {
     }
 
     /// Adds a candidate. The first one added with a replacement wins. `detail` is shown next to
-    /// the candidate (e.g. its type).
+    /// the candidate (e.g. its type). When there are too many, the last ones in order are left
+    /// out, but keyword arguments are kept before any other candidate: they are few, and they
+    /// are what `f(<TAB>` is for (names are offered with them).
     pub(crate) fn add(&mut self, replacement: String, kind: repl_candidate::Kind, detail: &str) {
         if replacement.len() > MAX_CANDIDATE_BYTES {
             self.truncated = true;
@@ -99,8 +101,20 @@ impl Candidates {
                 (kind, truncate_to_bytes(detail, MAX_DETAIL_BYTES).to_owned()),
             );
             if self.by_replacement.len() > MAX_CANDIDATES {
-                // Keep the first ones in order.
-                self.by_replacement.pop_last();
+                let last_other = self
+                    .by_replacement
+                    .iter()
+                    .rev()
+                    .find(|(_, (kind, _))| *kind != repl_candidate::Kind::Kwarg)
+                    .map(|(replacement, _)| replacement.clone());
+                match last_other {
+                    Some(replacement) => {
+                        self.by_replacement.remove(&replacement);
+                    }
+                    None => {
+                        self.by_replacement.pop_last();
+                    }
+                }
                 self.truncated = true;
             }
         }
@@ -110,7 +124,12 @@ impl Candidates {
         let mut candidates = Vec::with_capacity(self.by_replacement.len());
         let mut bytes = 0usize;
         let mut truncated = self.truncated;
-        for (replacement, (kind, detail)) in self.by_replacement {
+        // Keyword arguments first, so that the byte limit leaves out other candidates first.
+        let (kwargs, others): (Vec<_>, Vec<_>) = self
+            .by_replacement
+            .into_iter()
+            .partition(|(_, (kind, _))| *kind == repl_candidate::Kind::Kwarg);
+        for (replacement, (kind, detail)) in kwargs.into_iter().chain(others) {
             // Replacement, detail, and a few bytes of framing for each.
             bytes = bytes.saturating_add(replacement.len() + detail.len() + 16);
             if bytes > MAX_ANSWER_BYTES {

@@ -22,7 +22,8 @@
 //! symbols of a module, the query functions) is kept for a short while ([`LISTING_TTL`]), so
 //! that more Tabs on the same listing are instant; an answer that comes too late is kept too, so
 //! that the next Tab has it. Candidates are ranked by how they match the word (the word's prefix
-//! first; ignoring case, then as a subsequence, only when nothing matches better).
+//! first; ignoring case, then as a subsequence, only when nothing matches better; for a path, a
+//! target or a label, how they match its last part).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +51,7 @@ use buck2_cli_proto::repl_request;
 use buck2_core::buck2_env;
 use buck2_repl_syntax::candidates::insertion;
 use buck2_repl_syntax::candidates::is_label;
+use buck2_repl_syntax::candidates::is_loadable_dir;
 use buck2_repl_syntax::candidates::load_listing;
 use buck2_repl_syntax::candidates::short_display;
 use buck2_repl_syntax::candidates::target_listing;
@@ -60,6 +62,7 @@ use buck2_repl_syntax::commands::QueryDialect;
 use buck2_repl_syntax::commands::split_bxl_function;
 use buck2_repl_syntax::lexer::KEYWORDS;
 use buck2_repl_syntax::matching::Ranked;
+use buck2_repl_syntax::matching::match_last_part;
 use buck2_repl_syntax::matching::match_tier;
 use buck2_repl_syntax::query::LITERAL_CALLS;
 use buck2_repl_syntax::query::OPERATOR_WORDS;
@@ -96,6 +99,27 @@ const MAX_LOCAL_CANDIDATES: usize = 500;
 
 /// The extensions of the modules `load` and `:load` load.
 const LOAD_EXTENSIONS: &[&str] = &[".bzl", ".bxl"];
+
+/// Where a module (or a `.bxl` file) is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleSite {
+    /// The module of a `load()` statement: buck2 takes no `./` or `..` in a path, and a cell only
+    /// with an `@` (`@root//x:y.bzl`).
+    LoadCall,
+    /// The module of `:load`, which drops leading `./` and gives the rest to `load()`.
+    LoadCommand,
+    /// The `.bxl` file of `:bxl`, which takes a cell with or without `@`.
+    Bxl,
+}
+
+impl ModuleSite {
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            ModuleSite::LoadCall | ModuleSite::LoadCommand => LOAD_EXTENSIONS,
+            ModuleSite::Bxl => BXL_EXTENSIONS,
+        }
+    }
+}
 
 /// buck2's output directory, not completed as a path.
 const BUCK_OUT: &str = "buck-out";
@@ -176,9 +200,11 @@ impl ListingKey {
 /// Listings of the daemon, kept for a short while.
 #[derive(Default)]
 struct ListingCache {
+    /// Listings, with the time they were asked for.
     listings: HashMap<ListingKey, (Instant, Vec<ReplCandidate>)>,
-    /// Requests for listings that were given up on, whose answers may still come.
-    pending: HashMap<u64, ListingKey>,
+    /// Requests for listings that were given up on, whose answers may still come, with the time
+    /// they were sent.
+    pending: HashMap<u64, (ListingKey, Instant)>,
 }
 
 impl ListingCache {
@@ -187,31 +213,35 @@ impl ListingCache {
         (!key.expires() || Instant::now() - *at < LISTING_TTL).then(|| candidates.clone())
     }
 
-    /// Keeps an answer, if it is complete.
-    fn put(&mut self, key: ListingKey, answer: &ReplCompletions) {
+    /// Keeps an answer to a request sent at `asked`, if it is complete. It is used again until
+    /// [`LISTING_TTL`] after `asked` (it may list what was there any time after that).
+    fn put(&mut self, key: ListingKey, asked: Instant, answer: &ReplCompletions) {
         if answer.status == repl_completions::Status::Ok as i32 && answer.message.is_empty() {
             self.listings
-                .insert(key, (Instant::now(), answer.candidates.clone()));
+                .insert(key, (asked, answer.candidates.clone()));
         }
     }
 
     /// An answer to the request `id`, which came after the completion that asked for it gave
-    /// up.
+    /// up. Dropped if the request was sent before the last [`clear`](Self::clear).
     fn late(&mut self, id: u64, answer: &ReplCompletions) {
-        if let Some(key) = self.pending.remove(&id) {
-            self.put(key, answer);
+        if let Some((key, asked)) = self.pending.remove(&id) {
+            self.put(key, asked, answer);
         }
     }
 
-    fn give_up(&mut self, id: u64, key: ListingKey) {
+    fn give_up(&mut self, id: u64, key: ListingKey, asked: Instant) {
         if self.pending.len() >= MAX_PENDING {
             self.pending.clear();
         }
-        self.pending.insert(id, key);
+        self.pending.insert(id, (key, asked));
     }
 
+    /// Forgets the listings, and the answers still to come: an input may have changed what they
+    /// list.
     fn clear(&mut self) {
         self.listings.clear();
+        self.pending.clear();
     }
 }
 
@@ -275,8 +305,10 @@ impl Completer {
                 arg: ArgKind::Path,
                 word,
                 ..
+            } => self.load_paths(start, word, ModuleSite::LoadCommand),
+            SiteKind::LoadPath { prefix: word } => {
+                self.load_paths(start, word, ModuleSite::LoadCall)
             }
-            | SiteKind::LoadPath { prefix: word } => self.load_paths(start, word, LOAD_EXTENSIONS),
             SiteKind::CommandArg {
                 arg: ArgKind::BxlLabel,
                 word,
@@ -298,7 +330,7 @@ impl Completer {
                     },
                     prefix,
                 ),
-                None => self.load_paths(start, word, BXL_EXTENSIONS),
+                None => self.load_paths(start, word, ModuleSite::Bxl),
             },
             SiteKind::CommandArg { word, .. } | SiteKind::TargetString { prefix: word } => {
                 self.targets(start, word)
@@ -401,11 +433,15 @@ impl Completer {
         )
     }
 
-    /// Modules to load, with one of the `extensions`: labels (`//pkg:x.bzl`, `:x.bzl`) by the
+    /// Modules to load (or `.bxl` files, for `:bxl`): labels (`//pkg:x.bzl`, `:x.bzl`) by the
     /// daemon, paths relative to the working directory here (and the cells a word without a
-    /// slash may start, by the daemon).
-    fn load_paths(&self, start: usize, word: &str, extensions: &[&str]) -> Completion {
+    /// slash may start, `@cell//`, by the daemon).
+    fn load_paths(&self, start: usize, word: &str, site: ModuleSite) -> Completion {
+        let extensions = site.extensions();
         if !is_label(word) {
+            if !is_loadable_dir(word, site == ModuleSite::LoadCommand) {
+                return Completion::new(start, Vec::new());
+            }
             let mut completion = Completion::new(start, paths(&self.cwd, word, extensions));
             if !word.contains('/') {
                 let mut cells = self.listing(
@@ -423,6 +459,18 @@ impl Completer {
             }
             return completion;
         }
+        // `load` takes a cell only with an `@`: `root//x` is completed as `@root//x` (ranking
+        // ignores a leading `@`).
+        let with_at;
+        let word = if site != ModuleSite::Bxl
+            && !word.starts_with('@')
+            && word.find("//").is_some_and(|i| i > 0)
+        {
+            with_at = format!("@{word}");
+            &with_at
+        } else {
+            word
+        };
         let prefix = load_listing(word).unwrap_or(word);
         let mut completion = self.listing_for(
             start,
@@ -533,16 +581,17 @@ impl Completer {
         {
             return Completion::new(start, candidates);
         }
+        let asked = Instant::now();
         let (id, completion) = self.ask_id(start, request, self.target_timeout);
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         match completion.status {
             repl_completions::Status::Ok if completion.message.is_empty() => {
                 cache
                     .listings
-                    .insert(key, (Instant::now(), completion.candidates.clone()));
+                    .insert(key, (asked, completion.candidates.clone()));
             }
             // Still loading: the answer is kept when it comes.
-            repl_completions::Status::Timeout => cache.give_up(id, key),
+            repl_completions::Status::Timeout => cache.give_up(id, key, asked),
             _ => {}
         }
         completion
@@ -670,11 +719,12 @@ fn with_keywords(mut completion: Completion, keywords: &[&str]) -> Completion {
 }
 
 /// The candidates that match `word` best, sorted (keyword arguments first), each replacement
-/// once.
+/// once. The last part of a path, a target or a label is matched (`y` of `//pkg:y`), as the
+/// daemon matches what it lists.
 fn rank(candidates: Vec<ReplCandidate>, word: &str) -> Vec<ReplCandidate> {
     let mut ranked = Ranked::default();
     for c in candidates {
-        if let Some(tier) = match_tier(word, &c.replacement) {
+        if let Some(tier) = match_last_part(word, &c.replacement) {
             ranked.offer(tier, c);
         }
     }
@@ -740,7 +790,7 @@ fn commands(prefix: &str) -> Vec<ReplCandidate> {
     for spec in available_commands() {
         for name in std::iter::once(&spec.name).chain(spec.aliases) {
             let name = format!(":{name}");
-            if match_tier(prefix, &name).is_some() {
+            if match_last_part(prefix, &name).is_some() {
                 candidates.push(candidate(
                     &name,
                     repl_candidate::Kind::Command,
@@ -822,8 +872,8 @@ fn paths(cwd: &Path, word: &str, extensions: &[&str]) -> Vec<ReplCandidate> {
 /// The line editor's completer.
 pub(crate) struct ReplCompleter {
     completer: Arc<Completer>,
-    /// The replacements of the last candidates, to tell a candidate chosen from the common
-    /// prefix of several.
+    /// The replacements of the last candidates, to tell the one candidate there was from the
+    /// common prefix of several.
     last: Mutex<Vec<String>>,
 }
 
@@ -862,9 +912,12 @@ impl rustyline::completion::Completer for ReplCompleter {
         Ok((completion.start, candidates))
     }
 
-    /// Inserts the candidate chosen. A whole candidate replaces the rest of the identifier under
-    /// the cursor too (`ctx.cq▮uery()` becomes `ctx.cquery()`), and does not repeat the `(`,
-    /// `=` or quote that it ends with and that follows (then the cursor goes past it).
+    /// Inserts the candidate chosen. The only candidate replaces the rest of the identifier
+    /// under the cursor too (`ctx.cq▮uery()` becomes `ctx.cquery()`), and does not repeat the
+    /// `(`, `=` or quote that it ends with and that follows (then the cursor goes past it). The
+    /// common prefix of several candidates (in `CompletionType::List`, rustyline inserts that,
+    /// or the candidate when there is one) is inserted as it is, even when it is one of them:
+    /// nothing was chosen.
     fn update(
         &self,
         line: &mut LineBuffer,
@@ -873,12 +926,13 @@ impl rustyline::completion::Completer for ReplCompleter {
         cl: &mut rustyline::Changeset,
     ) {
         let end = line.pos();
-        let whole = self
-            .last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|c| c == elected);
+        let whole = matches!(
+            self.last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            [only] if only == elected
+        );
         let (replaced, insert, skip) = if whole {
             insertion(line.as_str(), end, elected)
         } else {
