@@ -269,9 +269,12 @@ fn details(id: CommandId) -> &'static str {
              directory; on the build file of a target (`:edit :lib`), at the line that defines \
              it when known (for editors that take `+<line>`); or on a module to load \
              (`:edit //pkg:defs.bzl`). A `.bzl` or `.bxl` file that the session loads (directly \
-             or through another module) is loaded again once the editor exits, like `:reload`.\n\n\
+             or through another module) is loaded again once the editor exits, like `:reload`. \
+             If the package of a target does not load, its build file is opened at the top.\n\n\
              Without an argument, edits a scratch buffer (it starts with what it held after the \
-             last `:edit`) and evaluates it as one input once the editor exits."
+             last `:edit`) and evaluates it as one input once the editor exits (Starlark only, \
+             no commands). Without a terminal (-e, a script on stdin), `:edit` needs `$VISUAL` \
+             or `$EDITOR`."
         }
         CommandId::Ls => {
             "Lists the targets of a package, with their rule types: the package of the \

@@ -27,11 +27,14 @@ use buck2_cli_proto::repl_message;
 use buck2_cli_proto::repl_notice;
 use buck2_cli_proto::repl_output;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_repl_syntax::text::truncate_to_bytes;
 use dupe::Dupe;
 use starlark::PrintHandler;
 use tokio::runtime::Handle;
 use tokio::task::AbortHandle;
 use tokio::time::MissedTickBehavior;
+
+use crate::repl::render::MAX_TEXT_BYTES;
 
 /// Largest `ReplOutput` payload: large gRPC messages can end the stream.
 pub(crate) const MAX_OUTPUT_CHUNK: usize = 16 << 10;
@@ -69,7 +72,13 @@ impl ReplEmitter {
         self.emit(id, repl_message::Message::Done(done));
     }
 
-    pub(crate) fn notice(&self, id: u64, level: repl_notice::Level, text: String) {
+    /// Sends a notice, cut to [`MAX_TEXT_BYTES`] (INV-13: every message is at most 64 KiB).
+    pub(crate) fn notice(&self, id: u64, level: repl_notice::Level, mut text: String) {
+        if text.len() > MAX_TEXT_BYTES {
+            let kept = truncate_to_bytes(&text, MAX_TEXT_BYTES - '…'.len_utf8()).len();
+            text.truncate(kept);
+            text.push('…');
+        }
         self.emit(
             id,
             repl_message::Message::Notice(ReplNotice {

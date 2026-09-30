@@ -189,21 +189,17 @@ const LINE_EDITORS: &[&str] = &[
     "ne",
 ];
 
-/// The editor of `:edit`: `$VISUAL`, else `$EDITOR`, else `vi` (`notepad` on Windows). It is a
-/// command line for the shell (e.g. `code --wait`).
-pub(crate) fn editor() -> String {
+/// The editor the user chose for `:edit`: `$VISUAL`, else `$EDITOR`. It is a command line for
+/// the shell (e.g. `code --wait`).
+fn chosen_editor() -> Option<String> {
     // `VISUAL` and `EDITOR` are ambient conventions, not buck2 settings.
     ["VISUAL", "EDITOR"]
         .iter()
         .find_map(|var| std::env::var(var).ok().filter(|e| !e.trim().is_empty()))
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".to_owned()
-            } else {
-                "vi".to_owned()
-            }
-        })
 }
+
+/// The editor of `:edit` when the user chose none.
+const DEFAULT_EDITOR: &str = if cfg!(windows) { "notepad" } else { "vi" };
 
 /// Whether the editor command takes `+<line>` (by the name of its program).
 fn takes_line(editor: &str) -> bool {
@@ -222,8 +218,19 @@ pub(crate) fn run_editor(
     ui: &SharedUi,
     after: UiState,
 ) -> Result<(), String> {
+    let editor = match chosen_editor() {
+        Some(editor) => editor,
+        // A terminal editor without the terminal (its stdin is empty) may never end, and the
+        // session would wait for it.
+        None if !env.interactive => {
+            return Err(format!(
+                "`:edit` needs VISUAL or EDITOR set when the session does not read a terminal \
+                 (the default editor, `{DEFAULT_EDITOR}`, needs one); nothing was loaded or run"
+            ));
+        }
+        None => DEFAULT_EDITOR.to_owned(),
+    };
     render::flush().map_err(|e| format!("{e}"))?;
-    let editor = editor();
     let mut args: Vec<OsString> = Vec::new();
     if let Some(line) = line
         && takes_line(&editor)

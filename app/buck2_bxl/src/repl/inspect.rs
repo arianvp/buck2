@@ -17,8 +17,10 @@ use std::fmt::Write;
 use buck2_cli_proto::repl_error;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::file_ops::dice::DiceFileComputations;
+use buck2_common::package_listing::dice::DicePackageListingResolver;
 use buck2_common::pattern::parse_from_cli::parse_and_resolve_patterns_from_cli_args;
 use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
+use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::pattern::pattern::ParsedPattern;
@@ -30,6 +32,7 @@ use buck2_interpreter_for_build::interpreter::dice_calculation_delegate::HasCalc
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
 use buck2_node::attrs::fmt_context::AttrFmtContext;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
+use buck2_node::configuration::calculation::CONFIGURATION_CALCULATION;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_query::query::environment::AttrFmtOptions;
@@ -50,6 +53,9 @@ const MAX_ATTR_BYTES: usize = 1 << 10;
 /// Most deps `:info` names (it counts them all).
 const MAX_DEPS_SHOWN: usize = 20;
 
+/// Longest warning of `:__locate` (with the error that made it).
+const MAX_WARNING_BYTES: usize = 8 << 10;
+
 /// What `:info`, `:ls` or `:__locate` looks at.
 #[derive(Clone, Debug)]
 pub(crate) enum InspectSpec {
@@ -68,7 +74,8 @@ pub(crate) enum InspectSpec {
 pub(crate) enum Inspected {
     /// Text for the client's stdout.
     Text(String),
-    /// `:__locate`: `{"path": <absolute path>, "line": <line or null>, "module": <bool>}`.
+    /// `:__locate`: `{"path": <absolute path>, "line": <line or null>, "module": <bool>}`, and
+    /// `"warning"` when the location is not the one asked for.
     Location(String),
     /// The target platform, as an absolute label.
     Platform(String),
@@ -98,23 +105,37 @@ pub(crate) async fn inspect(
             let location = if is_module(what) {
                 module_location(sctx, dc, what).await?
             } else {
-                let node = target_node(sctx, dc, what, ":edit").await?;
-                target_location(sctx, dc, &node).await?
+                target_edit_location(sctx, dc, what).await?
             };
-            Ok(Inspected::Location(
-                serde_json::json!({
-                    "path": location.path,
-                    "line": location.line,
-                    "module": location.module,
-                })
-                .to_string(),
-            ))
+            let mut json = serde_json::json!({
+                "path": location.path,
+                "line": location.line,
+                "module": location.module,
+            });
+            if let (Some(warning), Some(json)) = (location.warning, json.as_object_mut()) {
+                json.insert("warning".to_owned(), warning.into());
+            }
+            Ok(Inspected::Location(json.to_string()))
         }
         InspectSpec::Platform { target } => {
             // Relative to the session's directory, as everything is in the session; kept as an
             // absolute label, as `--target-platforms` takes it.
-            let node = target_node(sctx, dc, target, ":set target_platforms").await?;
-            Ok(Inspected::Platform(node.label().to_string()))
+            let label = target_label(sctx, dc, target, ":set target_platforms").await?;
+            dc.get_target_node(&label).await.map_err(buck)?;
+            // A `platform()` target, as `--target-platforms` needs (it is analysed for its
+            // `PlatformInfo`): anything else would break every request that configures.
+            let checked = match CONFIGURATION_CALCULATION.get() {
+                Ok(calculation) => calculation.get_platform_configuration(dc, &label).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = checked {
+                let mut failure = buck(e);
+                failure.add_note(&format_args!(
+                    "`{label}` is not a target platform; the setting is unchanged"
+                ));
+                return Err(failure);
+            }
+            Ok(Inspected::Platform(label.to_string()))
         }
     }
 }
@@ -124,13 +145,13 @@ fn is_module(what: &str) -> bool {
     [".bzl", ".bxl"].iter().any(|e| what.ends_with(e))
 }
 
-/// The node of the one target `target` names (relative to the session's directory).
-async fn target_node(
+/// The one target `target` names (relative to the session's directory).
+async fn target_label(
     sctx: &dyn ServerCommandContextTrait,
     dc: &mut DiceComputations<'_>,
     target: &str,
     command: &str,
-) -> Result<TargetNode, ReplFailure> {
+) -> Result<TargetLabel, ReplFailure> {
     let patterns = parse_patterns_from_cli_args::<TargetPatternExtra>(
         dc,
         &[target.to_owned()],
@@ -138,17 +159,68 @@ async fn target_node(
     )
     .await
     .map_err(buck)?;
-    let label = match patterns.as_slice() {
+    match patterns.as_slice() {
         [ParsedPattern::Target(package, name, TargetPatternExtra)] => {
-            TargetLabel::new(package.dupe(), name.as_ref())
+            Ok(TargetLabel::new(package.dupe(), name.as_ref()))
         }
-        _ => {
-            return Err(usage(&format_args!(
-                "`{command}` takes one target, not a pattern: `{target}` may match several"
-            )));
-        }
-    };
+        _ => Err(usage(&format_args!(
+            "`{command}` takes one target, not a pattern: `{target}` may match several"
+        ))),
+    }
+}
+
+/// The node of the one target `target` names (relative to the session's directory).
+async fn target_node(
+    sctx: &dyn ServerCommandContextTrait,
+    dc: &mut DiceComputations<'_>,
+    target: &str,
+    command: &str,
+) -> Result<TargetNode, ReplFailure> {
+    let label = target_label(sctx, dc, target, command).await?;
     dc.get_target_node(&label).await.map_err(buck)
+}
+
+/// Where `:edit <target>` edits: the target's build file, at the line where it is defined. A
+/// package that does not load has no targets, and that is when one most wants to edit its build
+/// file: it is edited then (from the top), with a warning that says why.
+async fn target_edit_location(
+    sctx: &dyn ServerCommandContextTrait,
+    dc: &mut DiceComputations<'_>,
+    target: &str,
+) -> Result<Location, ReplFailure> {
+    let label = target_label(sctx, dc, target, ":edit").await?;
+    let error = match dc.get_target_node(&label).await {
+        Ok(node) => return target_location(sctx, dc, &node).await,
+        Err(e) => e,
+    };
+    let package = label.pkg();
+    if dc.get_interpreter_results(package.dupe()).await.is_ok() {
+        // The package loads: the target is not in it.
+        return Err(buck(error));
+    }
+    let Ok(listing) = DicePackageListingResolver(dc)
+        .resolve_package_listing(package.dupe())
+        .await
+    else {
+        // No build file either.
+        return Err(buck(error));
+    };
+    let build_file = BuildFilePath::new(package.dupe(), listing.buildfile().to_owned()).path();
+    let (path, shown) = file_paths(sctx, dc, build_file.as_ref()).await?;
+    let mut warning = CappedString::new(MAX_WARNING_BYTES);
+    // A `CappedString` never fails.
+    let _ignored = write!(
+        warning,
+        "`{package}` does not load, so `{shown}` is opened at the top:\n{error:?}"
+    );
+    let warning = with_cut_note(warning);
+    Ok(Location {
+        path,
+        shown,
+        line: None,
+        module: false,
+        warning: Some(warning),
+    })
 }
 
 /// Where something is, for an editor.
@@ -161,6 +233,8 @@ struct Location {
     line: Option<usize>,
     /// A module to load (reloaded after it is edited, if it is loaded), not a build file.
     module: bool,
+    /// Why the location is not the one asked for.
+    warning: Option<String>,
 }
 
 /// The file of `path`: its absolute path and its path relative to the project root.
@@ -201,6 +275,7 @@ async fn target_location(
         shown,
         line,
         module: false,
+        warning: None,
     })
 }
 
@@ -231,6 +306,7 @@ async fn module_location(
         shown,
         line: None,
         module: true,
+        warning: None,
     })
 }
 

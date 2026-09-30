@@ -20,6 +20,7 @@ use buck2_repl_syntax::commands::SettingSide;
 use buck2_repl_syntax::commands::SettingSpec;
 use buck2_repl_syntax::commands::setting_line;
 use buck2_repl_syntax::text::shell_join;
+use buck2_repl_syntax::text::truncate_to_bytes;
 
 use crate::repl::render::ReplFailure;
 
@@ -98,9 +99,18 @@ pub(crate) fn show_settings(target_cfg: &TargetCfg, key: Option<&SettingSpec>) -
     lines.join("\n")
 }
 
+/// Longest value the notice of a change shows (`:set <key>` shows all of it).
+const MAX_NOTICE_VALUE_BYTES: usize = 1 << 10;
+
 /// What a notice says once a setting changed.
 pub(crate) fn setting_changed(target_cfg: &TargetCfg, name: &str) -> String {
-    format!("{name} is now {}", value(target_cfg, name))
+    let value = value(target_cfg, name);
+    let shown = truncate_to_bytes(&value, MAX_NOTICE_VALUE_BYTES);
+    if shown.len() < value.len() {
+        format!("{name} is now {shown}… (`:set {name}` shows all of it)")
+    } else {
+        format!("{name} is now {value}")
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +156,13 @@ mod tests {
         assert_eq!(
             setting_changed(&cfg, "modifiers"),
             "modifiers is now 'a b' c"
+        );
+        cfg.cli_modifiers = (0..20000).map(|i| format!("//m:x{i}")).collect();
+        let changed = setting_changed(&cfg, "modifiers");
+        assert!(changed.len() < 2 * MAX_NOTICE_VALUE_BYTES, "{changed}");
+        assert!(
+            changed.ends_with("… (`:set modifiers` shows all of it)"),
+            "{changed}"
         );
     }
 }

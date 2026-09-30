@@ -41,6 +41,7 @@ use buck2_repl_syntax::commands::parse_command;
 use buck2_repl_syntax::commands::parse_count;
 use buck2_repl_syntax::commands::parse_set_args;
 use buck2_repl_syntax::commands::split_args;
+use buck2_repl_syntax::commands::split_command_token;
 use buck2_repl_syntax::text::truncate_to_bytes;
 
 use crate::complete::Completer;
@@ -352,7 +353,14 @@ impl Inputs {
         }
         let path = self.run_env.cwd.join(file);
         match std::fs::read_to_string(&path) {
-            Ok(code) => self.send(code.clone(), &code),
+            Ok(code) => match starts_with_command(&code) {
+                Some(command) => self.error(&format!(
+                    "error: `{file}` starts with the command `:{command}`, but a file is \
+                     evaluated as one Starlark input, which cannot hold commands; feed it on \
+                     stdin instead (`buck2 repl < {file}`), or give commands with -e"
+                )),
+                None => self.send(code.clone(), &code),
+            },
             Err(e) => self.error(&format!("error: cannot read `{file}`: {e}")),
         }
     }
@@ -615,9 +623,22 @@ impl Inputs {
     /// target, or a module (`//pkg:x.bzl`). A module is loaded again afterwards if the session
     /// loads it.
     fn edit_file(&mut self, what: &str, typed: &str) -> Next {
+        if what.is_empty() {
+            return self.error(
+                "error: `:edit` takes a path or a target, not an empty word; usage: :edit \
+                 [path|target]",
+            );
+        }
         let path = self.run_env.cwd.join(what);
         let is_label = what.contains(':') || what.contains("//") || what.starts_with('@');
-        let target = if path.exists() || !is_label {
+        // `//pkg:x` and `//pkg` are labels, never the paths `/pkg:x` and `/pkg`.
+        let is_path = !what.starts_with("//") && (path.exists() || !is_label);
+        if is_path && path.is_dir() {
+            return self.error(&format!(
+                "error: `{what}` is a directory; `:edit` edits a file"
+            ));
+        }
+        let target = if is_path {
             EditTarget {
                 module: is_module(&path),
                 path,
@@ -668,6 +689,17 @@ impl Inputs {
             }
             _ => None,
         };
+        // Why the location is not the one asked for (the package does not load).
+        if let Some(warning) = location
+            .as_ref()
+            .and_then(|l| l.get("warning"))
+            .and_then(|w| w.as_str())
+        {
+            let printed = render::print_note(self.style(), &format!("warning: {warning}"));
+            if !self.output(printed) {
+                return Err(Next::Stop);
+            }
+        }
         let path = location
             .as_ref()
             .and_then(|l| l.get("path"))
@@ -722,9 +754,22 @@ impl Inputs {
         if code.trim().is_empty() {
             return self.note("note: the scratch buffer is empty: nothing to run");
         }
+        if let Some(command) = starts_with_command(&code) {
+            return self.error(&format!(
+                "error: the scratch buffer starts with the command `:{command}`, but it is \
+                 evaluated as one Starlark input, which cannot hold commands (it is kept: \
+                 `:edit` opens it again)"
+            ));
+        }
         // Recorded as the code (for `:hist`), which is what `<repl:N>` names.
         self.send(code.clone(), &code)
     }
+}
+
+/// The command a file or the scratch buffer starts with, if it does: evaluated as one input, it
+/// would be taken as that command, with the rest of the text as its argument.
+fn starts_with_command(code: &str) -> Option<&str> {
+    split_command_token(code).map(|token| token.token)
 }
 
 /// Whether the file is a module that `load` loads.
@@ -782,5 +827,9 @@ mod tests {
         assert!(history.render(None).ends_with('…'));
         assert!(is_module(Path::new("a/b.bzl")));
         assert!(!is_module(Path::new("a/TARGETS")));
+        assert_eq!(starts_with_command("\n  :set x\ny = 1"), Some("set"));
+        assert_eq!(starts_with_command(":b //:x\nprint(1)"), Some("b"));
+        assert_eq!(starts_with_command("x = 1\n:b //:x"), None);
+        assert_eq!(starts_with_command("# :b\nx = 1"), None);
     }
 }

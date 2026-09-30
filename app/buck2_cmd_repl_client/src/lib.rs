@@ -45,7 +45,8 @@ mod settings;
 #[clap(name = "repl")]
 pub struct ReplCommand {
     /// Files to evaluate before the first input: `.bzl` and `.bxl` files are loaded as `:load`
-    /// loads them (their public symbols become bindings), other files are evaluated as Starlark.
+    /// loads them (their public symbols become bindings), other files are evaluated as one
+    /// Starlark input (no `:` commands).
     #[clap(value_name = "FILES")]
     files: Vec<String>,
 
