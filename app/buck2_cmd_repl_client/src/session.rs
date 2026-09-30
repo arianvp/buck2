@@ -221,6 +221,13 @@ impl SharedUi {
         }
     }
 
+    /// Whether the terminal is someone else's: the line editor reads a line, or a program that
+    /// the session runs (`:run`, `:!`, `:edit`) runs.
+    pub(crate) fn terminal_taken(&self) -> bool {
+        let inner = self.lock();
+        inner.reading || inner.state == UiState::Child
+    }
+
     /// The line editor starts reading a line, unless the session is over. Returns whether it
     /// is not (so that the editor may read).
     pub(crate) fn start_reading(&self) -> bool {

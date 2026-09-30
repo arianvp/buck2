@@ -18,7 +18,9 @@
 //! has run for [`SHOW_AFTER`] (quick inputs draw nothing), and erased before the result of the
 //! input is passed on to be printed. Between inputs nothing is drawn: a simple console prints
 //! the events, as the session's console does without live progress, and it is not ticked (it
-//! would print `Waiting on ...` over the prompt).
+//! would print `Waiting on ...` over the prompt). What it would print while the line editor reads
+//! a line, or while a program that the session runs has the terminal, is held back until the
+//! terminal is free again ([`Held`]).
 //!
 //! The terminal has one writer at a time: everything here runs on the client's runtime (the event
 //! subscriber, the partial result handler and the SIGINT handler, which never run at the same
@@ -63,6 +65,13 @@ const SHOW_AFTER: Duration = Duration::from_millis(300);
 /// The name the consoles show (`Command repl`).
 const COMMAND_NAME: &str = "repl";
 
+/// Most events held back while the terminal is someone else's (see [`Held`]) before they are
+/// printed anyway.
+const MAX_HELD_EVENTS: usize = 10_000;
+
+/// Most bytes of daemon messages held back likewise.
+const MAX_HELD_BYTES: usize = 1 << 20;
+
 /// Where the session writes on the client's runtime. Without [`start`](Self::start) (no live
 /// progress), output and messages are written as they come.
 #[derive(Clone, Dupe, Default)]
@@ -95,6 +104,26 @@ struct State {
     done_up_to: u64,
     /// A superconsole could not be created: the session goes on without one.
     disabled: bool,
+    held: Held,
+}
+
+/// What came for the simple console while the terminal was someone else's: the line editor
+/// reading a line (where it would garble the prompt, and rustyline 18's `ExternalPrinter` cannot
+/// be used, see `session.rs`) or a program that the session runs (`:run`, `:!`, `:edit`). It is
+/// printed once the terminal is free again, before anything else (e.g. `File changed` lines of
+/// the file watcher, which completions sync). Held in order, and at most [`MAX_HELD_EVENTS`]
+/// events and [`MAX_HELD_BYTES`] of messages: past that, it is printed at once.
+#[derive(Default)]
+struct Held {
+    items: Vec<HeldItem>,
+    events: usize,
+    bytes: usize,
+}
+
+enum HeldItem {
+    Events(Vec<Arc<BuckEvent>>),
+    /// Daemon stderr (`handle_tailer_stderr`).
+    Stderr(String),
 }
 
 #[derive(Default)]
@@ -196,15 +225,25 @@ impl ReplConsole {
         buck2_client_ctx::eprintln!("{}", text)
     }
 
-    /// The daemon call is over: the superconsole of an input that ran is erased.
+    /// The daemon call is over: what was held back is printed, the superconsole of an input that
+    /// ran is erased.
     pub(crate) async fn end(&self) -> buck2_error::Result<()> {
-        self.0.lock().await.end_input().await
+        let mut state = self.0.lock().await;
+        state.release().await?;
+        state.end_input().await
     }
 }
 
 impl State {
-    /// Creates the superconsole of the input that runs, or ends one whose input is over.
+    /// Prints what was held back once the terminal is free, creates the superconsole of the
+    /// input that runs, or ends one whose input is over.
     async fn follow_ui(&mut self) -> buck2_error::Result<()> {
+        let Some(setup) = &self.setup else {
+            return Ok(());
+        };
+        if !setup.ui.terminal_taken() {
+            self.release().await?;
+        }
         let Some(setup) = &self.setup else {
             return Ok(());
         };
@@ -292,6 +331,41 @@ impl State {
         console.erase_interactive_output().await
     }
 
+    /// Holds `item` back (see [`Held`]) if the terminal is someone else's now, and there is room.
+    /// Returns whether it did; if not, the caller prints it, after [`release`](Self::release).
+    fn hold(&mut self, events: usize, bytes: usize, item: impl FnOnce() -> HeldItem) -> bool {
+        let taken = self.setup.as_ref().is_some_and(|s| s.ui.terminal_taken());
+        if !taken || !matches!(self.display, Display::Simple(_)) {
+            return false;
+        }
+        let held = &mut self.held;
+        if held.events + events > MAX_HELD_EVENTS || held.bytes + bytes > MAX_HELD_BYTES {
+            return false;
+        }
+        held.events += events;
+        held.bytes += bytes;
+        held.items.push(item());
+        true
+    }
+
+    /// Prints what was held back.
+    async fn release(&mut self) -> buck2_error::Result<()> {
+        if self.held.items.is_empty() {
+            return Ok(());
+        }
+        let items = std::mem::take(&mut self.held).items;
+        let Some((console, _)) = self.console() else {
+            return Ok(());
+        };
+        for item in items {
+            match item {
+                HeldItem::Events(events) => console.handle_events(&events).await?,
+                HeldItem::Stderr(text) => console.handle_tailer_stderr(&text).await?,
+            }
+        }
+        Ok(())
+    }
+
     /// The console that the events go to now, and whether it is to be ticked.
     fn console(&mut self) -> Option<(&mut dyn EventSubscriber, bool)> {
         let busy = self.setup.as_ref().is_some_and(|s| s.ui.busy().is_some());
@@ -315,18 +389,26 @@ impl State {
 /// The simple console that prints the events between inputs (or during an input without a
 /// superconsole), as the session's console does without live progress.
 fn simple_console(setup: &Setup) -> Box<dyn EventSubscriber> {
+    new_simple_console(setup.trace_id.dupe(), setup.verbosity, setup.config.clone())
+}
+
+fn new_simple_console(
+    trace_id: TraceId,
+    verbosity: Verbosity,
+    config: SuperConsoleConfig,
+) -> Box<dyn EventSubscriber> {
     let timekeeper = Timekeeper::new(
         Box::new(RealtimeClock),
         EventTimestamp(SystemTime::now().into()),
     );
     get_console_with_root(
-        setup.trace_id.dupe(),
+        trace_id,
         ConsoleType::Simple,
-        setup.verbosity,
+        verbosity,
         false,
         timekeeper,
         COMMAND_NAME,
-        setup.config.clone(),
+        config,
         None,
     )
     .0
@@ -383,6 +465,10 @@ impl EventSubscriber for ConsoleSubscriber {
     async fn handle_events(&mut self, events: &[Arc<BuckEvent>]) -> buck2_error::Result<()> {
         let mut state = self.0.0.lock().await;
         state.follow_ui().await?;
+        if state.hold(events.len(), 0, || HeldItem::Events(events.to_vec())) {
+            return Ok(());
+        }
+        state.release().await?;
         match state.console() {
             Some((console, _)) => console.handle_events(events).await,
             None => Ok(()),
@@ -391,10 +477,24 @@ impl EventSubscriber for ConsoleSubscriber {
 
     async fn handle_tailer_stderr(&mut self, stderr: &str) -> buck2_error::Result<()> {
         let mut state = self.0.0.lock().await;
+        state.follow_ui().await?;
+        if state.hold(0, stderr.len(), || HeldItem::Stderr(stderr.to_owned())) {
+            return Ok(());
+        }
+        state.release().await?;
         match state.console() {
             Some((console, _)) => console.handle_tailer_stderr(stderr).await,
-            // E.g. `Starting new buck2 daemon...`, before the session starts.
-            None => buck2_client_ctx::eprintln!("{}", stderr),
+            // E.g. `Starting new buck2 daemon...`, before the session starts: printed as the
+            // simple console prints it (with a timestamp).
+            None => {
+                new_simple_console(
+                    TraceId::null(),
+                    Verbosity::default(),
+                    SuperConsoleConfig::default(),
+                )
+                .handle_tailer_stderr(stderr)
+                .await
+            }
         }
     }
 
