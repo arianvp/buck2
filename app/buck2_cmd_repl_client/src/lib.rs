@@ -30,6 +30,7 @@ use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 
 mod editor;
+mod help;
 mod render;
 mod script;
 mod session;

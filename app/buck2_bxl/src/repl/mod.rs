@@ -28,6 +28,8 @@ use crate::repl::driver::Driver;
 use crate::repl::output::ReplEmitter;
 
 mod cancel;
+mod commands;
+mod complete;
 mod driver;
 mod line_ctx;
 mod output;

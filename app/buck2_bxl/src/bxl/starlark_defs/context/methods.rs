@@ -16,8 +16,6 @@ use buck2_cli_proto::build_request::Materializations;
 use buck2_cli_proto::build_request::Uploads;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_common::events::HasEvents;
-use buck2_core::cells::cell_path::CellPathRef;
-use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::provider::label::ProvidersLabel;
@@ -697,7 +695,7 @@ pub(crate) fn bxl_context_methods(builder: &mut MethodsBuilder) {
                 async move {
                     match ParsedPattern::<TargetPatternExtra>::parse_relaxed(
                         this.target_alias_resolver(),
-                        CellPathRef::new(this.cell_name(), CellRelativePath::empty()),
+                        this.relative_pattern_base(),
                         label,
                         this.cell_resolver(),
                         this.cell_alias_resolver(),

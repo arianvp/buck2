@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use buck2_cli_proto::ReplDone;
 use buck2_cli_proto::ReplEval;
@@ -30,6 +32,7 @@ use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_request;
 use buck2_core::buck2_env;
 use buck2_repl_syntax::commands::CommandId;
+use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::parse_command;
 use buck2_repl_syntax::completeness::Completeness;
 use buck2_repl_syntax::completeness::completeness;
@@ -58,6 +61,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::ValidationContext;
 use rustyline::validate::ValidationResult;
 
+use crate::help;
 use crate::render;
 use crate::render::Style;
 use crate::session::InputOutcome;
@@ -386,13 +390,63 @@ impl Session {
     /// Evaluates one input and renders its result.
     fn eval(&mut self, input: String) -> Next {
         match parse_command(&input) {
-            Ok(Some(command)) if command.spec.id == CommandId::Quit => return Next::Stop,
-            Ok(_) => {}
+            Ok(Some(command)) => match command.spec.id {
+                CommandId::Quit => return Next::Stop,
+                CommandId::Help => {
+                    let printed = match help::help(&command.arg) {
+                        Ok(text) => render::print_text(&text).and_then(|()| render::flush()),
+                        Err(message) => {
+                            render::print_error(self.style, &format!("error: {message}"))
+                        }
+                    };
+                    return self.continue_if(printed);
+                }
+                CommandId::Time => {
+                    let timed = command.arg.into_owned();
+                    return self.eval_timed(timed);
+                }
+                _ => {}
+            },
+            Ok(None) => {}
             Err(e) => {
                 return self.continue_if(render::print_error(self.style, &format!("error: {e}")));
             }
         }
+        match self.request(input) {
+            Some(done) => self.finish(&done, self.style, None),
+            None => Next::Stop,
+        }
+    }
 
+    /// `:time <input>`: evaluates the input, then prints how long it took.
+    fn eval_timed(&mut self, mut input: String) -> Next {
+        loop {
+            match parse_command(&input) {
+                // `:time :time x` times `x`.
+                Ok(Some(command)) if command.spec.id == CommandId::Time => {
+                    let timed = command.arg.into_owned();
+                    input = timed;
+                }
+                // Nothing to time: handled here.
+                Ok(Some(command)) if command.spec.handler == Handler::Client => {
+                    return self.eval(input);
+                }
+                Err(_) => return self.eval(input),
+                Ok(_) => break,
+            }
+        }
+        let start = Instant::now();
+        match self.request(input) {
+            Some(done) => {
+                let total = Instant::now() - start;
+                self.finish(&done, self.style.without_durations(), Some(total))
+            }
+            None => Next::Stop,
+        }
+    }
+
+    /// Sends an input to the daemon and waits for its result. `None` if the session ended.
+    fn request(&mut self, input: String) -> Option<ReplDone> {
         self.number = self.number.saturating_add(1);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = ReplRequest {
@@ -405,20 +459,28 @@ impl Session {
         self.ui.set(UiState::Busy { id, presses: 0 });
         if self.req_tx.send(request).is_err() {
             self.outcome.lost = true;
-            return Next::Stop;
+            return None;
         }
         let done = self.wait_for_done(id);
         self.ui.set(UiState::Editor);
-        let Some(done) = done else {
+        if done.is_none() {
             self.outcome.lost = true;
-            return Next::Stop;
-        };
+        }
+        done
+    }
+
+    /// Renders the result of an input (and how long it took, for `:time`).
+    fn finish(&mut self, done: &ReplDone, style: Style, timing: Option<Duration>) -> Next {
         if self.outcome.output_error.is_some() {
             // A notice could not be printed.
             return Next::Stop;
         }
-        let rendered = render::render_done(&done, self.style);
-        let rendered = rendered.and_then(|r| render::flush().map(|()| r));
+        let rendered = render::render_done(done, style).and_then(|r| {
+            if let Some(total) = timing {
+                render::print_timing(style, total, done)?;
+            }
+            render::flush().map(|()| r)
+        });
         match rendered {
             Ok(render::Rendered::Ok) => Next::Continue,
             Ok(render::Rendered::Failed | render::Rendered::Interrupted) => {

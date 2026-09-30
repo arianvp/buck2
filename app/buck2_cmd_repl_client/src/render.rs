@@ -43,6 +43,8 @@ pub(crate) struct Style {
     interactive: bool,
     /// Errors and notes on stderr are coloured.
     color: bool,
+    /// Slow inputs show their duration (interactive only). Off for `:time`, which shows more.
+    durations: bool,
 }
 
 impl Style {
@@ -51,6 +53,7 @@ impl Style {
         Style {
             interactive: false,
             color: false,
+            durations: false,
         }
     }
 
@@ -61,6 +64,15 @@ impl Style {
         Style {
             interactive: true,
             color: !no_color && std::io::stderr().is_terminal(),
+            durations: true,
+        }
+    }
+
+    /// Without the duration of slow inputs.
+    pub(crate) fn without_durations(self) -> Self {
+        Style {
+            durations: false,
+            ..self
         }
     }
 
@@ -115,10 +127,30 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
             Rendered::Ok
         }
     };
-    if style.interactive {
+    if style.interactive && style.durations {
         print_duration(done, style)?;
     }
     Ok(rendered)
+}
+
+/// What `:time` prints: `time: 1.24s total · 0.80s daemon wait · 0.40s eval`.
+pub(crate) fn print_timing(
+    style: Style,
+    total: Duration,
+    done: &ReplDone,
+) -> buck2_error::Result<()> {
+    let text = format!(
+        "time: {:.3}s total · {:.3}s daemon wait · {:.3}s eval",
+        total.as_secs_f64(),
+        Duration::from_millis(done.wait_ms).as_secs_f64(),
+        Duration::from_millis(done.eval_ms).as_secs_f64(),
+    );
+    print_note(style, &text)
+}
+
+/// Prints `text` on stdout, on its own lines.
+pub(crate) fn print_text(text: &str) -> buck2_error::Result<()> {
+    buck2_client_ctx::println!("{}", text.trim_end_matches('\n'))
 }
 
 fn print_value(value: &ReplValue, style: Style) -> buck2_error::Result<()> {

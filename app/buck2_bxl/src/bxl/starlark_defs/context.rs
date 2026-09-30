@@ -27,7 +27,9 @@ use buck2_common::target_aliases::HasTargetAliasResolver;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::name::CellName;
+use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
@@ -321,15 +323,35 @@ impl BxlContextCoreData {
         &self.artifact_fs
     }
 
+    /// The directory relative target patterns are parsed against: the cell root, or in
+    /// `buck2 repl` the directory the session was started in.
+    pub(crate) fn relative_pattern_base(&self) -> CellPathRef<'_> {
+        match &self.repl_cwd {
+            Some(cwd) => cwd.as_ref(),
+            None => CellPathRef::new(self.cell_name, CellRelativePath::empty()),
+        }
+    }
+
     /// Working dir for resolving literals.
     /// Note, unlike buck2 command line UI, we resolve targets and literals
-    /// against the cell root instead of user working dir.
+    /// against the cell root instead of user working dir (except in `buck2 repl`, which
+    /// resolves them against the directory the session was started in, like the command line).
     pub(crate) fn working_dir(&self) -> buck2_error::Result<ProjectRelativePathBuf> {
+        if let Some(cwd) = &self.repl_cwd {
+            return self.cell_resolver().resolve_path(cwd.as_ref());
+        }
         let cell = self.cell_resolver().get(self.cell_name())?;
         Ok(cell.path().as_project_relative_path().to_owned())
     }
 
     pub(crate) fn parse_query_file_literal(&self, literal: &str) -> buck2_error::Result<CellPath> {
+        let repl_cwd_abs = match &self.repl_cwd {
+            Some(cwd) => Some(
+                self.project_root()
+                    .resolve(&self.cell_resolver().resolve_path(cwd.as_ref())?),
+            ),
+            None => None,
+        };
         parse_query_file_literal(
             literal,
             self.cell_alias_resolver(),
@@ -338,7 +360,8 @@ impl BxlContextCoreData {
             //   which is inconsistent with the rest of buck2:
             //   The same query `owner(foo.h)` is resolved using
             //   current directory in `buck2 query`, but relative to cell root in BXL.
-            self.cell_root_abs(),
+            //   (`buck2 repl` passes the directory the session was started in.)
+            repl_cwd_abs.as_ref().unwrap_or(self.cell_root_abs()),
             self.project_root(),
         )
     }

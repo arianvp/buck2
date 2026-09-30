@@ -57,6 +57,8 @@ pub(crate) struct PrepRequest<'a> {
     pub(crate) global_cfg_options: GlobalCfgOptions,
     /// Load the prelude.
     pub(crate) need_prelude: bool,
+    /// Modules to import whole (`:load` without symbols), as they would be loaded.
+    pub(crate) import_all: Vec<String>,
 }
 
 pub(crate) struct Prepared {
@@ -64,6 +66,9 @@ pub(crate) struct Prepared {
     pub(crate) ast: AstModule,
     /// The modules the input loads, by the string it loads them with.
     pub(crate) loads: HashMap<String, FrozenModule>,
+    /// The modules to import whole, in the order asked for, with the string they were asked
+    /// for with.
+    pub(crate) import_all: Vec<(String, FrozenModule)>,
     /// The prelude's modules if asked for (none if the project has no prelude), or why they
     /// could not be loaded.
     pub(crate) prelude: Option<buck2_error::Result<Vec<FrozenModule>>>,
@@ -87,6 +92,7 @@ pub(crate) async fn prepare(
         cwd,
         global_cfg_options,
         need_prelude,
+        import_all,
     } = req;
 
     let gis = dc.get_global_interpreter_state().await.map_err(buck)?;
@@ -102,7 +108,7 @@ pub(crate) async fn prepare(
         .map(|load| load.module_id.to_owned())
         .collect();
 
-    let (load_paths, prelude_paths) = {
+    let (load_paths, import_all_paths, prelude_paths) = {
         let calc = dc
             .get_interpreter_calculator(OwnedStarlarkPath::BxlFile(repl_path.clone()))
             .await
@@ -114,6 +120,14 @@ pub(crate) async fn prepare(
                 .await
                 .map_err(buck)?;
             load_paths.push((id, path));
+        }
+        let mut import_all_paths = Vec::with_capacity(import_all.len());
+        for id in import_all {
+            let path = calc
+                .resolve_load(StarlarkPath::BxlFile(repl_path), &id)
+                .await
+                .map_err(buck)?;
+            import_all_paths.push((id, path));
         }
         let prelude_paths = if need_prelude {
             // The implicit imports of an empty `.bxl` file: the prelude, if there is one.
@@ -131,13 +145,18 @@ pub(crate) async fn prepare(
         } else {
             None
         };
-        (load_paths, prelude_paths)
+        (load_paths, import_all_paths, prelude_paths)
     };
 
     let mut loads = HashMap::with_capacity(load_paths.len());
     for (id, path) in load_paths {
         let module = dc.get_loaded_module(path.borrow()).await.map_err(buck)?;
         loads.insert(id, module.env().dupe());
+    }
+    let mut import_all = Vec::with_capacity(import_all_paths.len());
+    for (id, path) in import_all_paths {
+        let module = dc.get_loaded_module(path.borrow()).await.map_err(buck)?;
+        import_all.push((id, module.env().dupe()));
     }
 
     let prelude = match prelude_paths {
@@ -183,6 +202,7 @@ pub(crate) async fn prepare(
         globals,
         ast,
         loads,
+        import_all,
         prelude,
         core,
         provider,

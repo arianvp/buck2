@@ -11,6 +11,7 @@
 //! The session on its thread: evaluation of inputs in the session's module.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::pin;
 
@@ -29,9 +30,11 @@ use buck2_interpreter::factory::FinishedStarlarkEvaluation;
 use buck2_interpreter::factory::ProfilingReportedToken;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
 use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
+use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::PrecheckError;
 use buck2_repl_syntax::text::dedent;
 use buck2_repl_syntax::text::precheck;
+use buck2_repl_syntax::text::starlark_string_literal;
 use dice_futures::cancellation::CancellationObserver;
 use dupe::Dupe;
 use futures::future::Either;
@@ -48,14 +51,19 @@ use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::output::OutputStreamState;
 use crate::bxl::starlark_defs::context::starlark_async::BxlDiceComputations;
 use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
+use crate::repl::complete::types::TypeIndex;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplPrintHandler;
 use crate::repl::prep::PrepRequest;
 use crate::repl::prep::Prepared;
 use crate::repl::prep::prepare;
-use crate::repl::render::RenderedValue;
+use crate::repl::render::RenderBudget;
+use crate::repl::render::RenderContext;
+use crate::repl::render::RenderMode;
+use crate::repl::render::Rendered;
 use crate::repl::render::ReplFailure;
-use crate::repl::render::render_echo;
+use crate::repl::render::render;
+use crate::repl::thread::EvalKind;
 use crate::repl::thread::EvalReply;
 use crate::repl::thread::EvalWork;
 use crate::repl::thread::SessionConfig;
@@ -63,6 +71,12 @@ use crate::repl::thread::SessionConfig;
 /// The synthetic `.bxl` file of the session, in its working directory. It is never read; loads
 /// resolve relative to it.
 const REPL_FILE_NAME: &str = "__repl__.bxl";
+
+/// Most names a notice about loaded modules lists.
+const MAX_NOTICE_NAMES: usize = 64;
+
+/// Longest notice about loaded modules.
+const MAX_NOTICE_BYTES: usize = 4 << 10;
 
 /// The state of the session between jobs. It holds no Starlark values (INV-2): values live only
 /// in the module's slots.
@@ -78,6 +92,73 @@ pub(crate) struct Session {
     prelude_loaded: bool,
     /// The token of the last finished evaluation, to leave the module's profiling scope with.
     last_token: Option<ProfilingReportedToken>,
+    /// What `:reload` loads again.
+    loaded: LoadedModules,
+    /// The documentation of the types of the globals, built when `:doc` first needs it.
+    types: Option<TypeIndex>,
+}
+
+/// The modules the session has loaded, to load again on `:reload`.
+#[derive(Default)]
+struct LoadedModules {
+    /// Modules imported whole (`:load` without symbols), in order.
+    import_all: Vec<String>,
+    /// `load` statements: the modules (as they were loaded), each with its symbols (local name,
+    /// name in the module), in the order they were first loaded. A local name is bound by the
+    /// latest load only.
+    loads: Vec<(String, Vec<(String, String)>)>,
+}
+
+impl LoadedModules {
+    fn is_empty(&self) -> bool {
+        self.import_all.is_empty() && self.loads.is_empty()
+    }
+
+    fn add_import_all(&mut self, module: &str) {
+        if !self.import_all.iter().any(|m| m == module) {
+            self.import_all.push(module.to_owned());
+        }
+    }
+
+    fn add_load(&mut self, module: &str, symbols: &[(String, String)]) {
+        for (local, _) in symbols {
+            for (_, known) in &mut self.loads {
+                known.retain(|(l, _)| l != local);
+            }
+        }
+        match self.loads.iter_mut().find(|(m, _)| m == module) {
+            Some((_, known)) => known.extend(symbols.iter().cloned()),
+            None => self.loads.push((module.to_owned(), symbols.to_vec())),
+        }
+        self.loads.retain(|(_, symbols)| !symbols.is_empty());
+    }
+
+    /// The `load` statements that bind the loaded symbols again.
+    fn load_statements(&self) -> String {
+        let mut code = String::new();
+        for (module, symbols) in &self.loads {
+            code.push_str("load(");
+            code.push_str(&starlark_string_literal(module));
+            for (local, symbol) in symbols {
+                code.push_str(", ");
+                if local != symbol {
+                    code.push_str(local);
+                    code.push_str(" = ");
+                }
+                code.push_str(&starlark_string_literal(symbol));
+            }
+            code.push_str(")\n");
+        }
+        code
+    }
+
+    /// Every module, for notices.
+    fn modules(&self) -> impl Iterator<Item = &str> {
+        self.import_all
+            .iter()
+            .map(String::as_str)
+            .chain(self.loads.iter().map(|(m, _)| m.as_str()))
+    }
 }
 
 impl Session {
@@ -90,6 +171,8 @@ impl Session {
             need_prelude: true,
             prelude_loaded: false,
             last_token: None,
+            loaded: LoadedModules::default(),
+            types: None,
         }
     }
 
@@ -125,11 +208,12 @@ impl Session {
         work: EvalWork,
         print: &ReplPrintHandler,
         dispatcher: EventDispatcher,
-    ) -> Result<Option<RenderedValue>, ReplFailure> {
+    ) -> Result<Rendered, ReplFailure> {
         let EvalWork {
             id,
             number,
             input,
+            kind,
             txn,
             liveness,
             cwd,
@@ -137,7 +221,32 @@ impl Session {
             span: _,
         } = work;
 
-        let code = dedent(&input);
+        let (code, import_all) = match &kind {
+            EvalKind::ImportAll { module } => (String::new(), vec![module.clone()]),
+            EvalKind::Reload => {
+                if self.loaded.is_empty() {
+                    self.emitter.notice(
+                        id,
+                        repl_notice::Level::Info,
+                        "nothing to reload: no module has been loaded".to_owned(),
+                    );
+                    return Ok(Rendered::Nothing);
+                }
+                (
+                    self.loaded.load_statements(),
+                    self.loaded.import_all.clone(),
+                )
+            }
+            EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) => (input, Vec::new()),
+        };
+        // Errors in code the user did not write are shown without it.
+        let generated = matches!(kind, EvalKind::Sugar | EvalKind::Reload);
+        let mode = match kind {
+            EvalKind::Render(mode) => mode,
+            _ => RenderMode::Echo,
+        };
+
+        let code = dedent(&code);
         precheck(&code).map_err(|e| {
             let kind = match e {
                 PrecheckError::TooLarge { .. } => repl_error::Kind::Usage,
@@ -146,6 +255,12 @@ impl Session {
             ReplFailure::new(kind, &e)
         })?;
         let code = code.into_owned();
+        // For the heading of `:doc`.
+        let typed = if mode == RenderMode::Doc {
+            code.clone()
+        } else {
+            String::new()
+        };
 
         let repl_path = ForwardRelativePath::new(REPL_FILE_NAME)
             .and_then(|name| BxlFilePath::new(cwd.join(name)))
@@ -164,6 +279,7 @@ impl Session {
                     cwd,
                     global_cfg_options,
                     need_prelude: self.need_prelude,
+                    import_all,
                 },
             ),
         )?;
@@ -171,6 +287,7 @@ impl Session {
             globals,
             ast,
             loads,
+            import_all,
             prelude,
             core,
             provider,
@@ -203,6 +320,31 @@ impl Session {
             }
         }
 
+        // Modules imported whole: their public symbols become (private) bindings of the session,
+        // as with `load`.
+        for (_, module) in &import_all {
+            env.import_public_symbols(module);
+        }
+        // The `load` statements of the code, recorded for `:reload` once they have run.
+        let load_statements: Vec<(String, Vec<(String, String)>)> = ast
+            .loads()
+            .iter()
+            .map(|load| {
+                (
+                    load.module_id.to_owned(),
+                    load.symbols
+                        .iter()
+                        .map(|(local, symbol)| ((*local).to_owned(), (*symbol).to_owned()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        if mode == RenderMode::Doc && self.types.is_none() {
+            self.types = Some(TypeIndex::build(&globals));
+        }
+        let types = self.types.as_ref();
+
         let loader = ReplLoader(loads);
         let stream = self.stream.dupe();
         let mut extra = BxlEvalExtra::new(
@@ -228,8 +370,17 @@ impl Session {
                 env.set("ctx", heap.alloc(ctx));
                 Ok(match eval.eval_module(ast, &globals) {
                     Ok(v) => {
-                        let rendered = render_echo(v, &core);
-                        if !v.is_none() {
+                        let cancelled = || liveness.is_cancelled();
+                        let cx = RenderContext {
+                            core: &core,
+                            module: &**env,
+                            heap,
+                            budget: RenderBudget::new(&cancelled),
+                            types,
+                            code: &typed,
+                        };
+                        let rendered = render(v, mode, &cx);
+                        if rendered.is_ok() && mode.binds_last_value() && !v.is_none() {
                             env.set("_", v);
                         }
                         Ok(rendered)
@@ -246,11 +397,15 @@ impl Session {
                 .0,
         );
 
-        result.map_err(|e| {
+        let rendered = result.map_err(|e| {
             if liveness.is_cancelled() {
                 ReplFailure::interrupted()
             } else {
-                let mut failure = ReplFailure::from_starlark(e);
+                let mut failure = if generated {
+                    ReplFailure::from_starlark(starlark::Error::new_kind(e.into_kind()))
+                } else {
+                    ReplFailure::from_starlark(e)
+                };
                 if env.heap().peak_allocated_bytes() >= heap_limit {
                     failure.add_note(&format_args!(
                         "the session's heap is limited to {} MiB (`--max-heap-mb`) and is full; \
@@ -260,7 +415,36 @@ impl Session {
                 }
                 failure
             }
-        })
+        })??;
+
+        // The loads ran: record them for `:reload`.
+        for (module, symbols) in &load_statements {
+            self.loaded.add_load(module, symbols);
+        }
+        match &kind {
+            EvalKind::ImportAll { .. } => {
+                for (module_id, module) in &import_all {
+                    self.loaded.add_import_all(module_id);
+                    self.emitter.notice(
+                        id,
+                        repl_notice::Level::Info,
+                        loaded_notice(module_id, module),
+                    );
+                }
+            }
+            EvalKind::Reload => {
+                let mut notice = CappedString::new(MAX_NOTICE_BYTES);
+                let _ignored = fmt::write(&mut notice, format_args!("reloaded"));
+                for (i, module) in self.loaded.modules().enumerate() {
+                    let sep = if i == 0 { " " } else { ", " };
+                    let _ignored = fmt::write(&mut notice, format_args!("{sep}{module}"));
+                }
+                self.emitter
+                    .notice(id, repl_notice::Level::Info, notice.into_string());
+            }
+            EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) => {}
+        }
+        Ok(rendered)
     }
 
     /// Runs the asynchronous part of an evaluation to completion on this thread, or until the
@@ -324,6 +508,28 @@ struct EvaluatorSetup<'a, 'e> {
     extra: &'a mut BxlEvalExtra<'e>,
     /// Most bytes the session's heap may hold at its peak.
     heap_limit: usize,
+}
+
+/// `loaded //pkg:x.bzl: a, b, c`: what `:load` without symbols imported.
+fn loaded_notice(module_id: &str, module: &FrozenModule) -> String {
+    let mut notice = CappedString::new(MAX_NOTICE_BYTES);
+    let _ignored = fmt::write(&mut notice, format_args!("loaded {module_id}:"));
+    let mut names: Vec<&str> = module.names().filter(|n| !n.starts_with('_')).collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        let _ignored = fmt::write(&mut notice, format_args!(" no public symbols"));
+    }
+    for (i, name) in names.iter().take(MAX_NOTICE_NAMES).enumerate() {
+        let sep = if i == 0 { " " } else { ", " };
+        let _ignored = fmt::write(&mut notice, format_args!("{sep}{name}"));
+    }
+    if names.len() > MAX_NOTICE_NAMES {
+        let _ignored = fmt::write(
+            &mut notice,
+            format_args!(" and {} more", names.len() - MAX_NOTICE_NAMES),
+        );
+    }
+    notice.into_string()
 }
 
 /// Serves the modules an input loads, resolved and loaded beforehand.

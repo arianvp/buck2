@@ -39,6 +39,7 @@ use buck2_cli_proto::repl_completions;
 use buck2_cli_proto::repl_done;
 use buck2_cli_proto::repl_error;
 use buck2_cli_proto::repl_message;
+use buck2_cli_proto::repl_notice;
 use buck2_cli_proto::repl_output;
 use buck2_cli_proto::repl_request;
 use buck2_common::dice::cells::HasCellResolver;
@@ -49,8 +50,8 @@ use buck2_data::BxlEnsureArtifactsEnd;
 use buck2_data::BxlEnsureArtifactsStart;
 use buck2_error::buck2_error;
 use buck2_events::dispatch::current_span;
-use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::parse_command;
+use buck2_repl_syntax::text::truncate_to_bytes;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
@@ -70,11 +71,15 @@ use tokio::runtime::Handle;
 use crate::bxl::starlark_defs::context::output::OutputStreamOutcome;
 use crate::command::materialize_ensured_artifacts;
 use crate::repl::cancel::EvalCancel;
+use crate::repl::commands::CommandWork;
+use crate::repl::commands::command_work;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplOutputWriter;
+use crate::repl::render::Rendered;
 use crate::repl::render::ReplFailure;
 use crate::repl::thread::EvalJob;
+use crate::repl::thread::EvalKind;
 use crate::repl::thread::EvalReply;
 use crate::repl::thread::EvalWork;
 use crate::repl::thread::Job;
@@ -84,6 +89,9 @@ use crate::repl::thread::SessionConfig;
 /// The heap limit when `ReplOpen` does not set one.
 const DEFAULT_HEAP_LIMIT: u64 = 4 << 30;
 
+/// Longest excerpt of an input kept to describe its request to other commands.
+const MAX_TITLE_BYTES: usize = 256;
+
 /// A request, classified.
 enum Work {
     /// Start the session: import the prelude, bind `ctx`. Answered with `Ready`.
@@ -91,6 +99,10 @@ enum Work {
         id: u64,
     },
     Eval(EvalRequest),
+    /// `:reset`: a new session, started like the first one.
+    Reset {
+        id: u64,
+    },
     /// Answered at once, without DICE.
     Reply {
         id: u64,
@@ -104,7 +116,30 @@ enum Work {
 struct EvalRequest {
     id: u64,
     number: u32,
+    /// The code to evaluate (for a meta-command, generated from it).
     input: String,
+    kind: EvalKind,
+    /// The first line of the input as typed, shown to other commands that wait for this one.
+    title: String,
+}
+
+impl EvalRequest {
+    /// Starts the session: imports the prelude and binds `ctx`.
+    fn init(id: u64) -> Self {
+        EvalRequest {
+            id,
+            number: 0,
+            input: String::new(),
+            kind: EvalKind::Input,
+            title: String::new(),
+        }
+    }
+}
+
+/// The first line of `input`, cut to [`MAX_TITLE_BYTES`].
+fn title(input: &str) -> String {
+    let first_line = input.trim_start().lines().next().unwrap_or("");
+    truncate_to_bytes(first_line, MAX_TITLE_BYTES + 1).to_owned()
 }
 
 /// The result of a request that ran in a transaction.
@@ -211,15 +246,24 @@ impl<'a> Driver<'a> {
                 Work::Reply { id, message } => self.emitter.emit(id, message),
                 Work::Init { id } => {
                     let outcome = self
-                        .in_flight(&thread, &target_cfg, id, 0, String::new())
+                        .in_flight(&thread, &target_cfg, EvalRequest::init(id))
                         .await;
                     self.answer_init(id, outcome);
                 }
-                Work::Eval(EvalRequest { id, number, input }) => {
-                    let outcome = self
-                        .in_flight(&thread, &target_cfg, id, number, input)
-                        .await;
+                Work::Eval(request) => {
+                    let id = request.id;
+                    let outcome = self.in_flight(&thread, &target_cfg, request).await;
                     self.answer_eval(id, outcome);
+                }
+                Work::Reset { id } => {
+                    // The thread is idle: it drops the module at once.
+                    let outcome = if thread.reset().await {
+                        self.in_flight(&thread, &target_cfg, EvalRequest::init(id))
+                            .await
+                    } else {
+                        Ok(Outcome::ThreadExited)
+                    };
+                    self.answer_reset(id, outcome);
                 }
             }
             if !self.client_open {
@@ -255,16 +299,15 @@ impl<'a> Driver<'a> {
         &mut self,
         thread: &ReplThread,
         target_cfg: &TargetCfg,
-        id: u64,
-        number: u32,
-        input: String,
+        request: EvalRequest,
     ) -> buck2_error::Result<Outcome> {
+        let id = request.id;
         let cancel = Arc::new(EvalCancel::new());
         let fut = run_eval(
             self.sctx,
             thread.jobs(),
             target_cfg.clone(),
-            EvalRequest { id, number, input },
+            request,
             cancel.dupe(),
             self.emitter.dupe(),
         );
@@ -342,6 +385,19 @@ impl<'a> Driver<'a> {
         self.answer_eval(id, outcome)
     }
 
+    fn answer_reset(&mut self, id: u64, outcome: buck2_error::Result<Outcome>) {
+        if let Ok(Outcome::Eval { reply, .. }) = &outcome
+            && reply.result.is_ok()
+        {
+            self.emitter.notice(
+                id,
+                repl_notice::Level::Info,
+                "session reset: every binding and loaded module is gone".to_owned(),
+            );
+        }
+        self.answer_eval(id, outcome)
+    }
+
     fn answer_eval(&mut self, id: u64, outcome: buck2_error::Result<Outcome>) {
         let done = match outcome {
             Err(e) => ReplDone {
@@ -386,6 +442,15 @@ impl<'a> Driver<'a> {
                 } = *reply;
                 let outcome = match (result, drained, materialized) {
                     (Err(failure), _, _) => Some(repl_done::Outcome::Error(failure_proto(failure))),
+                    (Ok(Rendered::Text(text)), Ok(_), Materialized::Done) => {
+                        // After the output of the evaluation, as a value would be.
+                        self.send_text(id, &text.text);
+                        if let Some(incomplete) = text.incomplete {
+                            self.emitter
+                                .notice(id, repl_notice::Level::Warning, incomplete);
+                        }
+                        None
+                    }
                     (Ok(_), Err(e), _) => Some(repl_done::Outcome::Error(failure_proto(
                         ReplFailure::from_buck2(repl_error::Kind::Buck, &e),
                     ))),
@@ -395,8 +460,8 @@ impl<'a> Driver<'a> {
                     (Ok(_), Ok(_), Materialized::Failed(errors)) => Some(
                         repl_done::Outcome::Error(failure_proto(materialization_failure(&errors))),
                     ),
-                    (Ok(None), Ok(_), Materialized::Done) => None,
-                    (Ok(Some(value)), Ok(_), Materialized::Done) => {
+                    (Ok(Rendered::Nothing), Ok(_), Materialized::Done) => None,
+                    (Ok(Rendered::Value(value)), Ok(_), Materialized::Done) => {
                         Some(repl_done::Outcome::Value(ReplValue {
                             r#type: value.type_name,
                             text: value.text,
@@ -415,6 +480,15 @@ impl<'a> Driver<'a> {
             }
         };
         self.emitter.done(id, done);
+    }
+
+    /// Sends text to the client's stdout, ending with a newline.
+    fn send_text(&self, id: u64, text: &str) {
+        self.emitter
+            .output(id, repl_output::Channel::Stdout, text.as_bytes());
+        if !text.ends_with('\n') {
+            self.emitter.output(id, repl_output::Channel::Stdout, b"\n");
+        }
     }
 }
 
@@ -442,25 +516,27 @@ fn classify(request: ReplRequest) -> Work {
             Ok(None) => Work::Eval(EvalRequest {
                 id,
                 number: eval.number,
+                title: title(&eval.input),
                 input: eval.input,
+                kind: EvalKind::Input,
             }),
-            Ok(Some(command)) => {
-                let name = command.spec.display_name();
-                let done = match command.spec.handler {
-                    Handler::Client => error_done(
-                        repl_error::Kind::Usage,
-                        &format_args!("`{name}` is handled by the client"),
-                    ),
-                    Handler::Server | Handler::Both => error_done(
-                        repl_error::Kind::Unsupported,
-                        &format_args!("`{name}` is not implemented yet"),
-                    ),
-                };
-                Work::Reply {
+            Ok(Some(command)) => match command_work(&command) {
+                Ok(CommandWork::Eval { kind, code }) => Work::Eval(EvalRequest {
                     id,
-                    message: repl_message::Message::Done(done),
-                }
-            }
+                    number: eval.number,
+                    input: code,
+                    kind,
+                    title: title(&eval.input),
+                }),
+                Ok(CommandWork::Reset) => Work::Reset { id },
+                Err(failure) => Work::Reply {
+                    id,
+                    message: repl_message::Message::Done(ReplDone {
+                        outcome: Some(repl_done::Outcome::Error(failure_proto(failure))),
+                        ..ReplDone::default()
+                    }),
+                },
+            },
             // The message quotes the token, which may be of any length.
             Err(e) => Work::Reply {
                 id,
@@ -490,9 +566,15 @@ async fn run_eval(
     cancel: Arc<EvalCancel>,
     emitter: ReplEmitter,
 ) -> buck2_error::Result<Outcome> {
-    let EvalRequest { id, number, input } = request;
+    let EvalRequest {
+        id,
+        number,
+        input,
+        kind,
+        title,
+    } = request;
     let t0 = Instant::now();
-    let repl_ctx = ReplCtx::eval(sctx, &input);
+    let repl_ctx = ReplCtx::eval(sctx, &title);
     (&repl_ctx as &dyn ServerCommandContextTrait)
         .with_dice_ctx(|sctx, txn| async move {
             let t1 = Instant::now();
@@ -532,6 +614,7 @@ async fn run_eval(
                                     id,
                                     number,
                                     input,
+                                    kind,
                                     txn: job_txn,
                                     // A fresh observer for every job (INV-6).
                                     liveness,
