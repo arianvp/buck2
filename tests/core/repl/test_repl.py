@@ -381,6 +381,7 @@ async def test_repl_json_output(buck: Buck) -> None:
     assert (buck.cwd / path).read_text() == "hello\n"
     # `:run` is not run: its command line is given.
     assert records[4]["run"]["argv"] == ["echo", "hello from greet", "a"]
+    assert records[4]["stdout"] == "echo 'hello from greet' a\n"
     assert records[5]["notices"] == [
         {"level": "info", "text": "loaded //pkg:helpers.bxl: double, main"}
     ]

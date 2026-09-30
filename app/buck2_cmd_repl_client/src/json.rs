@@ -25,7 +25,8 @@
 //! `n` is the input's number (the `N` of `<repl:N>` in errors), `null` for an input the client
 //! handles alone (`:help`, `:hist`, ...). `type`, `text` (and `truncated`, `json`) are there when
 //! the input has a value; `json` when the value has a JSON form of at most 1 MiB. `run` is the
-//! command line of `:run` (which is not run). `error` (`kind`, `message`) is there when `ok` is
+//! command line of `:run`, which is not run (as with `--print`, `stdout` has the command line,
+//! quoted for a shell). `error` (`kind`, `message`) is there when `ok` is
 //! false. `notices` lists what the daemon said about the input (`loaded ...`). `wait_ms`,
 //! `eval_ms` and `sources_changed` are there when the daemon answered the input.
 

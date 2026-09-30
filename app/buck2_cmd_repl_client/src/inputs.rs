@@ -645,8 +645,11 @@ impl Inputs {
             self.style()
         };
         if let Some(record) = self.record() {
-            // Recorded; the program of `:run` is not run.
             record.done(done);
+            // The program of `:run` is not run: its command line is printed, as with `--print`.
+            if let Some(repl_done::Outcome::Run(run)) = &done.outcome {
+                self.print(&render::command_line(run));
+            }
             if show_timing {
                 self.note(&render::timing(total, done));
             }

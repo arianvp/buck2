@@ -41,18 +41,18 @@ relative in the session is relative to it (see
 
 Useful flags (`buck2 help repl` lists them all):
 
-| Flag                                                   | Meaning                                                                                                    |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| `FILES...`                                             | Load or evaluate these files first (see [Preloading files](#preloading-files))                             |
-| `-e INPUT`                                             | Evaluate `INPUT` and exit (repeatable)                                                                     |
-| `-i`                                                   | After the files and `-e` inputs, go on with the prompt (or stdin)                                          |
-| `--json`                                               | One JSON object per input on stdout (non-interactive only)                                                 |
-| `--continue-on-error`                                  | Non-interactive: keep going after a failing input                                                          |
-| `--target-platforms`, `-m`                             | The target platform and modifiers that configure targets (can be changed later with `:set`)                |
-| `--prefer-local`, `--keep-going`, `--fail-fast`, ...   | Build options, for every build of the session (`:build`, `:run`, `:bxl`, `ctx.output.ensure`)             |
-| `--max-heap-mb MIB`                                    | The most memory the session's values may use (default 4096)                                                |
-| `--no-history`                                         | Do not read or write the history file                                                                      |
-| `--console`, `--ui`                                    | How the progress of an input is shown (see [Progress](#progress-while-an-input-runs))                     |
+| Flag                                                 | Meaning                                                                                       |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `FILES...`                                           | Load or evaluate these files first (see [Preloading files](#preloading-files))                |
+| `-e INPUT`                                           | Evaluate `INPUT` and exit (repeatable)                                                        |
+| `-i`                                                 | After the files and `-e` inputs, go on with the prompt (or stdin)                             |
+| `--json`                                             | One JSON object per input on stdout (non-interactive only)                                    |
+| `--continue-on-error`                                | Non-interactive: keep going after a failing input                                             |
+| `--target-platforms`, `-m`                           | The target platform and modifiers that configure targets (can be changed later with `:set`)   |
+| `--prefer-local`, `--keep-going`, `--fail-fast`, ... | Build options, for every build of the session (`:build`, `:run`, `:bxl`, `ctx.output.ensure`) |
+| `--max-heap-mb MIB`                                  | The most memory the session's values may use (default 4096)                                   |
+| `--no-history`                                       | Do not read or write the history file                                                         |
+| `--console`, `--ui`                                  | How the progress of an input is shown (see [Progress](#progress-while-an-input-runs))         |
 
 Build options, `-c`/`--config` and the other buck2 flags are fixed when the
 session starts; start a new session to change them.
@@ -134,33 +134,33 @@ indented: the common indentation is removed.
 A line that starts with `:` is a command. A command can be shortened to any unique
 prefix (`:prov` for `:providers`), and most have aliases.
 
-| Command                                     | Alias               | What it does                                                                         |
-| ------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------ |
-| `:help [command\|keys\|patterns]`           | `:h`, `:?`          | The commands, or help on one command or topic                                        |
-| `:quit`                                     | `:q`                | End the session (as Ctrl-D)                                                          |
-| `:time <input>`                             |                     | Run an input, then print how long it took (total, waiting for the daemon, evaluating) |
-| `:type <expr>`                              | `:t`                | The type of an expression                                                            |
-| `:print <expr>`                             | `:p`                | The whole value of an expression (not cut); binds `_`                                |
-| `:json <expr>`                              | `:j`                | An expression as pretty JSON; binds `_`                                              |
-| `:doc <expr>`                               | `:d`                | The documentation of a value (a function, a type, `ctx.cquery`) or of its type      |
-| `:load <label> [symbol...]`                 | `:l`                | Load symbols of a `.bzl` or `.bxl` file (every public one if none are named)        |
-| `:reload`                                   | `:r`                | Load the modules loaded so far again, picking up changes                             |
-| `:reset`                                    |                     | Start over: drop every binding and loaded module                                    |
-| `:uquery <query>`                           | `:uq`               | Run an unconfigured query; binds `_`                                                 |
-| `:cquery <query>`                           | `:cq`               | Run a configured query; binds `_`                                                    |
-| `:aquery <query>`                           | `:aq`               | Run an action query; binds `_`                                                       |
-| `:providers <target>`                       | `:pv`               | Analyze a target and show its providers; binds `_`                                   |
-| `:build <pattern>...`                       | `:b`                | Build targets and print their outputs; binds `_`                                     |
-| `:run [--print] <target> [-- args...]`      |                     | Build a target and run it                                                            |
-| `:bxl <file.bxl:function> [-- args...]`     |                     | Run a BXL function, with actions and outputs                                         |
-| `:info <target>`                            | `:i`                | A target's rule type, build file, attributes and deps                                |
-| `:ls [package]`                             |                     | The targets of a package, with their rule types                                      |
-| `:set [key [value...]]`                     |                     | Show or change the session's settings                                                |
-| `:who [glob...]`                            | `:vars`             | The session's bindings, with their types and values                                  |
-| `:hist [n]`                                 | `:history`          | The inputs of the session, numbered like `<repl:N>`                                  |
-| `:!<command>`                               | `:shell`            | Run a shell command in the current directory                                         |
-| `:edit [path\|target]`                      | `:e`                | Edit a file, a target's build file, or a scratch buffer to run                      |
-| `:qdoc [function\|language]`                |                     | The documentation of the query functions                                             |
+| Command                                 | Alias      | What it does                                                                          |
+| --------------------------------------- | ---------- | ------------------------------------------------------------------------------------- |
+| `:help [command\|keys\|patterns]`       | `:h`, `:?` | The commands, or help on one command or topic                                         |
+| `:quit`                                 | `:q`       | End the session (as Ctrl-D)                                                           |
+| `:time <input>`                         |            | Run an input, then print how long it took (total, waiting for the daemon, evaluating) |
+| `:type <expr>`                          | `:t`       | The type of an expression                                                             |
+| `:print <expr>`                         | `:p`       | The whole value of an expression (not cut); binds `_`                                 |
+| `:json <expr>`                          | `:j`       | An expression as pretty JSON; binds `_`                                               |
+| `:doc <expr>`                           | `:d`       | The documentation of a value (a function, a type, `ctx.cquery`) or of its type        |
+| `:load <label> [symbol...]`             | `:l`       | Load symbols of a `.bzl` or `.bxl` file (every public one if none are named)          |
+| `:reload`                               | `:r`       | Load the modules loaded so far again, picking up changes                              |
+| `:reset`                                |            | Start over: drop every binding and loaded module                                      |
+| `:uquery <query>`                       | `:uq`      | Run an unconfigured query; binds `_`                                                  |
+| `:cquery <query>`                       | `:cq`      | Run a configured query; binds `_`                                                     |
+| `:aquery <query>`                       | `:aq`      | Run an action query; binds `_`                                                        |
+| `:providers <target>`                   | `:pv`      | Analyze a target and show its providers; binds `_`                                    |
+| `:build <pattern>...`                   | `:b`       | Build targets and print their outputs; binds `_`                                      |
+| `:run [--print] <target> [-- args...]`  |            | Build a target and run it                                                             |
+| `:bxl <file.bxl:function> [-- args...]` |            | Run a BXL function, with actions and outputs                                          |
+| `:info <target>`                        | `:i`       | A target's rule type, build file, attributes and deps                                 |
+| `:ls [package]`                         |            | The targets of a package, with their rule types                                       |
+| `:set [key [value...]]`                 |            | Show or change the session's settings                                                 |
+| `:who [glob...]`                        | `:vars`    | The session's bindings, with their types and values                                   |
+| `:hist [n]`                             | `:history` | The inputs of the session, numbered like `<repl:N>`                                   |
+| `:!<command>`                           | `:shell`   | Run a shell command in the current directory                                          |
+| `:edit [path\|target]`                  | `:e`       | Edit a file, a target's build file, or a scratch buffer to run                        |
+| `:qdoc [function\|language]`            |            | The documentation of the query functions                                              |
 
 `:help <command>` explains each one in detail.
 
@@ -263,13 +263,13 @@ next `:bxl`. A good way to develop a BXL script is to try its pieces at the prom
 `:set` lists the settings, `:set <key>` shows one, and `:set <key> <value>`
 changes it for the rest of the session:
 
-| Setting                                  | Meaning                                                                                                            |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `target_platforms <target>\|""`          | The target platform that configures targets (`ctx`, queries, `:build`, `:run`, `:bxl`), as `--target-platforms`    |
-| `modifiers <modifier>...\|""`            | The configuration modifiers of every target, as `-m`                                                               |
-| `color auto\|on\|off`                    | Colour errors, notes and the input as it is typed (auto: interactively, on a terminal, unless `NO_COLOR` is set)  |
-| `timing auto\|on\|off`                   | Show how long inputs take (auto: those that take a second or more; on: every input, as `:time`)                   |
-| `completion_timeout_ms <ms>\|auto`       | How long Tab waits for the daemon (auto: 500 ms for names, 1000 ms for targets and modules)                        |
+| Setting                            | Meaning                                                                                                          |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `target_platforms <target>\|""`    | The target platform that configures targets (`ctx`, queries, `:build`, `:run`, `:bxl`), as `--target-platforms`  |
+| `modifiers <modifier>...\|""`      | The configuration modifiers of every target, as `-m`                                                             |
+| `color auto\|on\|off`              | Colour errors, notes and the input as it is typed (auto: interactively, on a terminal, unless `NO_COLOR` is set) |
+| `timing auto\|on\|off`             | Show how long inputs take (auto: those that take a second or more; on: every input, as `:time`)                  |
+| `completion_timeout_ms <ms>\|auto` | How long Tab waits for the daemon (auto: 500 ms for names, 1000 ms for targets and modules)                      |
 
 `:set target_platforms //platforms:linux_arm` checks that the target is a platform.
 
@@ -291,15 +291,15 @@ changes it for the rest of the session:
 Target patterns, queries and file names are relative to the session's directory,
 as on the buck2 command line (in `buck2 bxl` they are relative to the cell root):
 
-| Pattern          | Means                                                         |
-| ---------------- | ------------------------------------------------------------- |
-| `:lib`           | the target `lib` in the package of the session's directory    |
-| `sub:lib`        | the target `lib` in the package `sub` below it                |
-| `//pkg:lib`      | the target `lib` in the package `pkg` of the current cell     |
-| `cell//pkg:lib`  | a target in another cell                                      |
-| `//pkg:`         | every target in the package `pkg`                             |
-| `//pkg/...`      | every target in `pkg` and the packages below it               |
-| `...`            | every target at or below the session's directory              |
+| Pattern         | Means                                                      |
+| --------------- | ---------------------------------------------------------- |
+| `:lib`          | the target `lib` in the package of the session's directory |
+| `sub:lib`       | the target `lib` in the package `sub` below it             |
+| `//pkg:lib`     | the target `lib` in the package `pkg` of the current cell  |
+| `cell//pkg:lib` | a target in another cell                                   |
+| `//pkg:`        | every target in the package `pkg`                          |
+| `//pkg/...`     | every target in `pkg` and the packages below it            |
+| `...`           | every target at or below the session's directory           |
 
 This holds for the commands and for everything `ctx` resolves
 (`ctx.configured_targets(":lib")`, `ctx.cquery().eval("deps(:lib)")`,
@@ -333,22 +333,23 @@ case, then those that contain its letters in order (`ctx.cfgt` →
 While the cursor is in the parentheses of a call of a function that Tab offered,
 its signature is shown under the input, with the parameter being typed in bold.
 
-Completion never runs code, and gives up quickly (see `completion_timeout_ms`)
-when the daemon is busy with another command.
+Completion does not evaluate the input (though it loads a module to list its
+symbols or BXL functions, as `load()` would), and gives up quickly (see
+`completion_timeout_ms`) when the daemon is busy with another command.
 
 ## Key bindings
 
-| Key                      | At the prompt                                                               | While an input runs                            |
-| ------------------------ | --------------------------------------------------------------------------- | ---------------------------------------------- |
-| Enter                    | Submit the input if it is complete, otherwise start a new line              |                                                |
-| Alt-Enter, Esc Enter     | Start a new line                                                            |                                                |
-| Tab                      | Indent (at the start of a line), otherwise complete                         |                                                |
-| Ctrl-C                   | Clear the input                                                             | Interrupt it; a third press ends the session   |
-| Ctrl-D                   | End the session (on an empty line)                                          |                                                |
-| Up, Down                 | Previous and next input in the history                                      |                                                |
-| Ctrl-R                   | Search the history                                                          |                                                |
-| Right, End               | Accept the suggestion from the history (shown dimmed)                       |                                                |
-| Ctrl-L                   | Clear the screen                                                            |                                                |
+| Key                  | At the prompt                                                  | While an input runs                          |
+| -------------------- | -------------------------------------------------------------- | -------------------------------------------- |
+| Enter                | Submit the input if it is complete, otherwise start a new line |                                              |
+| Alt-Enter, Esc Enter | Start a new line                                               |                                              |
+| Tab                  | Indent (at the start of a line), otherwise complete            |                                              |
+| Ctrl-C               | Clear the input                                                | Interrupt it; a third press ends the session |
+| Ctrl-D               | End the session (on an empty line)                             |                                              |
+| Up, Down             | Previous and next input in the history                         |                                              |
+| Ctrl-R               | Search the history                                             |                                              |
+| Right, End           | Accept the suggestion from the history (shown dimmed)          |                                              |
+| Ctrl-L               | Clear the screen                                               |                                              |
 
 The input is highlighted as it is typed: keywords, strings, numbers, comments,
 the command, and the bracket matching the one at the cursor. `NO_COLOR` or `:set
@@ -367,8 +368,9 @@ clean. `--ui` configures it as for other commands (`--ui dice`, `--ui io`, ...).
 simple`), `--console super` draws it even when stderr is not a terminal. Scripts
 get the simple console.
 
-What the daemon prints while you type (for example that a file changed) is held
-and shown with the next input, so it never garbles the line you are editing.
+With live progress, what the daemon prints while you type (for example that a
+file changed) is held and shown with the next input, so it never garbles the line
+you are editing.
 
 ## Scripting
 
@@ -412,30 +414,30 @@ $ buck2 repl --json -e 'x = 1' -e 'x + 1' -e ':cq deps(//:hello)' -e 'nope'
 {"n":4,"input":"nope","ok":false,"error":{"kind":"eval","message":"error: Variable `nope` not found, ..."},"stdout":"","stderr":"","wait_ms":0,"eval_ms":1,"sources_changed":false}
 ```
 
-| Field                                  | Meaning                                                                                                                                 |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `n`                                    | The input's number (`<repl:N>` in errors), or `null` for an input the client handles alone (`:help`, `:hist`, `:!`, ...)               |
-| `input`                                | The input (for a file of the command line: its code, and `file` is its path)                                                           |
-| `ok`                                   | Whether the input succeeded                                                                                                             |
-| `type`, `text`                         | The value's type and text, when the input has a value (`truncated` is `true` if the text was cut)                                      |
-| `json`                                 | The value as JSON, when it has a JSON form of at most 1 MiB (as `:json` would show it)                                                |
-| `run`                                  | For `:run`: the command (`argv`, `label`), which is not run                                                                             |
-| `error`                                | When `ok` is false: `kind` (`syntax`, `eval`, `buck`, `interrupted`, `usage`, `busy`, `unsupported`, `internal`, `io`, `exit`, `lost`) and `message` |
-| `notices`                              | What the daemon said about the input (`{"level": "info", "text": "loaded ..."}`)                                                       |
-| `stdout`, `stderr`                     | What the input wrote (`print()`, `ctx.output`, `:print`, `:help`, a `:!` command, ...); `stdout_truncated`/`stderr_truncated` past 64 MiB |
-| `wait_ms`, `eval_ms`, `sources_changed` | How long the daemon waited and evaluated, and whether sources changed since the previous input, when the daemon answered            |
+| Field                                   | Meaning                                                                                                                                              |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `n`                                     | The input's number (`<repl:N>` in errors), or `null` for an input the client handles alone (`:help`, `:hist`, `:!`, ...)                             |
+| `input`                                 | The input (for a file of the command line: its code, and `file` is its path)                                                                         |
+| `ok`                                    | Whether the input succeeded                                                                                                                          |
+| `type`, `text`                          | The value's type and text, when the input has a value (`truncated` is `true` if the text was cut)                                                    |
+| `json`                                  | The value as JSON, when it has a JSON form of at most 1 MiB (as `:json` would show it)                                                               |
+| `run`                                   | For `:run`: the command (`argv`, `label`), which is not run (`stdout` has it, as `:run --print` prints it)                                           |
+| `error`                                 | When `ok` is false: `kind` (`syntax`, `eval`, `buck`, `interrupted`, `usage`, `busy`, `unsupported`, `internal`, `io`, `exit`, `lost`) and `message` |
+| `notices`                               | What the daemon said about the input (`{"level": "info", "text": "loaded ..."}`)                                                                     |
+| `stdout`, `stderr`                      | What the input wrote (`print()`, `ctx.output`, `:print`, `:help`, a `:!` command, ...); `stdout_truncated`/`stderr_truncated` past 64 MiB            |
+| `wait_ms`, `eval_ms`, `sources_changed` | How long the daemon waited and evaluated, and whether sources changed since the previous input, when the daemon answered                             |
 
 `--json` requires non-interactive inputs.
 
 ### Exit codes
 
-| Situation                                         | Exit code                                        |
-| ------------------------------------------------- | ------------------------------------------------ |
-| An interactive session ends (Ctrl-D, `:quit`)     | 0, whatever its inputs did                       |
-| Non-interactive, every input succeeded            | 0                                                |
-| Non-interactive, an input failed                  | 3 (also with `--continue-on-error`)              |
-| An input was interrupted (Ctrl-C, SIGINT)         | 141, as other buck2 commands                     |
-| The daemon could not be reached, was killed, ...  | buck2's usual [exit codes](../commands_extra/exit_codes.md) |
+| Situation                                                                          | Exit code                                                   |
+| ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| An interactive session ends (Ctrl-D, `:quit`)                                      | 0, whatever its inputs did                                  |
+| Non-interactive, every input succeeded                                             | 0                                                           |
+| Non-interactive, an input failed                                                   | 3 (also with `--continue-on-error`)                         |
+| An input of a script was interrupted (SIGINT), or a third Ctrl-C ended the session | 141, as other buck2 commands                                |
+| The daemon could not be reached, was killed, ...                                   | buck2's usual [exit codes](../commands_extra/exit_codes.md) |
 
 ### Completion from a script
 

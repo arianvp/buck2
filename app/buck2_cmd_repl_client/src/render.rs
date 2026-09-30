@@ -117,10 +117,7 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
         }
         Some(repl_done::Outcome::Run(run)) => {
             if run.print_only {
-                // `:run --print`: the command line, quoted for a POSIX shell.
-                let argv = run.argv.iter().map(String::as_str);
-                let command = shlex::try_join(argv).unwrap_or_else(|_| run.argv.join(" "));
-                buck2_client_ctx::println!("{}", command)?;
+                buck2_client_ctx::println!("{}", command_line(run))?;
                 Rendered::Ok
             } else {
                 Rendered::Run(run.clone())
@@ -131,6 +128,12 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
         print_duration(done, style)?;
     }
     Ok(rendered)
+}
+
+/// What `:run --print` prints: the command line, quoted for a POSIX shell.
+pub(crate) fn command_line(run: &ReplRun) -> String {
+    let argv = run.argv.iter().map(String::as_str);
+    shlex::try_join(argv).unwrap_or_else(|_| run.argv.join(" "))
 }
 
 /// How an input went, from its result, when nothing is printed (`--json`). A `:run` is not run.
