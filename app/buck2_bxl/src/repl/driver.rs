@@ -17,6 +17,7 @@
 //! thread end it.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -285,7 +286,7 @@ impl<'a> Driver<'a> {
                         request.id,
                         error_done(
                             repl_error::Kind::Busy,
-                            "error: busy: another request of this session is running",
+                            &"busy: another request of this session is running",
                         ),
                     ),
                 },
@@ -334,7 +335,7 @@ impl<'a> Driver<'a> {
                 self.client_open = false;
                 error_done(
                     repl_error::Kind::Internal,
-                    "error: the repl session thread exited; the session is over",
+                    &"the repl session thread exited; the session is over",
                 )
             }
             Ok(Outcome::Interrupted { t0, t1 }) => ReplDone {
@@ -394,7 +395,7 @@ fn classify(request: ReplRequest) -> Work {
             id,
             message: repl_message::Message::Done(error_done(
                 repl_error::Kind::Internal,
-                "error: malformed repl request (no request)",
+                &"malformed repl request (no request)",
             )),
         };
     };
@@ -403,7 +404,7 @@ fn classify(request: ReplRequest) -> Work {
             id,
             message: repl_message::Message::Done(error_done(
                 repl_error::Kind::Usage,
-                "error: the repl session is already open",
+                &"the repl session is already open",
             )),
         },
         repl_request::Request::Eval(eval) => match parse_command(&eval.input) {
@@ -413,33 +414,26 @@ fn classify(request: ReplRequest) -> Work {
                 input: eval.input,
             }),
             Ok(Some(command)) => {
-                let (kind, message) = match command.spec.handler {
-                    Handler::Client => (
+                let name = command.spec.display_name();
+                let done = match command.spec.handler {
+                    Handler::Client => error_done(
                         repl_error::Kind::Usage,
-                        format!(
-                            "error: `{}` is handled by the client",
-                            command.spec.display_name()
-                        ),
+                        &format_args!("`{name}` is handled by the client"),
                     ),
-                    Handler::Server | Handler::Both => (
+                    Handler::Server | Handler::Both => error_done(
                         repl_error::Kind::Unsupported,
-                        format!(
-                            "error: `{}` is not implemented yet",
-                            command.spec.display_name()
-                        ),
+                        &format_args!("`{name}` is not implemented yet"),
                     ),
                 };
                 Work::Reply {
                     id,
-                    message: repl_message::Message::Done(error_done(kind, &message)),
+                    message: repl_message::Message::Done(done),
                 }
             }
+            // The message quotes the token, which may be of any length.
             Err(e) => Work::Reply {
                 id,
-                message: repl_message::Message::Done(error_done(
-                    repl_error::Kind::Usage,
-                    &format!("error: {e}"),
-                )),
+                message: repl_message::Message::Done(error_done(repl_error::Kind::Usage, &e)),
             },
         },
         // Completion comes later: no candidates.
@@ -566,12 +560,12 @@ async fn run_eval(
         .await
 }
 
-fn error_done(kind: repl_error::Kind, message: &str) -> ReplDone {
+/// A `Done` with an error, whose message is capped like every other (INV-13).
+fn error_done(kind: repl_error::Kind, message: &dyn fmt::Display) -> ReplDone {
     ReplDone {
-        outcome: Some(repl_done::Outcome::Error(ReplError {
-            kind: kind as i32,
-            message: message.to_owned(),
-        })),
+        outcome: Some(repl_done::Outcome::Error(failure_proto(ReplFailure::new(
+            kind, message,
+        )))),
         ..ReplDone::default()
     }
 }

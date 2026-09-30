@@ -104,7 +104,7 @@ impl Session {
         // Per job, on this thread: events of the evaluation go to the request's dispatcher.
         maybe_proxy_current_span(work.span, || {
             with_dispatcher(dispatcher.dupe(), || {
-                let print = ReplPrintHandler::new(self.emitter.dupe(), work.id);
+                let print = ReplPrintHandler::new(&self.rt, self.emitter.dupe(), work.id);
                 let result = self.eval_inner(env, work, &print, dispatcher);
                 // On every path, success, error or interrupt (INV-7).
                 print.flush();

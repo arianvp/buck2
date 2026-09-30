@@ -30,6 +30,7 @@ use buck2_repl_syntax::commands::parse_command;
 use crate::render;
 use crate::render::Rendered;
 use crate::session::OPEN_ID;
+use crate::session::ShutdownHangup;
 use crate::session::UiEvent;
 
 pub(crate) enum ScriptInputs {
@@ -50,9 +51,18 @@ pub(crate) struct ScriptOutcome {
     lost: bool,
     /// Output could not be written (e.g. stdout is a closed pipe), which stopped the script.
     output_error: Option<buck2_error::Error>,
+    /// An input failed or was interrupted after the daemon said that it was shutting down
+    /// (which cancels the input in flight).
+    after_shutdown: bool,
 }
 
 impl ScriptOutcome {
+    /// The script stopped because the daemon shut down, which explains the outcome better
+    /// than its own exit code.
+    pub(crate) fn ended_by_shutdown(&self) -> bool {
+        self.output_error.is_none() && (self.after_shutdown || self.lost)
+    }
+
     pub(crate) fn exit_result(self) -> ExitResult {
         if let Some(e) = self.output_error {
             // A closed pipe exits like other commands do (quietly, with its own exit code).
@@ -85,6 +95,7 @@ pub(crate) struct ScriptMode {
     pub(crate) ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     pub(crate) next_id: Arc<AtomicU64>,
     pub(crate) outcome_tx: tokio::sync::oneshot::Sender<ScriptOutcome>,
+    pub(crate) shutdown: ShutdownHangup,
 }
 
 impl ScriptMode {
@@ -97,12 +108,14 @@ impl ScriptMode {
             ui_rx,
             next_id,
             outcome_tx,
+            shutdown,
         } = self;
         let mut session = Session {
             continue_on_error,
             req_tx,
             ui_rx,
             next_id,
+            shutdown,
             number: 0,
             outcome: ScriptOutcome::default(),
         };
@@ -122,6 +135,7 @@ struct Session {
     req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     next_id: Arc<AtomicU64>,
+    shutdown: ShutdownHangup,
     /// Number of inputs sent so far; the daemon names input N `<repl:N>`.
     number: u32,
     outcome: ScriptOutcome,
@@ -234,6 +248,11 @@ impl Session {
                 return Next::Stop;
             }
         };
+        if !matches!(rendered, Rendered::Ok) && self.shutdown.is_shutting_down() {
+            // The daemon cancels the input in flight when it shuts down.
+            self.outcome.after_shutdown = true;
+            return Next::Stop;
+        }
         match rendered {
             Rendered::Ok => Next::Continue,
             Rendered::Failed => self.failed(),

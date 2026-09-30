@@ -108,6 +108,11 @@ impl ShutdownHangup {
         self.state().reason.clone()
     }
 
+    /// The daemon has said that it is shutting down.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.state().reason.is_some()
+    }
+
     pub(crate) fn subscriber(&self) -> Box<dyn EventSubscriber> {
         Box::new(ShutdownSubscriber(self.dupe()))
     }
@@ -238,6 +243,7 @@ pub(crate) async fn run(
         ui_rx,
         next_id,
         outcome_tx,
+        shutdown: shutdown.dupe(),
     };
     let thread = match thread_spawn("repl-editor", move || script.run()) {
         Ok(thread) => thread,
@@ -270,15 +276,22 @@ pub(crate) async fn run(
         Err(e) => ExitResult::err(e),
         Ok(CommandOutcome::Failure(exit)) => exit,
         Ok(CommandOutcome::Success(_)) => match (outcome, shutdown.reason()) {
+            (Some(outcome), Some(reason)) if outcome.ended_by_shutdown() => {
+                daemon_shutdown_error(&reason)
+            }
             (Some(outcome), _) => outcome.exit_result(),
-            (None, Some(reason)) => ExitResult::err(buck2_error::buck2_error!(
-                buck2_error::ErrorTag::InterruptedByDaemonShutdown,
-                "the buck2 daemon was shut down, which ended the repl session: {reason}"
-            )),
+            (None, Some(reason)) => daemon_shutdown_error(&reason),
             (None, None) => ExitResult::err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Tier0,
                 "the daemon ended the repl session before all inputs were evaluated"
             )),
         },
     }
+}
+
+fn daemon_shutdown_error(reason: &str) -> ExitResult {
+    ExitResult::err(buck2_error::buck2_error!(
+        buck2_error::ErrorTag::InterruptedByDaemonShutdown,
+        "the buck2 daemon was shut down, which ended the repl session: {reason}"
+    ))
 }

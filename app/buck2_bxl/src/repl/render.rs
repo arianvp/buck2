@@ -13,9 +13,13 @@
 //! Nothing here can panic or run unbounded on user values (INV-9): values are formatted with
 //! `fmt::write` into a capped writer that stops the formatting at the cap or when the native
 //! stack runs low, and values nested too deeply for the (recursive) formatter are detected
-//! beforehand without recursion.
+//! beforehand without recursion, in time bounded by the cap.
+//!
+//! One cost is not bounded here: the `Display` of a string builds its whole `repr` before
+//! writing it. A top-level string is cut to the cap first; a huge string inside a container
+//! still costs a few times its size, as it does anywhere in Starlark.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Write;
 
@@ -25,10 +29,10 @@ use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::truncate_to_bytes;
 use starlark::values::Value;
-use starlark::values::ValueIdentity;
 use starlark::values::dict::DictRef;
 use starlark::values::list::ListRef;
 use starlark::values::record::Record;
+use starlark::values::string::StarlarkStr;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
 
@@ -135,6 +139,18 @@ pub(crate) fn render_echo(v: Value) -> Option<RenderedValue> {
             truncated: false,
         });
     }
+    if let Some(s) = v.unpack_str()
+        && s.len() > MAX_TEXT_BYTES
+    {
+        // Only the start of it can be shown, and its `Display` would build all of its `repr`.
+        let shown = StarlarkStr::repr(truncate_to_bytes(s, MAX_TEXT_BYTES));
+        let shown = shown.strip_suffix('"').unwrap_or(&shown);
+        return Some(RenderedValue {
+            type_name,
+            text: truncate_to_bytes(shown, MAX_TEXT_BYTES).to_owned(),
+            truncated: true,
+        });
+    }
     if nesting_exceeds(v, MAX_DISPLAY_DEPTH) {
         return Some(RenderedValue {
             type_name,
@@ -224,175 +240,112 @@ impl Write for RenderWriter {
     }
 }
 
-/// The containers directly inside `v` (the values its formatting recurses into), or `None` if
-/// `v` is not a container.
-fn children<'v>(v: Value<'v>) -> Option<Vec<Value<'v>>> {
-    fn keep<'v>(it: impl Iterator<Item = Value<'v>>) -> Vec<Value<'v>> {
-        it.filter(|c| is_container(*c)).collect()
+/// Most values the depth check visits. The formatter writes at least one byte before every value
+/// it visits below the top one (an opening bracket, a separator or a key), and it stops at
+/// [`MAX_TEXT_BYTES`], so it never gets further than this.
+const MAX_VISITS: usize = MAX_TEXT_BYTES + 1;
+
+/// The children of a container are fetched this many at a time, so that the check holds at most
+/// one chunk per container on its path, however large the containers are.
+const CHILDREN_CHUNK: usize = 1024;
+
+/// Up to `max` of the values that formatting `v` recurses into, from the `from`th on, in the
+/// order the formatter visits them; `None` if `v` is not a container.
+fn children<'v>(v: Value<'v>, from: usize, max: usize) -> Option<Vec<Value<'v>>> {
+    fn chunk<'v>(it: impl Iterator<Item = Value<'v>>, from: usize, max: usize) -> Vec<Value<'v>> {
+        it.skip(from).take(max).collect()
     }
     if let Some(list) = ListRef::from_value(v) {
-        Some(keep(list.iter()))
+        Some(chunk(list.iter(), from, max))
     } else if let Some(tuple) = TupleRef::from_value(v) {
-        Some(keep(tuple.iter()))
+        Some(chunk(tuple.iter(), from, max))
     } else if let Some(dict) = DictRef::from_value(v) {
-        Some(keep(dict.iter().flat_map(|(k, v)| [k, v])))
+        Some(chunk(dict.iter().flat_map(|(k, v)| [k, v]), from, max))
     } else if let Some(s) = StructRef::from_value(v) {
-        Some(keep(s.iter().map(|(_, v)| v)))
+        Some(chunk(s.iter().map(|(_, v)| v), from, max))
     } else {
-        Record::from_value(v).map(|r| keep(r.iter().map(|(_, v)| v)))
+        Record::from_value(v).map(|r| chunk(r.iter().map(|(_, v)| v), from, max))
     }
 }
 
-fn is_container(v: Value) -> bool {
-    ListRef::from_value(v).is_some()
-        || TupleRef::from_value(v).is_some()
-        || DictRef::from_value(v).is_some()
-        || StructRef::from_value(v).is_some()
-        || Record::from_value(v).is_some()
+/// A container on the path of the depth check.
+struct Frame<'v> {
+    value: Value<'v>,
+    /// Children fetched and not visited yet, the next one last.
+    pending: Vec<Value<'v>>,
+    /// How many children have been fetched.
+    fetched: usize,
+    /// Every child has been fetched.
+    complete: bool,
 }
 
-/// Whether formatting `root` may recurse more than `limit` containers deep, checked without
-/// recursion, in time linear in the size of the value.
+impl<'v> Frame<'v> {
+    fn new(value: Value<'v>, first: Vec<Value<'v>>) -> Self {
+        let mut frame = Frame {
+            value,
+            pending: Vec::new(),
+            fetched: 0,
+            complete: false,
+        };
+        frame.add(first);
+        frame
+    }
+
+    fn add(&mut self, mut chunk: Vec<Value<'v>>) {
+        self.complete = chunk.len() < CHILDREN_CHUNK;
+        self.fetched = self.fetched.saturating_add(chunk.len());
+        chunk.reverse();
+        self.pending = chunk;
+    }
+
+    fn next_child(&mut self) -> Option<Value<'v>> {
+        if self.pending.is_empty() && !self.complete {
+            let chunk = children(self.value, self.fetched, CHILDREN_CHUNK).unwrap_or_default();
+            self.add(chunk);
+        }
+        self.pending.pop()
+    }
+}
+
+/// Whether formatting `root` recurses more than `limit` containers deep, checked without
+/// recursion.
 ///
-/// The formatter follows simple paths (it cuts a cycle at a value it is already inside). The
-/// longest simple path is bounded by the longest path through the strongly connected components
-/// of the containers, each counting as its size: exact for acyclic values (so no false positives
-/// on them), an over-estimate only for cyclic ones.
+/// Walks the value the way the formatter does: depth first, children in order, and a value that
+/// is already on the path is not entered again (the formatter shows it as `[...]`). The walk
+/// stops where the formatter would have stopped at its size cap ([`MAX_VISITS`]), so it costs
+/// time and memory bounded by the size of the rendering, not by the size of the value (INV-9):
+/// the part of a value past the cap is never formatted, so its depth does not matter.
+///
+/// Values the walk does not look into (sets, providers, ...) are left to the stack check of
+/// [`RenderWriter`].
 fn nesting_exceeds(root: Value, limit: usize) -> bool {
-    struct Node<'v> {
-        index: usize,
-        lowlink: usize,
-        on_stack: bool,
-        /// Set once its component is complete.
-        component: Option<usize>,
-        children: Vec<ValueIdentity<'v>>,
-    }
-    struct Frame<'v> {
-        id: ValueIdentity<'v>,
-        children: Vec<Value<'v>>,
-        next: usize,
-    }
-    struct Search<'v> {
-        nodes: HashMap<ValueIdentity<'v>, Node<'v>>,
-        /// Tarjan's stack.
-        stack: Vec<ValueIdentity<'v>>,
-        /// The depth-first path: a simple path, which the formatter also follows.
-        frames: Vec<Frame<'v>>,
-        /// For each complete component: the longest path from it, counting components by size.
-        bounds: Vec<usize>,
-    }
-    impl<'v> Search<'v> {
-        fn enter(&mut self, v: Value<'v>, children: Vec<Value<'v>>) {
-            let id = v.identity();
-            let index = self.nodes.len();
-            self.nodes.insert(
-                id,
-                Node {
-                    index,
-                    lowlink: index,
-                    on_stack: true,
-                    component: None,
-                    children: children.iter().map(|c| c.identity()).collect(),
-                },
-            );
-            self.stack.push(id);
-            self.frames.push(Frame {
-                id,
-                children,
-                next: 0,
-            });
-        }
-
-        fn lower(&mut self, id: ValueIdentity<'v>, to: usize) {
-            if let Some(node) = self.nodes.get_mut(&id) {
-                node.lowlink = node.lowlink.min(to);
-            }
-        }
-
-        /// Completes the component rooted at `root`; returns its bound.
-        fn complete(&mut self, root: ValueIdentity<'v>) -> usize {
-            let component = self.bounds.len();
-            let mut members = Vec::new();
-            while let Some(member) = self.stack.pop() {
-                if let Some(node) = self.nodes.get_mut(&member) {
-                    node.on_stack = false;
-                    node.component = Some(component);
-                }
-                members.push(member);
-                if member == root {
-                    break;
-                }
-            }
-            // Components complete in reverse topological order: every other component reached
-            // from this one is complete.
-            let mut reach = 0;
-            for member in &members {
-                let Some(node) = self.nodes.get(member) else {
-                    continue;
-                };
-                for child in &node.children {
-                    if let Some(c) = self.nodes.get(child).and_then(|n| n.component) {
-                        if c != component {
-                            reach = reach.max(self.bounds.get(c).copied().unwrap_or(0));
-                        }
-                    }
-                }
-            }
-            let bound = members.len().saturating_add(reach);
-            self.bounds.push(bound);
-            bound
-        }
-    }
-
-    let Some(root_children) = children(root) else {
+    let Some(first) = children(root, 0, CHILDREN_CHUNK) else {
         return false;
     };
-    // Tarjan's algorithm, iteratively.
-    let mut search = Search {
-        nodes: HashMap::new(),
-        stack: Vec::new(),
-        frames: Vec::new(),
-        bounds: Vec::new(),
-    };
-    search.enter(root, root_children);
-    loop {
-        if search.frames.len() > limit {
+    let mut on_path = HashSet::from([root.identity()]);
+    let mut path = vec![Frame::new(root, first)];
+    let mut visits = 0usize;
+    while let Some(frame) = path.last_mut() {
+        let Some(child) = frame.next_child() else {
+            on_path.remove(&frame.value.identity());
+            path.pop();
+            continue;
+        };
+        visits += 1;
+        if visits > MAX_VISITS {
+            return false;
+        }
+        if on_path.contains(&child.identity()) {
+            continue;
+        }
+        let Some(grandchildren) = children(child, 0, CHILDREN_CHUNK) else {
+            continue;
+        };
+        if path.len() >= limit {
             return true;
         }
-        let Some(frame) = search.frames.last_mut() else {
-            return false;
-        };
-        let parent = frame.id;
-        match frame.children.get(frame.next).copied() {
-            Some(child) => {
-                frame.next += 1;
-                match search.nodes.get(&child.identity()) {
-                    None => {
-                        let grandchildren = children(child).unwrap_or_default();
-                        search.enter(child, grandchildren);
-                    }
-                    Some(node) if node.on_stack => {
-                        let index = node.index;
-                        search.lower(parent, index);
-                    }
-                    // In a complete component.
-                    Some(_) => {}
-                }
-            }
-            None => {
-                search.frames.pop();
-                let Some((index, lowlink)) =
-                    search.nodes.get(&parent).map(|n| (n.index, n.lowlink))
-                else {
-                    return true;
-                };
-                if let Some(grandparent) = search.frames.last().map(|f| f.id) {
-                    search.lower(grandparent, lowlink);
-                }
-                if lowlink == index && search.complete(parent) > limit {
-                    return true;
-                }
-            }
-        }
+        on_path.insert(child.identity());
+        path.push(Frame::new(child, grandchildren));
     }
+    false
 }
