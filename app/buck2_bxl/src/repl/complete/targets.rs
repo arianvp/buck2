@@ -176,9 +176,13 @@ pub(crate) async fn complete_targets(
     Ok(candidates)
 }
 
-/// `base` joined with the typed relative path `path` (trailing slashes ignored). `None` if it is
-/// not a forward relative path (`..`, `a//b`, ...).
+/// `base` joined with the typed relative path `path` (a trailing slash ignored). `None` if it
+/// is not a forward relative path (`..`, `a//b`, `/a`, ...).
 fn join(base: &CellPath, path: &str) -> Option<CellPath> {
+    // One trailing slash is fine (`pkg/`), `pkg//` and `/pkg` are not paths.
+    if path.starts_with('/') || path.ends_with("//") {
+        return None;
+    }
     let path = ForwardRelativePath::new_trim_trailing_slashes(path).ok()?;
     Some(base.join(path))
 }
