@@ -73,6 +73,22 @@ impl<'a> ReplCtx<'a> {
             sanitized_argv,
         }
     }
+
+    /// For the completion of a target pattern: it gives up at once rather than wait for
+    /// commands that use another state, and gives way to them if they come later. Its work is
+    /// DICE computations, which are safe to drop.
+    pub(crate) fn completion(inner: &'a dyn ServerCommandContextTrait) -> Self {
+        ReplCtx {
+            inner,
+            preemptible: PreemptibleWhen::OnDifferentState,
+            exit_when: ExitWhen::ExitDifferentState,
+            sanitized_argv: vec![
+                "buck2".to_owned(),
+                "repl".to_owned(),
+                "<completion>".to_owned(),
+            ],
+        }
+    }
 }
 
 #[async_trait]

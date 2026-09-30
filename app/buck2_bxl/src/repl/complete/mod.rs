@@ -8,6 +8,14 @@
  * above-listed licenses.
  */
 
-//! What the session knows about names and types, for `:doc` and completion.
+//! Completion, and what the session knows about names and types (for `:doc` too).
+//!
+//! Names and attributes are completed by the session thread from the session's module, live
+//! values and the documentation of the globals ([`names`]); no code runs. Target patterns are
+//! completed by the driver in a transaction of its own ([`targets`]).
 
+pub(crate) mod candidates;
+pub(crate) mod names;
+pub(crate) mod private;
+pub(crate) mod targets;
 pub(crate) mod types;

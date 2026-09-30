@@ -57,6 +57,7 @@ use dupe::Dupe;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::ReplCommand;
+use crate::complete::Completer;
 use crate::editor::EditorMode;
 use crate::editor::history_path;
 use crate::run::RunEnv;
@@ -411,6 +412,15 @@ pub(crate) async fn run(
     let (compl_tx, compl_rx) = std::sync::mpsc::channel::<(u64, ReplCompletions)>();
     let (outcome_tx, mut outcome_rx) = tokio::sync::oneshot::channel::<InputOutcome>();
     let next_id = Arc::new(AtomicU64::new(OPEN_ID + 1));
+    let completer = match Completer::new(
+        req_tx.clone(),
+        compl_rx,
+        next_id.dupe(),
+        run_env.cwd.clone(),
+    ) {
+        Ok(completer) => Arc::new(completer),
+        Err(e) => return ExitResult::err(e),
+    };
     let ui = SharedUi::new();
     cmd.shutdown.arm(&req_tx, next_id.dupe());
 
@@ -433,6 +443,7 @@ pub(crate) async fn run(
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui: ui.dupe(),
             history,
             outcome_tx,
@@ -452,6 +463,7 @@ pub(crate) async fn run(
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui: ui.dupe(),
             outcome_tx,
             shutdown: shutdown.dupe(),
@@ -484,7 +496,6 @@ pub(crate) async fn run(
     let reading = ui.end_session();
     // Wakes the input thread if it is waiting for a result.
     let _ignored = handler.ui_tx.send(UiEvent::SessionEnded);
-    drop(compl_rx);
 
     let Some(result) = result else {
         // Given up on with Ctrl-C. The editor (which is not reading) exits at once; a script

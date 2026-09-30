@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use buck2_build_api::bxl::result::PendingStreamingOutput;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
+use buck2_cli_proto::ReplComplete;
 use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::ReplDone;
 use buck2_cli_proto::ReplError;
@@ -36,6 +37,7 @@ use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::ReplResponse;
 use buck2_cli_proto::ReplValue;
 use buck2_cli_proto::TargetCfg;
+use buck2_cli_proto::repl_complete;
 use buck2_cli_proto::repl_completions;
 use buck2_cli_proto::repl_done;
 use buck2_cli_proto::repl_error;
@@ -77,6 +79,8 @@ use crate::repl::build::build;
 use crate::repl::cancel::EvalCancel;
 use crate::repl::commands::CommandWork;
 use crate::repl::commands::command_work;
+use crate::repl::complete::candidates::completions_status;
+use crate::repl::complete::targets::complete_targets;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplOutputWriter;
@@ -96,6 +100,10 @@ const DEFAULT_HEAP_LIMIT: u64 = 4 << 30;
 /// Longest excerpt of an input kept to describe its request to other commands.
 const MAX_TITLE_BYTES: usize = 256;
 
+/// Longest a target completion may take. The client stops waiting sooner; the work goes on
+/// meanwhile (unless an input cancels it), so that the next completion is fast.
+const TARGET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A request, classified.
 enum Work {
     /// Start the session: import the prelude, bind `ctx`. Answered with `Ready`.
@@ -108,6 +116,16 @@ enum Work {
     /// `:reset`: a new session, started like the first one.
     Reset {
         id: u64,
+    },
+    /// Completion of a name or an attribute, by the session thread (no DICE).
+    CompleteStarlark {
+        id: u64,
+        req: ReplComplete,
+    },
+    /// Completion of a target pattern, in a transaction of its own.
+    CompleteTargets {
+        id: u64,
+        prefix: String,
     },
     /// Answered at once, without DICE.
     Reply {
@@ -209,6 +227,9 @@ pub(crate) struct Driver<'a> {
     last_equality: Option<DiceEquality>,
     /// Bytes allocated on the session's heap, as of the last job of the session thread.
     heap_bytes: u64,
+    /// An input that arrived while a completion was in flight, which it cancelled: it runs
+    /// next (Enter beats Tab).
+    queued: Option<ReplRequest>,
 }
 
 impl<'a> Driver<'a> {
@@ -226,6 +247,7 @@ impl<'a> Driver<'a> {
             client_open: true,
             last_equality: None,
             heap_bytes: 0,
+            queued: None,
         }
     }
 
@@ -259,15 +281,40 @@ impl<'a> Driver<'a> {
         loop {
             let work = match pending.pop_front() {
                 Some(work) => work,
-                None => match self.next_request().await {
+                None => match self.queued.take() {
                     Some(request) => classify(request),
-                    None => break,
+                    None => match self.next_request().await {
+                        Some(request) => classify(request),
+                        None => break,
+                    },
                 },
             };
             match work {
                 Work::Hangup => break,
                 Work::Interrupt => {}
                 Work::Reply { id, message } => self.emitter.emit(id, message),
+                Work::CompleteStarlark { id, req } => {
+                    // Nothing is in flight: the thread is idle, and answers at once.
+                    let answer = match thread.complete(req).await {
+                        Some(answer) => answer,
+                        None => {
+                            self.client_open = false;
+                            completions_status(
+                                repl_completions::Status::Error,
+                                "the repl session thread exited; the session is over",
+                            )
+                        }
+                    };
+                    self.emitter
+                        .emit(id, repl_message::Message::Completions(answer));
+                }
+                Work::CompleteTargets { id, prefix } => {
+                    let cancel = Arc::new(EvalCancel::new());
+                    let fut = run_complete_targets(self.sctx, prefix, cancel.dupe());
+                    let answer = self.in_flight(id, &cancel, Some(&thread), fut).await;
+                    self.emitter
+                        .emit(id, repl_message::Message::Completions(answer));
+                }
                 Work::Init { id } => {
                     let outcome = self.eval(&thread, &target_cfg, EvalRequest::init(id)).await;
                     self.answer_init(id, outcome);
@@ -337,7 +384,7 @@ impl<'a> Driver<'a> {
             cancel.dupe(),
             self.emitter.dupe(),
         );
-        let outcome = self.in_flight(id, &cancel, fut).await;
+        let outcome = self.in_flight(id, &cancel, None, fut).await;
         if let Ok(Outcome::Eval { reply, .. }) = &outcome {
             self.heap_bytes = reply.heap_bytes;
         }
@@ -354,7 +401,7 @@ impl<'a> Driver<'a> {
         let id = request.id;
         let cancel = Arc::new(EvalCancel::new());
         let fut = run_build(self.sctx, target_cfg.clone(), request, cancel.dupe());
-        let mut outcome = self.in_flight(id, &cancel, fut).await;
+        let mut outcome = self.in_flight(id, &cancel, None, fut).await;
         if let Ok(Outcome::Built {
             result: Ok(Built::Outputs { value, .. }),
             ..
@@ -370,12 +417,18 @@ impl<'a> Driver<'a> {
     }
 
     /// Runs the request `id` to its end while answering the requests that arrive meanwhile.
-    async fn in_flight(
+    ///
+    /// While an input runs, other requests get `BUSY` (INV-14). A completion (`completion` is
+    /// the session thread, which it does not use) gives way instead: an input cancels it and runs
+    /// next, and names and attributes are completed meanwhile; only another target completion
+    /// gets `BUSY` (the one in flight keeps loading, so the next one is fast).
+    async fn in_flight<T>(
         &mut self,
         id: u64,
         cancel: &EvalCancel,
-        fut: impl Future<Output = buck2_error::Result<Outcome>>,
-    ) -> buck2_error::Result<Outcome> {
+        completion: Option<&ReplThread>,
+        fut: impl Future<Output = T>,
+    ) -> T {
         tokio::pin!(fut);
         loop {
             // `fut` is polled until it completes, never dropped (INV-8).
@@ -385,39 +438,80 @@ impl<'a> Driver<'a> {
                 _ = &mut self.session_obs, if self.client_open => Event::SessionEnded,
                 m = self.req.next(), if self.client_open => Event::Request(m),
             };
-            match event {
+            let request = match event {
                 Event::SessionEnded | Event::Request(None | Some(Err(_))) => {
                     cancel.trigger();
                     self.client_open = false;
+                    continue;
                 }
-                Event::Request(Some(Ok(request))) => match request.request {
-                    Some(repl_request::Request::Hangup(_)) => {
+                Event::Request(Some(Ok(request))) => request,
+            };
+            match (&request.request, completion) {
+                (Some(repl_request::Request::Hangup(_)), _) => {
+                    cancel.trigger();
+                    self.client_open = false;
+                }
+                (Some(repl_request::Request::Interrupt(interrupt)), _) => {
+                    if interrupt.target_id == id {
                         cancel.trigger();
-                        self.client_open = false;
+                    } else if self
+                        .queued
+                        .as_ref()
+                        .is_some_and(|queued| queued.id == interrupt.target_id)
+                    {
+                        // The input waiting for the completion to wind down.
+                        self.queued = None;
+                        self.emitter.done(
+                            interrupt.target_id,
+                            ReplDone {
+                                outcome: Some(repl_done::Outcome::Error(failure_proto(
+                                    ReplFailure::interrupted(),
+                                ))),
+                                heap_bytes: self.heap_bytes,
+                                ..ReplDone::default()
+                            },
+                        );
                     }
-                    Some(repl_request::Request::Interrupt(interrupt)) => {
-                        if interrupt.target_id == id {
-                            cancel.trigger();
-                        }
-                    }
-                    Some(repl_request::Request::Complete(_)) => self.emitter.emit(
-                        request.id,
-                        repl_message::Message::Completions(ReplCompletions {
-                            status: repl_completions::Status::Busy as i32,
-                            candidates: Vec::new(),
-                            message: String::new(),
-                        }),
-                    ),
-                    // One request at a time (INV-14).
-                    Some(repl_request::Request::Eval(_) | repl_request::Request::Open(_))
-                    | None => self.emitter.done(
-                        request.id,
-                        error_done(
-                            repl_error::Kind::Busy,
-                            &"busy: another request of this session is running",
+                }
+                (Some(repl_request::Request::Eval(_)), Some(_)) if self.queued.is_none() => {
+                    // Enter beats Tab.
+                    cancel.trigger();
+                    self.queued = Some(request);
+                }
+                (Some(repl_request::Request::Complete(complete)), Some(thread))
+                    if matches!(
+                        complete.kind(),
+                        repl_complete::Kind::Name | repl_complete::Kind::Attr
+                    ) =>
+                {
+                    let answer = match thread.complete(complete.clone()).await {
+                        Some(answer) => answer,
+                        None => completions_status(
+                            repl_completions::Status::Error,
+                            "the repl session thread exited",
                         ),
+                    };
+                    self.emitter
+                        .emit(request.id, repl_message::Message::Completions(answer));
+                }
+                (Some(repl_request::Request::Complete(_)), _) => self.emitter.emit(
+                    request.id,
+                    repl_message::Message::Completions(completions_status(
+                        repl_completions::Status::Busy,
+                        "busy: another request of this session is running",
+                    )),
+                ),
+                // One request at a time (INV-14).
+                (
+                    Some(repl_request::Request::Eval(_) | repl_request::Request::Open(_)) | None,
+                    _,
+                ) => self.emitter.done(
+                    request.id,
+                    error_done(
+                        repl_error::Kind::Busy,
+                        &"busy: another request of this session is running",
                     ),
-                },
+                ),
             }
         }
     }
@@ -643,14 +737,21 @@ fn classify(request: ReplRequest) -> Work {
                 message: repl_message::Message::Done(error_done(repl_error::Kind::Usage, &e)),
             },
         },
-        // Completion comes later: no candidates.
-        repl_request::Request::Complete(_) => Work::Reply {
-            id,
-            message: repl_message::Message::Completions(ReplCompletions {
-                status: repl_completions::Status::Ok as i32,
-                candidates: Vec::new(),
-                message: String::new(),
-            }),
+        repl_request::Request::Complete(req) => match req.kind() {
+            repl_complete::Kind::Name | repl_complete::Kind::Attr => {
+                Work::CompleteStarlark { id, req }
+            }
+            repl_complete::Kind::TargetPattern => Work::CompleteTargets {
+                id,
+                prefix: req.prefix,
+            },
+            _ => Work::Reply {
+                id,
+                message: repl_message::Message::Completions(completions_status(
+                    repl_completions::Status::Error,
+                    "this kind of completion is not supported",
+                )),
+            },
         },
         repl_request::Request::Interrupt(_) => Work::Interrupt,
         repl_request::Request::Hangup(_) => Work::Hangup,
@@ -828,6 +929,72 @@ async fn run_build(
             })
         })
         .await
+}
+
+/// Completes a target pattern in a transaction of its own, taken with the completion policy
+/// (it never waits for commands that use another state, and gives way to them). The work races
+/// the cancellation of the request and a timeout: it is DICE computations, which are safe to drop.
+async fn run_complete_targets(
+    sctx: &dyn ServerCommandContextTrait,
+    prefix: String,
+    cancel: Arc<EvalCancel>,
+) -> ReplCompletions {
+    let repl_ctx = ReplCtx::completion(sctx);
+    let result = (&repl_ctx as &dyn ServerCommandContextTrait)
+        .with_dice_ctx(|sctx, txn| async move {
+            if cancel.is_triggered() {
+                return Ok(completions_status(
+                    repl_completions::Status::Cancelled,
+                    "cancelled",
+                ));
+            }
+            let mut dc = txn.ctx();
+            let work = async {
+                let cwd = dc
+                    .get_cell_resolver()
+                    .await?
+                    .get_cell_path(sctx.working_dir());
+                complete_targets(&mut dc, &cwd, &prefix).await
+            };
+            Ok(tokio::select! {
+                result = tokio::time::timeout(TARGET_COMPLETION_TIMEOUT, work) => match result {
+                    Ok(Ok(candidates)) => candidates.into_completions(),
+                    Ok(Err(e)) => completion_error(&e),
+                    Err(_) => completions_status(
+                        repl_completions::Status::Timeout,
+                        "timed out",
+                    ),
+                },
+                () = cancel.cancelled() => completions_status(
+                    repl_completions::Status::Cancelled,
+                    "cancelled",
+                ),
+            })
+        })
+        .await;
+    match result {
+        Ok(answer) => answer,
+        Err(e)
+            if e.has_tag(buck2_error::ErrorTag::DaemonIsBusy)
+                || e.has_tag(buck2_error::ErrorTag::DaemonPreempted) =>
+        {
+            completions_status(
+                repl_completions::Status::Busy,
+                "busy: another buck2 command is running with a different state",
+            )
+        }
+        Err(e) => completion_error(&e),
+    }
+}
+
+/// An answer to a completion that failed.
+fn completion_error(e: &buck2_error::Error) -> ReplCompletions {
+    let failure = ReplFailure::from_buck2(repl_error::Kind::Buck, e);
+    let message = failure
+        .message
+        .strip_prefix("error: ")
+        .unwrap_or(&failure.message);
+    completions_status(repl_completions::Status::Error, message)
 }
 
 /// Materializes the artifacts an input ensured, racing the cancellation of the request: this is

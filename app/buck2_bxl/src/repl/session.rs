@@ -15,6 +15,8 @@ use std::fmt;
 use std::future::Future;
 use std::pin::pin;
 
+use buck2_cli_proto::ReplComplete;
+use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::repl_error;
 use buck2_cli_proto::repl_notice;
 use buck2_common::events::HasEvents;
@@ -41,6 +43,7 @@ use futures::future::Either;
 use futures::future::select;
 use starlark::PrintHandler;
 use starlark::environment::FrozenModule;
+use starlark::environment::Globals;
 use starlark::eval::Evaluator;
 use starlark::eval::FileLoader;
 use starlark::values::ValueOfUnchecked;
@@ -51,6 +54,8 @@ use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::context::output::OutputStreamState;
 use crate::bxl::starlark_defs::context::starlark_async::BxlDiceComputations;
 use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
+use crate::repl::complete::names::complete_starlark;
+use crate::repl::complete::private::PrivateBindings;
 use crate::repl::complete::types::TypeIndex;
 use crate::repl::docstrings::Docstrings;
 use crate::repl::output::ReplEmitter;
@@ -97,10 +102,15 @@ pub(crate) struct Session {
     last_token: Option<ProfilingReportedToken>,
     /// What `:reload` loads again.
     loaded: LoadedModules,
-    /// The documentation of the types of the globals, built when `:doc` first needs it.
+    /// The globals of the last evaluation, for completion.
+    globals: Option<Globals>,
+    /// The documentation of the types of the globals, built when `:doc` or completion first
+    /// needs it.
     types: Option<TypeIndex>,
     /// The docstrings of the functions defined in the session, for `:doc`.
     docstrings: Docstrings,
+    /// Where the private bindings (loaded symbols) come from, for completion.
+    private: PrivateBindings,
 }
 
 /// The modules the session has loaded, to load again on `:reload`.
@@ -177,13 +187,30 @@ impl Session {
             prelude_loaded: false,
             last_token: None,
             loaded: LoadedModules::default(),
+            globals: None,
             types: None,
             docstrings: Docstrings::default(),
+            private: PrivateBindings::default(),
         }
     }
 
     pub(crate) fn take_token(&mut self) -> Option<ProfilingReportedToken> {
         self.last_token.take()
+    }
+
+    /// Completes a name or an attribute. Runs no code (INV-1) and uses no DICE.
+    pub(crate) fn complete(
+        &mut self,
+        env: &BuckStarlarkModule<'_>,
+        req: &ReplComplete,
+    ) -> ReplCompletions {
+        let globals = self.globals.as_ref();
+        if self.types.is_none()
+            && let Some(globals) = globals
+        {
+            self.types = Some(TypeIndex::build(globals));
+        }
+        complete_starlark(env, &self.private, globals, self.types.as_ref(), req)
     }
 
     /// Evaluates an input. Consumes the work, so every DICE handle is dropped when this returns
@@ -304,8 +331,9 @@ impl Session {
             self.need_prelude = false;
             match prelude {
                 Ok(modules) => {
-                    for module in &modules {
+                    for (i, module) in modules.iter().enumerate() {
                         env.import_public_symbols(module);
+                        self.private.import_all(&format!("<prelude {i}>"), module);
                     }
                     self.prelude_loaded = !modules.is_empty();
                 }
@@ -328,8 +356,9 @@ impl Session {
 
         // Modules imported whole: their public symbols become (private) bindings of the session,
         // as with `load`.
-        for (_, module) in &import_all {
+        for (module_id, module) in &import_all {
             env.import_public_symbols(module);
+            self.private.import_all(module_id, module);
         }
         // The `load` statements of the code, recorded for `:reload` once they have run.
         let load_statements: Vec<(String, Vec<(String, String)>)> = ast
@@ -346,6 +375,7 @@ impl Session {
             })
             .collect();
 
+        self.globals = Some(globals.dupe());
         if mode == RenderMode::Doc && self.types.is_none() {
             self.types = Some(TypeIndex::build(&globals));
         }
@@ -399,6 +429,14 @@ impl Session {
             },
         )
         .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Internal, &e))?;
+        // Whether the evaluation succeeded or not, the loads it made are bindings now.
+        for (module_id, symbols) in &load_statements {
+            if let Some(module) = loader.0.get(module_id) {
+                for (local, symbol) in symbols {
+                    self.private.load(local, module, symbol);
+                }
+            }
+        }
         self.last_token = Some(
             finished
                 .finish()

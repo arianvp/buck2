@@ -28,6 +28,8 @@ use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::parse_command;
 
+use crate::complete::Completer;
+use crate::complete::complete_command;
 use crate::help;
 use crate::render;
 use crate::render::Rendered;
@@ -60,6 +62,7 @@ pub(crate) struct ScriptMode {
     pub(crate) req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     pub(crate) ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     pub(crate) next_id: Arc<AtomicU64>,
+    pub(crate) completer: Arc<Completer>,
     pub(crate) ui: SharedUi,
     pub(crate) outcome_tx: tokio::sync::oneshot::Sender<InputOutcome>,
     pub(crate) shutdown: ShutdownHangup,
@@ -75,6 +78,7 @@ impl ScriptMode {
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui,
             outcome_tx,
             shutdown,
@@ -85,6 +89,7 @@ impl ScriptMode {
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui,
             shutdown,
             run_env,
@@ -107,6 +112,7 @@ struct Session {
     req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     next_id: Arc<AtomicU64>,
+    completer: Arc<Completer>,
     ui: SharedUi,
     shutdown: ShutdownHangup,
     run_env: RunEnv,
@@ -210,6 +216,26 @@ impl Session {
                 CommandId::Time => {
                     let timed = command.arg.into_owned();
                     return self.eval_timed(timed);
+                }
+                CommandId::Complete => {
+                    return match complete_command(&self.completer, &command.arg) {
+                        Ok(json) => {
+                            if self.output(render::print_text(&json).and_then(|()| render::flush()))
+                            {
+                                Next::Continue
+                            } else {
+                                Next::Stop
+                            }
+                        }
+                        Err(message) => {
+                            let printed =
+                                render::print_error(Style::script(), &format!("error: {message}"));
+                            if !self.output(printed) {
+                                return Next::Stop;
+                            }
+                            self.failed()
+                        }
+                    };
                 }
                 _ => {}
             },

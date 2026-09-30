@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use starlark::docs::DocItem;
+use starlark::docs::DocMember;
 use starlark::docs::DocModule;
 use starlark::docs::DocType;
 use starlark::environment::Globals;
@@ -93,5 +94,10 @@ impl TypeIndex {
     /// The documentation of the type named `name` (`bxl.Context`, `str`, ...).
     pub(crate) fn get(&self, name: &str) -> Option<&DocType> {
         self.types.get(name)
+    }
+
+    /// The member `member` of the type named `type_name`.
+    pub(crate) fn member(&self, type_name: &str, member: &str) -> Option<&DocMember> {
+        self.types.get(type_name)?.members.get(member)
     }
 }

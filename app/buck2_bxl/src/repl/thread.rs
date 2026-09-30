@@ -11,6 +11,8 @@
 //! The session thread: it owns the Starlark module of the session and runs the jobs the driver
 //! sends it, one at a time.
 
+use buck2_cli_proto::ReplComplete;
+use buck2_cli_proto::ReplCompletions;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_error::buck2_error;
@@ -42,6 +44,8 @@ pub(crate) struct SessionConfig {
 
 pub(crate) enum Job {
     Eval(EvalJob),
+    /// Complete a name or an attribute. Runs no code and uses no DICE.
+    Complete(CompleteJob),
     /// Drops the session's module and starts a new session (`:reset`). Acknowledged once the
     /// old module is gone.
     Reset(tokio::sync::oneshot::Sender<()>),
@@ -90,6 +94,12 @@ pub(crate) struct EvalWork {
     pub(crate) global_cfg_options: GlobalCfgOptions,
     /// The span of the request, as the parent of the thread's spans.
     pub(crate) span: Option<SpanId>,
+}
+
+/// Complete a name or an attribute from the session's module.
+pub(crate) struct CompleteJob {
+    pub(crate) req: ReplComplete,
+    pub(crate) reply: tokio::sync::oneshot::Sender<ReplCompletions>,
 }
 
 /// Binds a name of the session's module to a value made from JSON (`_` after `:build`).
@@ -172,6 +182,20 @@ impl ReplThread {
         ack_rx.await.ok()
     }
 
+    /// Completes a name or an attribute. `None` if the thread has exited. The driver calls it
+    /// when no job is in flight, or when the job in flight does not use the thread.
+    pub(crate) async fn complete(&self, req: ReplComplete) -> Option<ReplCompletions> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let job = Job::Complete(CompleteJob {
+            req,
+            reply: reply_tx,
+        });
+        if self.jobs.send(job).is_err() {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
     /// Asks the thread to exit and waits until it has (INV-16). The driver calls it when no job
     /// is in flight.
     pub(crate) async fn shutdown(self) {
@@ -212,6 +236,9 @@ fn thread_main(
                         // reply is sent (INV-4).
                         let result = session.eval_job(&env, work);
                         let _ignored = reply.send(result);
+                    }
+                    Ok(Job::Complete(CompleteJob { req, reply })) => {
+                        let _ignored = reply.send(session.complete(&env, &req));
                     }
                     Ok(Job::Bind(BindJob { name, value, ack })) => {
                         // No evaluator runs, so nothing can collect the session's heap (INV-1).

@@ -36,6 +36,7 @@ use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::parse_command;
 use buck2_repl_syntax::completeness::Completeness;
 use buck2_repl_syntax::completeness::completeness;
+use dupe::Dupe;
 use rustyline::Cmd;
 use rustyline::Completer;
 use rustyline::CompletionType;
@@ -61,6 +62,9 @@ use rustyline::history::FileHistory;
 use rustyline::validate::ValidationContext;
 use rustyline::validate::ValidationResult;
 
+use crate::complete::Completer;
+use crate::complete::ReplCompleter;
+use crate::complete::complete_command;
 use crate::help;
 use crate::render;
 use crate::render::Style;
@@ -106,6 +110,8 @@ impl rustyline::validate::Validator for ReplValidator {
 
 #[derive(Helper, Completer, Hinter, Validator)]
 struct ReplHelper {
+    #[rustyline(Completer)]
+    completer: ReplCompleter,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
     #[rustyline(Validator)]
@@ -170,6 +176,7 @@ pub(crate) struct EditorMode {
     pub(crate) req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     pub(crate) ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     pub(crate) next_id: Arc<AtomicU64>,
+    pub(crate) completer: Arc<Completer>,
     pub(crate) ui: SharedUi,
     pub(crate) history: Option<PathBuf>,
     pub(crate) outcome_tx: tokio::sync::oneshot::Sender<InputOutcome>,
@@ -184,6 +191,7 @@ impl EditorMode {
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui,
             history,
             outcome_tx,
@@ -194,6 +202,7 @@ impl EditorMode {
             req_tx,
             ui_rx,
             next_id,
+            completer,
             ui,
             history,
             history_failed: false,
@@ -216,6 +225,7 @@ struct Session {
     req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     next_id: Arc<AtomicU64>,
+    completer: Arc<Completer>,
     ui: SharedUi,
     history: Option<PathBuf>,
     /// The history file could not be written: it is not tried again.
@@ -301,6 +311,7 @@ impl Session {
             .build();
         let mut editor = Editor::with_config(config)?;
         editor.set_helper(Some(ReplHelper {
+            completer: ReplCompleter(self.completer.dupe()),
             hinter: HistoryHinter::new(),
             validator: ReplValidator,
             brackets: MatchingBracketHighlighter::new(),
@@ -410,6 +421,15 @@ impl Session {
                 CommandId::Time => {
                     let timed = command.arg.into_owned();
                     return self.eval_timed(timed);
+                }
+                CommandId::Complete => {
+                    let printed = match complete_command(&self.completer, &command.arg) {
+                        Ok(json) => render::print_text(&json).and_then(|()| render::flush()),
+                        Err(message) => {
+                            render::print_error(self.style, &format!("error: {message}"))
+                        }
+                    };
+                    return self.continue_if(printed);
                 }
                 _ => {}
             },

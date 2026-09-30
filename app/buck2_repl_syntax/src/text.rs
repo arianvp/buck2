@@ -222,6 +222,49 @@ pub fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
     s.get(..end).unwrap_or("")
 }
 
+/// The text after the last occurrence of `sep` in `s` outside brackets (`(`, `[`). Used to read
+/// the return type in a rendered function type: `def(f: def() -> str) -> int` gives `int`.
+pub fn after_top_level<'a>(s: &'a str, sep: &str) -> Option<&'a str> {
+    let mut depth = 0usize;
+    let mut found = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && s.get(i..).is_some_and(|rest| rest.starts_with(sep)) => {
+                found = Some(i + sep.len());
+            }
+            _ => {}
+        }
+    }
+    s.get(found?..)
+}
+
+/// `s` split at the occurrences of `sep` outside brackets (`(`, `[`): the alternatives of a
+/// rendered union type.
+pub fn split_top_level<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+    let mut depth = 0usize;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && i >= start
+                && !sep.is_empty()
+                && s.get(i..).is_some_and(|rest| rest.starts_with(sep)) =>
+            {
+                parts.push(s.get(start..i).unwrap_or(""));
+                start = i + sep.len();
+            }
+            _ => {}
+        }
+    }
+    parts.push(s.get(start..).unwrap_or(""));
+    parts
+}
+
 /// A [`fmt::Write`] that keeps at most `cap` bytes, silently drops the rest and never fails, so
 /// that formatting a value into it cannot panic or run out of memory.
 #[derive(Debug, Clone, Default)]
@@ -283,6 +326,23 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
+
+    #[test]
+    fn test_top_level() {
+        assert_eq!(
+            after_top_level("def(x: int, f: def() -> str) -> bxl.CqueryContext", " -> "),
+            Some("bxl.CqueryContext")
+        );
+        assert_eq!(after_top_level("def(x: int)", " -> "), None);
+        assert_eq!(after_top_level("é -> ", " -> "), Some(""));
+        assert_eq!(
+            split_top_level("str | list[str | int] | None", " | "),
+            vec!["str", "list[str | int]", "None"]
+        );
+        assert_eq!(split_top_level("", " | "), vec![""]);
+        assert_eq!(split_top_level("a", ""), vec!["a"]);
+        assert_eq!(split_top_level("a || b", "|"), vec!["a ", "", " b"]);
+    }
 
     #[test]
     fn test_dedent() {

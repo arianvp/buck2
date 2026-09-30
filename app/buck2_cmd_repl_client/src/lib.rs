@@ -29,6 +29,7 @@ use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 
+mod complete;
 mod editor;
 mod help;
 mod render;
