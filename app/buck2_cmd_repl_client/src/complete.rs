@@ -280,7 +280,7 @@ impl Completer {
                 ..
             } => match split_bxl_function(word) {
                 // `x.bxl:ma`: the functions of the file.
-                Some((module, prefix)) => self.listing(
+                Some((module, prefix)) => self.listing_for(
                     start,
                     ReplComplete {
                         kind: repl_complete::Kind::BxlFunction as i32,
@@ -293,6 +293,7 @@ impl Completer {
                         load_module: module.to_owned(),
                         ..ReplComplete::default()
                     },
+                    prefix,
                 ),
                 None => self.load_paths(start, word, BXL_EXTENSIONS),
             },
@@ -300,13 +301,14 @@ impl Completer {
                 self.targets(start, word)
             }
             SiteKind::LoadSymbol { module, used, .. } => {
-                let mut completion = self.listing(
+                let mut completion = self.listing_for(
                     start,
                     ReplComplete {
                         kind: repl_complete::Kind::LoadSymbol as i32,
                         load_module: (*module).to_owned(),
                         ..ReplComplete::default()
                     },
+                    word,
                 );
                 completion
                     .candidates
@@ -385,13 +387,14 @@ impl Completer {
     /// that match are checked for build files).
     fn targets(&self, start: usize, word: &str) -> Completion {
         let prefix = target_listing(word).unwrap_or(word);
-        self.listing(
+        self.listing_for(
             start,
             ReplComplete {
                 kind: repl_complete::Kind::TargetPattern as i32,
                 prefix: prefix.to_owned(),
                 ..ReplComplete::default()
             },
+            word,
         )
     }
 
@@ -418,13 +421,14 @@ impl Completer {
             return completion;
         }
         let prefix = load_listing(word).unwrap_or(word);
-        let mut completion = self.listing(
+        let mut completion = self.listing_for(
             start,
             ReplComplete {
                 kind: repl_complete::Kind::LoadPath as i32,
                 prefix: prefix.to_owned(),
                 ..ReplComplete::default()
             },
+            word,
         );
         completion.candidates.retain(|c| {
             c.kind() != repl_candidate::Kind::File
@@ -495,6 +499,23 @@ impl Completer {
                 completion
             }
         }
+    }
+
+    /// The listing `request` (for a shorter prefix than `word`, the prefix the candidates are
+    /// for), filtered here; or, when the daemon could not list every candidate (too many), the
+    /// candidates for `word` itself.
+    fn listing_for(&self, start: usize, request: ReplComplete, word: &str) -> Completion {
+        let completion = self.listing(start, request.clone());
+        if completion.is_ok() && !completion.message.is_empty() && request.prefix != word {
+            return self.listing(
+                start,
+                ReplComplete {
+                    prefix: word.to_owned(),
+                    ..request
+                },
+            );
+        }
+        completion
     }
 
     /// A listing of the daemon: kept, or asked for (and kept).
