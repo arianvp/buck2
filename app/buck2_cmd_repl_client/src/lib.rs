@@ -37,6 +37,7 @@ mod console;
 mod editor;
 mod help;
 mod inputs;
+mod json;
 mod render;
 mod run;
 mod script;
@@ -58,12 +59,13 @@ pub struct ReplCommand {
     #[clap(short = 'e', long = "eval", value_name = "INPUT")]
     eval: Vec<String>,
 
-    /// Go on with the inputs of stdin (the prompt, on a terminal) after the `-e` inputs, as
-    /// without `-e`: `buck2 repl -i -e INPUT FILE`.
+    /// Then read inputs from stdin (the prompt, on a terminal), as without `-e`: `buck2 repl -i
+    /// FILE -e INPUT` evaluates FILE and INPUT, then shows the prompt.
     #[clap(short = 'i', long, overrides_with = "interactive")]
     interactive: bool,
 
-    /// Print one JSON object per input (non-interactive only).
+    /// Print one JSON object per input on stdout (JSON Lines: its value, error and output), and
+    /// nothing else there. Non-interactive only.
     #[clap(long)]
     json: bool,
 
@@ -95,6 +97,9 @@ pub struct ReplCommand {
 
     #[clap(skip)]
     console: console::ReplConsole,
+
+    #[clap(skip)]
+    json_capture: json::JsonCapture,
 }
 
 /// How the session shows what the daemon does.
@@ -158,10 +163,12 @@ impl StreamingCommand for ReplCommand {
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        if self.json {
+        if self.json && self.is_interactive() {
+            // The records are for programs, which do not type at a terminal.
             return ExitResult::err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "`buck2 repl --json` is not implemented yet"
+                "`buck2 repl --json` needs non-interactive inputs: give them with -e, or pipe \
+                 them on stdin"
             ));
         }
         let context = ctx.client_context(matches, &self)?;
@@ -219,6 +226,10 @@ impl StreamingCommand for ReplCommand {
         let mut subscribers = vec![self.shutdown.subscriber()];
         if let ConsoleMode::Live { .. } = self.console_mode() {
             subscribers.push(self.console.subscriber());
+        }
+        if self.json {
+            // The console is `none`: what consoles print of the events goes into the records.
+            subscribers.push(self.json_capture.subscriber());
         }
         subscribers
     }

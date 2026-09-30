@@ -93,6 +93,7 @@ use crate::repl::inspect::inspect;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplOutputWriter;
+use crate::repl::render::MAX_JSON_BYTES;
 use crate::repl::render::Rendered;
 use crate::repl::render::ReplFailure;
 use crate::repl::settings::SetWork;
@@ -329,6 +330,8 @@ pub(crate) struct Driver<'a> {
     /// The completion of a name, an attribute or a keyword argument the session thread is
     /// answering, if any: at most one at a time.
     completing: Option<ThreadCompletion>,
+    /// Values get their JSON form too (`ReplOpen.json_values`).
+    json_values: bool,
 }
 
 impl<'a> Driver<'a> {
@@ -348,6 +351,7 @@ impl<'a> Driver<'a> {
             heap_bytes: 0,
             queued: None,
             completing: None,
+            json_values: false,
         }
     }
 
@@ -373,7 +377,9 @@ impl<'a> Driver<'a> {
         };
         let cfg = SessionConfig {
             heap_limit: usize::try_from(heap_limit).unwrap_or(usize::MAX),
+            json_values: open.json_values,
         };
+        self.json_values = open.json_values;
         // `:set` changes it.
         let mut target_cfg = open.target_cfg.unwrap_or_default();
         let thread = ReplThread::spawn(Handle::current(), cfg, self.emitter.dupe())?;
@@ -560,10 +566,15 @@ impl<'a> Driver<'a> {
         let fut = run_build(self.sctx, target_cfg.clone(), request, cancel.dupe());
         let mut outcome = self.in_flight(id, &cancel, None, fut).await;
         if let Ok(Outcome::Built {
-            result: Ok(Built::Outputs { value, .. }),
+            result: Ok(Built::Outputs { value, json, .. }),
             ..
         }) = &mut outcome
         {
+            if self.json_values {
+                *json = serde_json::to_string(value)
+                    .ok()
+                    .filter(|json| json.len() <= MAX_JSON_BYTES);
+            }
             // The transaction is over and the thread is idle.
             match thread.bind("_", std::mem::take(value)).await {
                 Some(heap_bytes) => self.heap_bytes = heap_bytes,
@@ -828,12 +839,15 @@ impl<'a> Driver<'a> {
                 self.last_equality = Some(equality);
                 let outcome = match result {
                     Ok(Built::Outputs {
-                        listing, truncated, ..
+                        listing,
+                        truncated,
+                        json,
+                        ..
                     }) => repl_done::Outcome::Value(ReplValue {
                         r#type: "dict".to_owned(),
                         text: listing,
                         truncated,
-                        json: None,
+                        json,
                     }),
                     Ok(Built::Run(run)) => repl_done::Outcome::Run(run),
                     Err(failure) => repl_done::Outcome::Error(failure_proto(failure)),
@@ -943,7 +957,7 @@ impl<'a> Driver<'a> {
                             r#type: value.type_name,
                             text: value.text,
                             truncated: value.truncated,
-                            json: None,
+                            json: value.json,
                         }))
                     }
                 };
@@ -1126,7 +1140,7 @@ async fn run_eval(
                     global_cfg_options_from_client_context(&target_cfg, sctx, &mut dc).await?;
                 (cwd, global_cfg_options)
             };
-            let target_platform = global_cfg_options.target_platform.clone();
+            let target_platform = global_cfg_options.target_platform;
 
             // The job runs in a task of its own, whose structured cancellation the session
             // thread observes; an interrupt cancels that task, never this future (INV-8).

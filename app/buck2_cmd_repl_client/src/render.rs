@@ -76,7 +76,7 @@ impl Style {
     }
 
     /// `text` in `color`, when colour is on.
-    fn paint(&self, color: &str, text: &str) -> String {
+    fn paint(self, color: &str, text: &str) -> String {
         if self.color {
             format!("{color}{text}{RESET}")
         } else {
@@ -133,30 +133,37 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
     Ok(rendered)
 }
 
+/// How an input went, from its result, when nothing is printed (`--json`). A `:run` is not run.
+pub(crate) fn outcome(done: &ReplDone) -> Rendered {
+    match &done.outcome {
+        Some(repl_done::Outcome::Error(error)) if error.kind() == repl_error::Kind::Interrupted => {
+            Rendered::Interrupted
+        }
+        Some(repl_done::Outcome::Error(_)) => Rendered::Failed,
+        None | Some(repl_done::Outcome::Value(_) | repl_done::Outcome::Run(_)) => Rendered::Ok,
+    }
+}
+
+/// The note shown when sources changed since the previous request.
+pub(crate) const SOURCES_CHANGED: &str =
+    "note: sources changed since the previous input; values computed earlier may be stale";
+
 /// The note that sources changed since the previous request, if they did.
-pub(crate) fn print_sources_changed(done: &ReplDone, style: Style) -> buck2_error::Result<()> {
+fn print_sources_changed(done: &ReplDone, style: Style) -> buck2_error::Result<()> {
     if done.sources_changed {
-        print_note(
-            style,
-            "note: sources changed since the previous input; values computed earlier may be stale",
-        )?;
+        print_note(style, SOURCES_CHANGED)?;
     }
     Ok(())
 }
 
 /// What `:time` prints: `time: 1.24s total · 0.80s daemon wait · 0.40s eval`.
-pub(crate) fn print_timing(
-    style: Style,
-    total: Duration,
-    done: &ReplDone,
-) -> buck2_error::Result<()> {
-    let text = format!(
+pub(crate) fn timing(total: Duration, done: &ReplDone) -> String {
+    format!(
         "time: {:.3}s total · {:.3}s daemon wait · {:.3}s eval",
         total.as_secs_f64(),
         Duration::from_millis(done.wait_ms).as_secs_f64(),
         Duration::from_millis(done.eval_ms).as_secs_f64(),
-    );
-    print_note(style, &text)
+    )
 }
 
 /// Prints `text` on stdout, on its own lines.

@@ -141,7 +141,8 @@ enum Display {
     /// (it was finalized) until the input ends.
     Live {
         id: u64,
-        console: StatefulSuperConsole,
+        /// Boxed: it is large, and the other variants are small.
+        console: Box<StatefulSuperConsole>,
         /// When the canvas is drawn first.
         show_at: Instant,
         /// Output written to the terminal did not end its line (on this channel): the canvas is
@@ -304,7 +305,7 @@ impl State {
             Ok(Some(console)) => {
                 self.display = Display::Live {
                     id,
-                    console,
+                    console: Box::new(console),
                     show_at: Instant::now() + SHOW_AFTER,
                     open_line: None,
                     // From the start: keys typed before the canvas is first drawn would move
@@ -400,7 +401,7 @@ impl State {
                 ..
             } => {
                 let tick = open_line.is_none() && Instant::now() >= *show_at;
-                Some((console, tick))
+                Some((&mut **console, tick))
             }
         }
     }

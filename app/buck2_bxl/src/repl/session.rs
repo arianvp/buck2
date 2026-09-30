@@ -415,6 +415,7 @@ impl Session {
             self.stream.dupe(),
         );
         let heap_limit = self.cfg.heap_limit;
+        let json_values = self.cfg.json_values;
         let (finished, result) = with_repl_evaluator(
             env,
             provider,
@@ -440,6 +441,7 @@ impl Session {
                             budget: RenderBudget::new(&cancelled),
                             types,
                             code: &typed,
+                            json_values,
                         };
                         let rendered = render(v, mode, &cx);
                         if rendered.is_ok() && mode.binds_last_value() && !v.is_none() {

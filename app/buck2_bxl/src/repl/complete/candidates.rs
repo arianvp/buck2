@@ -116,16 +116,15 @@ impl Candidates {
             self.truncated = true;
             return;
         }
-        if !self.by_replacement.contains_key(&replacement) {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.by_replacement.entry(replacement)
+        {
             let max_detail = if kind == repl_candidate::Kind::Function {
                 MAX_FUNCTION_DETAIL_BYTES
             } else {
                 MAX_DETAIL_BYTES
             };
-            self.by_replacement.insert(
-                replacement,
-                (kind, truncate_to_bytes(detail, max_detail).to_owned()),
-            );
+            entry.insert((kind, truncate_to_bytes(detail, max_detail).to_owned()));
             if self.by_replacement.len() > MAX_CANDIDATES {
                 let last_other = self
                     .by_replacement

@@ -25,10 +25,12 @@ use std::process::Stdio;
 use std::time::Instant;
 
 use buck2_cli_proto::ReplRun;
+use buck2_cli_proto::repl_output;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_UUID_ENV_VAR;
 use buck2_wrapper_common::BUCK2_WRAPPER_ENV_VAR;
 
+use crate::json::JsonCapture;
 use crate::render;
 use crate::render::Rendered;
 use crate::render::Style;
@@ -127,19 +129,8 @@ pub(crate) fn run_shell(
 ) -> buck2_error::Result<Rendered> {
     // What the session printed so far comes before what the command prints.
     render::flush()?;
-    let (shell, flag) = shell();
-    // ast-grep-ignore: rust/buck2-no-command-new
-    let mut child = std::process::Command::new(&shell);
-    child.arg(flag).arg(command).current_dir(&env.cwd);
-    for var in WRAPPER_ENV_VARS {
-        child.env_remove(var);
-    }
-    if !env.interactive {
-        child.stdin(Stdio::null());
-    }
-    ui.set(UiState::Child);
-    let status = child.status();
-    ui.set(after);
+    let (shell, mut child) = shell_command(command, env);
+    let status = run_child(&mut child, ui, after, None);
     let status = match status {
         Ok(status) => status,
         Err(e) => {
@@ -153,6 +144,57 @@ pub(crate) fn run_shell(
     let (how, rendered) = describe(status);
     render::print_note(style, &format!("[{how}]"))?;
     Ok(rendered)
+}
+
+/// `:!<command>` with `--json`: runs the command as [`run_shell`] does (stdin is empty), and
+/// captures what it writes. The error is a message (without `error: `).
+pub(crate) fn run_shell_captured(
+    command: &str,
+    env: &RunEnv,
+    ui: &SharedUi,
+    after: UiState,
+    capture: &JsonCapture,
+) -> Result<ExitStatus, String> {
+    let (shell, mut child) = shell_command(command, env);
+    run_child(&mut child, ui, after, Some(capture))
+        .map_err(|e| format!("cannot run `{shell}`: {e}"))
+}
+
+/// The command that runs `command` with the shell (see [`run_shell`]), and the shell.
+fn shell_command(command: &str, env: &RunEnv) -> (String, std::process::Command) {
+    let (shell, flag) = shell();
+    // ast-grep-ignore: rust/buck2-no-command-new
+    let mut child = std::process::Command::new(&shell);
+    child.arg(flag).arg(command).current_dir(&env.cwd);
+    for var in WRAPPER_ENV_VARS {
+        child.env_remove(var);
+    }
+    if !env.interactive {
+        child.stdin(Stdio::null());
+    }
+    (shell, child)
+}
+
+/// Runs a program of the session (`:run`, `:!`, the editor of `:edit`) to its end, with the
+/// terminal (SIGINT is for it meanwhile), or with its output captured for the input's JSON
+/// record. `after` is the state of the terminal once it has ended.
+fn run_child(
+    command: &mut std::process::Command,
+    ui: &SharedUi,
+    after: UiState,
+    capture: Option<&JsonCapture>,
+) -> std::io::Result<ExitStatus> {
+    ui.set(UiState::Child);
+    let result = match capture {
+        None => command.status(),
+        Some(capture) => command.output().map(|output| {
+            capture.write(repl_output::Channel::Stdout, &output.stdout);
+            capture.write(repl_output::Channel::Stderr, &output.stderr);
+            output.status
+        }),
+    };
+    ui.set(after);
+    result
 }
 
 /// The shell of `:!`, and its flag to run a command.
@@ -209,14 +251,15 @@ fn takes_line(editor: &str) -> bool {
 }
 
 /// Runs the editor of `:edit` on `path` (at `line`, if the editor is known to take one) with the
-/// terminal, and waits for it. `after` is the state of the terminal once it has ended. The
-/// error is a message (without `error: `).
+/// terminal (or, with `--json`, with what it writes captured), and waits for it. `after` is the
+/// state of the terminal once it has ended. The error is a message (without `error: `).
 pub(crate) fn run_editor(
     path: &Path,
     line: Option<usize>,
     env: &RunEnv,
     ui: &SharedUi,
     after: UiState,
+    capture: Option<&JsonCapture>,
 ) -> Result<(), String> {
     let editor = match chosen_editor() {
         Some(editor) => editor,
@@ -258,10 +301,7 @@ pub(crate) fn run_editor(
     if !env.interactive {
         command.stdin(Stdio::null());
     }
-    ui.set(UiState::Child);
-    let status = command.status();
-    ui.set(after);
-    match status {
+    match run_child(&mut command, ui, after, capture) {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!(
             "the editor (`{editor}`) {}; nothing was loaded or run",
@@ -272,7 +312,7 @@ pub(crate) fn run_editor(
 }
 
 /// `exited N` or `killed by signal S`, and what it means for the input.
-fn describe(status: ExitStatus) -> (String, Rendered) {
+pub(crate) fn describe(status: ExitStatus) -> (String, Rendered) {
     if let Some(code) = status.code() {
         let rendered = if code == 0 {
             Rendered::Ok

@@ -583,6 +583,34 @@ class Buck(Executable):
             env=env,
         )
 
+    def repl(
+        self,
+        *argv: str,
+        input: Optional[bytes] = None,
+        rel_cwd: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Process[BuckResult, BuckException]:
+        """
+        Returns a Process with BuckResult type that runs `buck2 repl` non-interactively.
+
+        The inputs are the `-e` arguments in `argv` (`buck.repl("-e", "1 + 1")`), or
+        `input`, fed on stdin (`buck.repl(input=b"x = 1\\nx + 1\\n")`); without `input`,
+        stdin is empty. Values are printed on stdout, errors on stderr, and the exit code
+        is 3 if an input failed. With `--json`, stdout has one JSON object per input.
+
+        rel_cwd: Optional Path specifying the working directory to run the command relative
+        to the root (the session's directory, which relative patterns and loads use).
+        env: Optional dictionary for environment variables to run command with.
+        """
+        return self._run_buck_command(
+            "repl",
+            *argv,
+            input=input,
+            rel_cwd=rel_cwd,
+            env=env,
+            stdin=subprocess.DEVNULL if input is None else None,
+        )
+
     def docs(
         self,
         *args: str,

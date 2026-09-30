@@ -93,6 +93,8 @@ pub(crate) enum Built {
         truncated: bool,
         /// `{label: [paths]}`, which becomes `_`.
         value: serde_json::Value,
+        /// `value` as JSON text, for `buck2 repl --json` (filled in by the driver).
+        json: Option<String>,
     },
     /// `:run`: the command that runs the target.
     Run(ReplRun),
@@ -448,6 +450,7 @@ fn list_outputs(
         listing,
         truncated,
         value: serde_json::Value::Object(value),
+        json: None,
     })
 }
 

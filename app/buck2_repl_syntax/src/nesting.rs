@@ -36,7 +36,7 @@
 //!   its chain: [`STMT_WEIGHT`] per level.
 //!
 //! [`check`] rejects inputs where the bound for some logical line exceeds
-//! [`MAX_NESTING`](crate::text::MAX_NESTING). It also enforces the bracket depth and
+//! [`MAX_NESTING`]. It also enforces the bracket depth and
 //! unary-run limits of [`precheck`](crate::text::precheck), which it serves.
 
 use crate::lexer::Bracket;
@@ -56,7 +56,7 @@ const STMT_WEIGHT: usize = 2;
 const LAMBDA_WEIGHT: usize = 2;
 
 /// Checks that the syntax tree of `code` cannot be deeper than about
-/// [`MAX_NESTING`](crate::text::MAX_NESTING), that brackets nest at most
+/// [`MAX_NESTING`], that brackets nest at most
 /// [`MAX_BRACKET_DEPTH`] deep and that no more than [`MAX_UNARY_RUN`] unary operators follow
 /// each other.
 pub(crate) fn check(code: &str) -> Result<(), PrecheckError> {

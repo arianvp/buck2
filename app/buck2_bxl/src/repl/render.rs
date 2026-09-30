@@ -81,6 +81,10 @@ const RENDER_STACK_RESERVE: usize = 256 << 10;
 /// Shown instead of a value that is nested too deeply to format.
 pub(crate) const TOO_DEEP: &str = "<value nested too deeply to display>";
 
+/// Longest JSON form of a value (`ReplValue.json`, for `buck2 repl --json`). It is the one part of
+/// a message that may make it longer than 64 KiB.
+pub(crate) const MAX_JSON_BYTES: usize = 1 << 20;
+
 /// Most text `:print`, `:json` and `:doc` send. It goes to the client's stdout as output, in
 /// chunks.
 pub(crate) const MAX_STREAM_BYTES: usize = 16 << 20;
@@ -156,6 +160,9 @@ pub(crate) struct RenderedValue {
     pub(crate) type_name: String,
     pub(crate) text: String,
     pub(crate) truncated: bool,
+    /// The value as compact JSON, when asked for (`buck2 repl --json`) and the value has a JSON
+    /// form of at most [`MAX_JSON_BYTES`].
+    pub(crate) json: Option<String>,
 }
 
 /// Text for the client's stdout.
@@ -242,6 +249,7 @@ impl Rendering {
             type_name,
             text: self.text,
             truncated: self.truncated || self.timed_out,
+            json: None,
         }
     }
 
@@ -270,6 +278,8 @@ pub(crate) struct RenderContext<'a, 'v> {
     pub(crate) types: Option<&'a TypeIndex>,
     /// The code as typed, which names the value in the heading of `:doc`.
     pub(crate) code: &'a str,
+    /// The echo of a value carries its JSON form too (`buck2 repl --json`).
+    pub(crate) json_values: bool,
 }
 
 /// A failed request, rendered.
@@ -346,8 +356,8 @@ pub(crate) fn render<'v>(
     let type_name = || truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES).to_owned();
     Ok(match mode {
         RenderMode::Echo if v.is_none() => Rendered::Nothing,
-        RenderMode::Echo => Rendered::Value(
-            render_value(
+        RenderMode::Echo => {
+            let mut value = render_value(
                 v,
                 cx.core,
                 MAX_TEXT_BYTES,
@@ -355,8 +365,12 @@ pub(crate) fn render<'v>(
                 &cx.budget,
             )
             .map_err(interrupted)?
-            .into_value(type_name()),
-        ),
+            .into_value(type_name());
+            if cx.json_values {
+                value.json = json_form(v, cx.core, &cx.budget);
+            }
+            Rendered::Value(value)
+        }
         RenderMode::Print => Rendered::Text(
             render_value(v, cx.core, MAX_STREAM_BYTES, MAX_PRETTY_DEPTH, &cx.budget)
                 .map_err(interrupted)?
@@ -475,6 +489,7 @@ fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
             type_name,
             text: out.into_string(),
             truncated: false,
+            json: None,
         };
     }
     // A `CappedString` never fails; an error from a `Display` impl just ends the text.
@@ -487,6 +502,7 @@ fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {
         type_name,
         text: out.into_string(),
         truncated,
+        json: None,
     }
 }
 
@@ -562,6 +578,34 @@ fn render_json(v: Value, budget: &RenderBudget<'_>) -> Result<RenderedText, Repl
     .into_text())
 }
 
+/// The JSON form of a value for `buck2 repl --json`: compact JSON, if the value has one (as for
+/// `:json`) of at most [`MAX_JSON_BYTES`], and if it is done within the budget. An ensured
+/// artifact is its path (as it is echoed); the other values shown as a summary (`ctx`, target
+/// nodes, ...) have none.
+fn json_form(v: Value, core: &BxlContextCoreData, budget: &RenderBudget<'_>) -> Option<String> {
+    if v.downcast_ref::<EnsuredArtifact>().is_some() {
+        return summary(v, core).and_then(|path| serde_json::to_string(&path).ok());
+    }
+    if summary(v, core).is_some() {
+        return None;
+    }
+    let mut out = CappedBytes {
+        buf: Vec::new(),
+        cap: MAX_JSON_BYTES,
+        full: false,
+        budget,
+        writes: 0,
+        stopped: None,
+    };
+    // The serializer of Starlark values stops at cycles and before it runs out of native stack;
+    // the writer stops it at the cap and when the budget is spent.
+    serde_json::to_writer(&mut out, &v).ok()?;
+    if out.full || out.stopped.is_some() {
+        return None;
+    }
+    String::from_utf8(out.buf).ok()
+}
+
 /// A byte buffer that keeps at most `cap` bytes, and fails the write that reaches the cap (or
 /// that finds the budget spent), which stops the serializer writing into it.
 struct CappedBytes<'a> {
@@ -613,7 +657,7 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
         Some(documentation(v, cx))
     };
     let (name, item) = match documentation {
-        Some(Documentation::Own(item)) => (code_name.to_owned(), item),
+        Some(Documentation::Own(item)) => (code_name.to_owned(), *item),
         Some(Documentation::Instance(property)) => {
             // An instance: its documentation only names its type.
             let type_name = property
@@ -652,8 +696,9 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
 
 /// What `:doc` knows of a value.
 enum Documentation {
-    /// The value's own documentation: a function's, a type's, a namespace's, ...
-    Own(DocItem),
+    /// The value's own documentation: a function's, a type's, a namespace's, ... (boxed: it is
+    /// large).
+    Own(Box<DocItem>),
     /// The value is an instance: its documentation only names its type.
     Instance(DocProperty),
 }
@@ -661,7 +706,7 @@ enum Documentation {
 impl Documentation {
     fn into_item(self) -> DocItem {
         match self {
-            Documentation::Own(item) => item,
+            Documentation::Own(item) => *item,
             Documentation::Instance(property) => DocItem::Member(DocMember::Property(property)),
         }
     }
@@ -693,10 +738,9 @@ fn documentation<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> Documentation 
                     let docs = function_name(v, &cx.budget)
                         .and_then(|name| cx.docstrings.get(&name))
                         .and_then(|raw| DocString::from_docstring(DocStringKind::Starlark, raw));
-                    return Documentation::Own(DocItem::Member(DocMember::Property(DocProperty {
-                        docs,
-                        typ,
-                    })));
+                    return Documentation::Own(Box::new(DocItem::Member(DocMember::Property(
+                        DocProperty { docs, typ },
+                    ))));
                 }
             }
             "namespace" => {
@@ -708,10 +752,10 @@ fn documentation<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> Documentation 
                         Some((name, documentation(member, cx).into_item()))
                     })
                     .collect();
-                return Documentation::Own(DocItem::Module(DocModule {
+                return Documentation::Own(Box::new(DocItem::Module(DocModule {
                     docs: None,
                     members,
-                }));
+                })));
             }
             _ => {}
         }
@@ -722,7 +766,7 @@ fn documentation<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> Documentation 
         DocItem::Member(DocMember::Property(property)) if v.get_type() != "function" => {
             Documentation::Instance(property)
         }
-        item => Documentation::Own(item),
+        item => Documentation::Own(Box::new(item)),
     }
 }
 
@@ -855,7 +899,7 @@ fn children<'v>(v: Value<'v>, from: usize, max: usize) -> Option<Vec<Value<'v>>>
     } else if let Some(dict) = DictRef::from_value(v) {
         let entry = from / 2;
         let entries = dict.keys().skip(entry).zip(dict.values().skip(entry));
-        Some(chunk(entries.flat_map(|(k, v)| [k, v]), from % 2, max))
+        Some(chunk(entries.flat_map(<[Value; 2]>::from), from % 2, max))
     } else if let Some(s) = StructRef::from_value(v) {
         Some(chunk(s.iter().map(|(_, v)| v), from, max))
     } else {

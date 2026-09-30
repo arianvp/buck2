@@ -67,6 +67,7 @@ use crate::inputs::FirstInputs;
 use crate::inputs::Inputs;
 use crate::inputs::Mode;
 use crate::inputs::SessionIo;
+use crate::json::JsonCapture;
 use crate::run::RunEnv;
 use crate::script::ScriptMode;
 
@@ -309,6 +310,8 @@ struct ReplHandler {
     /// Writes the output, and erases the live progress of an input before the input thread
     /// prints something of it.
     console: ReplConsole,
+    /// With `--json`, the output goes into the record of its input instead.
+    json: Option<JsonCapture>,
 }
 
 #[async_trait]
@@ -323,9 +326,10 @@ impl PartialResultHandler for ReplHandler {
         let id = message.id;
         // Send errors mean the input thread is gone, which the call's result reports.
         match message.message {
-            Some(repl_message::Message::Output(output)) => {
-                self.console.write_output(&output).await?
-            }
+            Some(repl_message::Message::Output(output)) => match &self.json {
+                Some(capture) => capture.write(output.channel(), &output.data),
+                None => self.console.write_output(&output).await?,
+            },
             Some(repl_message::Message::Ready(ready)) => {
                 let _ignored = self.ui_tx.send(UiEvent::Ready(ready));
             }
@@ -365,27 +369,29 @@ async fn sigint_loop(
             // No handler could be installed: SIGINT keeps its default action.
             return futures::future::pending().await;
         }
-        let mut inner = ui.lock();
-        let presses = match &mut inner.state {
-            UiState::Idle => return,
-            UiState::Editor | UiState::Child => continue,
-            UiState::Busy { id, presses } => {
-                *presses = presses.saturating_add(1);
-                if *presses == 1
-                    && let Some(req_tx) = req_tx.upgrade()
-                {
-                    // Fails only if the call is over, which ends this loop anyway.
-                    let _ignored = req_tx.send(ReplRequest {
-                        id: next_id.fetch_add(1, Ordering::Relaxed),
-                        request: Some(repl_request::Request::Interrupt(ReplInterrupt {
-                            target_id: *id,
-                        })),
-                    });
+        // The lock is released before the messages are printed.
+        let presses = {
+            let mut inner = ui.lock();
+            match &mut inner.state {
+                UiState::Idle => return,
+                UiState::Editor | UiState::Child => continue,
+                UiState::Busy { id, presses } => {
+                    *presses = presses.saturating_add(1);
+                    if *presses == 1
+                        && let Some(req_tx) = req_tx.upgrade()
+                    {
+                        // Fails only if the call is over, which ends this loop anyway.
+                        let _ignored = req_tx.send(ReplRequest {
+                            id: next_id.fetch_add(1, Ordering::Relaxed),
+                            request: Some(repl_request::Request::Interrupt(ReplInterrupt {
+                                target_id: *id,
+                            })),
+                        });
+                    }
+                    *presses
                 }
-                *presses
             }
         };
-        drop(inner);
         // Output errors do not matter here: the input thread reports them.
         match presses {
             1 => {
@@ -458,6 +464,7 @@ pub(crate) async fn run(
             .await;
     }
 
+    let json = cmd.json.then(|| cmd.json_capture.dupe());
     let open = ReplRequest {
         id: OPEN_ID,
         request: Some(repl_request::Request::Open(ReplOpen {
@@ -485,6 +492,7 @@ pub(crate) async fn run(
         ui: ui.dupe(),
         shutdown: shutdown.dupe(),
         run_env,
+        json: json.dupe(),
     };
     let first = FirstInputs {
         files: cmd.files,
@@ -519,6 +527,7 @@ pub(crate) async fn run(
         ui_tx,
         compl_tx,
         console: console.dupe(),
+        json,
     };
     let result = {
         let mut client = buckd.with_flushing();

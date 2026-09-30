@@ -205,7 +205,7 @@ impl OutputStreamState {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *guard, Some(OutputStreamStateInner::default()))
+            guard.replace(OutputStreamStateInner::default())
         };
         match state {
             Some(state) => Self::into_outcome(state),

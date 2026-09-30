@@ -68,7 +68,7 @@ impl Default for Settings {
 
 impl Settings {
     /// The value of the client's setting `name`, as `:set` shows it.
-    pub(crate) fn value(&self, name: &str, completer: &Completer) -> String {
+    pub(crate) fn value(self, name: &str, completer: &Completer) -> String {
         match name {
             "color" => self.color.as_str().to_owned(),
             "timing" => self.timing.as_str().to_owned(),
@@ -129,7 +129,7 @@ impl Settings {
     }
 
     /// The client's settings (or the one named), one line each.
-    pub(crate) fn show(&self, key: Option<&SettingSpec>, completer: &Completer) -> String {
+    pub(crate) fn show(self, key: Option<&SettingSpec>, completer: &Completer) -> String {
         SETTINGS
             .iter()
             .filter(|s| s.side == SettingSide::Client && key.is_none_or(|k| k.name == s.name))

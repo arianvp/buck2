@@ -32,6 +32,7 @@ use buck2_cli_proto::ReplNotice;
 use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_done;
+use buck2_cli_proto::repl_output;
 use buck2_cli_proto::repl_request;
 use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::Handler;
@@ -43,10 +44,14 @@ use buck2_repl_syntax::commands::parse_set_args;
 use buck2_repl_syntax::commands::split_args;
 use buck2_repl_syntax::commands::split_command_token;
 use buck2_repl_syntax::text::truncate_to_bytes;
+use dupe::Dupe;
 
 use crate::complete::Completer;
 use crate::complete::complete_command;
 use crate::help;
+use crate::json::ClientError;
+use crate::json::JsonCapture;
+use crate::json::JsonRecord;
 use crate::render;
 use crate::render::Rendered;
 use crate::render::Style;
@@ -152,6 +157,14 @@ pub(crate) struct SessionIo {
     pub(crate) ui: SharedUi,
     pub(crate) shutdown: ShutdownHangup,
     pub(crate) run_env: RunEnv,
+    /// `--json`: what inputs write is captured here.
+    pub(crate) json: Option<JsonCapture>,
+}
+
+/// `--json`: the record of the input that runs.
+struct JsonState {
+    capture: JsonCapture,
+    record: Option<JsonRecord>,
 }
 
 /// Reads and evaluates inputs, on the input thread.
@@ -170,6 +183,8 @@ pub(crate) struct Inputs {
     history: InputHistory,
     /// The scratch buffer of `:edit`, as last edited.
     scratch: String,
+    /// With `--json`, every input prints one JSON object instead of its results.
+    json: Option<JsonState>,
     pub(crate) outcome: InputOutcome,
 }
 
@@ -183,6 +198,7 @@ impl Inputs {
             ui,
             shutdown,
             run_env,
+            json,
         } = io;
         Inputs {
             req_tx,
@@ -197,7 +213,48 @@ impl Inputs {
             number: 0,
             history: InputHistory::default(),
             scratch: String::new(),
+            json: json.map(|capture| JsonState {
+                capture,
+                record: None,
+            }),
             outcome: InputOutcome::default(),
+        }
+    }
+
+    /// The record of the input that runs (`--json`).
+    fn record(&mut self) -> Option<&mut JsonRecord> {
+        self.json.as_mut().and_then(|json| json.record.as_mut())
+    }
+
+    /// Where the output of the input that runs goes (`--json`).
+    fn json_capture(&self) -> Option<JsonCapture> {
+        self.json.as_ref().map(|json| json.capture.dupe())
+    }
+
+    /// Runs one input. With `--json`, it gets a record, printed once it is done.
+    fn recorded(
+        &mut self,
+        input: &str,
+        file: Option<&str>,
+        run: impl FnOnce(&mut Self) -> Next,
+    ) -> Next {
+        match &mut self.json {
+            None => return run(self),
+            Some(json) => {
+                json.record = Some(JsonRecord::new(input.to_owned(), file.map(str::to_owned)))
+            }
+        }
+        let next = run(self);
+        let Some(json) = &mut self.json else {
+            return next;
+        };
+        let Some(record) = json.record.take() else {
+            return next;
+        };
+        let line = record.into_line(json.capture.take());
+        match self.continue_if(render::print_text(&line).and_then(|()| render::flush())) {
+            Next::Stop => Next::Stop,
+            Next::Continue => next,
         }
     }
 
@@ -300,11 +357,21 @@ impl Inputs {
 
     /// Prints `text` on stdout.
     fn print(&mut self, text: &str) -> Next {
+        if let Some(json) = &self.json {
+            json.capture
+                .write_line(repl_output::Channel::Stdout, text.trim_end_matches('\n'));
+            return Next::Continue;
+        }
         self.continue_if(render::print_text(text).and_then(|()| render::flush()))
     }
 
     /// Prints a note on stderr.
     fn note(&mut self, text: &str) -> Next {
+        if let Some(json) = &self.json {
+            json.capture
+                .write_line(repl_output::Channel::Stderr, text.trim_end_matches('\n'));
+            return Next::Continue;
+        }
         let printed = render::print_note(self.style(), text);
         self.continue_if(printed)
     }
@@ -325,8 +392,17 @@ impl Inputs {
         }
     }
 
-    /// An input failed with `message` (which starts with `error: `).
+    /// An input failed with `message` (which starts with `error: `): its usage was wrong.
     fn error(&mut self, message: &str) -> Next {
+        self.fail(ClientError::Usage, message)
+    }
+
+    /// An input failed with `message` (which starts with `error: `) for a reason of `kind`.
+    fn fail(&mut self, kind: ClientError, message: &str) -> Next {
+        if let Some(record) = self.record() {
+            record.fail(kind, message);
+            return self.failed();
+        }
         let printed = render::print_error(self.style(), message);
         if !self.output(printed) {
             return Next::Stop;
@@ -352,26 +428,49 @@ impl Inputs {
     /// A file of the command line: a `.bzl` or `.bxl` file is loaded as `:load` loads it (every
     /// public symbol becomes a binding); anything else is evaluated as one input.
     fn preload(&mut self, file: &str) -> Next {
+        // The input is the file's code once it is read.
+        self.recorded(file, Some(file), |this| this.preload_file(file))
+    }
+
+    fn preload_file(&mut self, file: &str) -> Next {
         if file.ends_with(".bzl") || file.ends_with(".bxl") {
-            let quoted = shlex::try_quote(file).map_or_else(|_| file.into(), |q| q);
-            return self.eval(format!(":load {quoted}"));
+            let quoted = shlex::try_quote(file).unwrap_or_else(|_| file.into());
+            let input = format!(":load {quoted}");
+            if let Some(record) = self.record() {
+                record.set_input(&input);
+            }
+            return self.eval_input(input);
         }
         let path = self.run_env.cwd.join(file);
         match std::fs::read_to_string(&path) {
-            Ok(code) => match starts_with_command(&code) {
-                Some(command) => self.error(&format!(
-                    "error: `{file}` starts with the command `:{command}`, but a file is \
-                     evaluated as one Starlark input, which cannot hold commands; feed it on \
-                     stdin instead (`buck2 repl < {file}`), or give commands with -e"
-                )),
-                None => self.send(code.clone(), &code),
-            },
-            Err(e) => self.error(&format!("error: cannot read `{file}`: {e}")),
+            Ok(code) => {
+                if let Some(record) = self.record() {
+                    record.set_input(&code);
+                }
+                match starts_with_command(&code) {
+                    Some(command) => self.error(&format!(
+                        "error: `{file}` starts with the command `:{command}`, but a file is \
+                         evaluated as one Starlark input, which cannot hold commands; feed it \
+                         on stdin instead (`buck2 repl < {file}`), or give commands with -e"
+                    )),
+                    None => self.send(code.clone(), &code),
+                }
+            }
+            Err(e) => self.fail(
+                ClientError::Io,
+                &format!("error: cannot read `{file}`: {e}"),
+            ),
         }
     }
 
-    /// Evaluates one input and renders its result.
+    /// Evaluates one input and renders its result (with `--json`, prints its record).
     pub(crate) fn eval(&mut self, input: String) -> Next {
+        let typed = input.clone();
+        self.recorded(&typed, None, |this| this.eval_input(input))
+    }
+
+    /// Evaluates one input and renders its result.
+    fn eval_input(&mut self, input: String) -> Next {
         match parse_command(&input) {
             Ok(Some(command)) => match command.spec.id {
                 CommandId::Quit => return Next::Stop,
@@ -402,6 +501,9 @@ impl Inputs {
                     };
                 }
                 CommandId::Shell => {
+                    if let Some(capture) = self.json_capture() {
+                        return self.shell_captured(&command.arg, &capture);
+                    }
                     let rendered = run::run_shell(
                         &command.arg,
                         &self.run_env,
@@ -442,9 +544,9 @@ impl Inputs {
                     if command.spec.handler == Handler::Client
                         || command.spec.id == CommandId::Set =>
                 {
-                    return self.eval(input);
+                    return self.eval_input(input);
                 }
-                Err(_) => return self.eval(input),
+                Err(_) => return self.eval_input(input),
                 Ok(_) => break,
             }
         }
@@ -472,7 +574,11 @@ impl Inputs {
                 self.completer.clear_listings();
                 self.number = self.number.saturating_add(1);
                 self.history.push(self.number, typed);
-                self.number
+                let number = self.number;
+                if let Some(record) = self.record() {
+                    record.set_number(number);
+                }
+                number
             }
             None => 0,
         };
@@ -483,17 +589,23 @@ impl Inputs {
         };
         let start = Instant::now();
         self.ui.set(UiState::Busy { id, presses: 0 });
-        if self.req_tx.send(request).is_err() {
-            self.outcome.lost = true;
-            return None;
-        }
-        let done = self.wait_for_done(id);
+        let done = if self.req_tx.send(request).is_ok() {
+            self.wait_for_done(id)
+        } else {
+            None
+        };
         self.ui.set(self.idle_state());
         let total = Instant::now() - start;
         match done {
             Some(done) => Some((done, total)),
             None => {
                 self.outcome.lost = true;
+                if let Some(record) = self.record() {
+                    record.fail(
+                        ClientError::Lost,
+                        "error: the repl session ended before this input was answered",
+                    );
+                }
                 None
             }
         }
@@ -506,8 +618,12 @@ impl Inputs {
             match self.ui_rx.recv() {
                 Ok(UiEvent::Done(done_id, done)) if done_id == id => return Some(done),
                 Ok(UiEvent::Notice(notice)) => {
-                    let printed = render::print_notice(self.style(), &notice);
-                    self.output(printed);
+                    if let Some(record) = self.record() {
+                        record.notice(&notice);
+                    } else {
+                        let printed = render::print_notice(self.style(), &notice);
+                        self.output(printed);
+                    }
                 }
                 Ok(UiEvent::Done(..) | UiEvent::Ready(_)) => {}
                 Ok(UiEvent::SessionEnded) | Err(_) => return None,
@@ -528,6 +644,14 @@ impl Inputs {
         } else {
             self.style()
         };
+        if let Some(record) = self.record() {
+            // Recorded; the program of `:run` is not run.
+            record.done(done);
+            if show_timing {
+                self.note(&render::timing(total, done));
+            }
+            return self.after_rendered(Ok(render::outcome(done)));
+        }
         let rendered = render::render_done(done, style).and_then(|r| {
             let r = match r {
                 Rendered::Run(run) => {
@@ -536,11 +660,33 @@ impl Inputs {
                 r => r,
             };
             if show_timing {
-                render::print_timing(style, total, done)?;
+                render::print_note(style, &render::timing(total, done))?;
             }
             render::flush().map(|()| r)
         });
         self.after_rendered(rendered)
+    }
+
+    /// `:!<command>` with `--json`: what the command writes goes into the record.
+    fn shell_captured(&mut self, command: &str, capture: &JsonCapture) -> Next {
+        let status =
+            run::run_shell_captured(command, &self.run_env, &self.ui, self.idle_state(), capture);
+        match status {
+            Err(message) => self.fail(ClientError::Io, &format!("error: {message}")),
+            Ok(status) => match run::describe(status) {
+                (_, Rendered::Ok) => Next::Continue,
+                (how, Rendered::Interrupted) => {
+                    if let Some(record) = self.record() {
+                        record.fail(
+                            ClientError::Interrupted,
+                            &format!("error: the command {how}"),
+                        );
+                    }
+                    self.after_rendered(Ok(Rendered::Interrupted))
+                }
+                (how, _) => self.fail(ClientError::Exit, &format!("error: the command {how}")),
+            },
+        }
     }
 
     /// Whether the session goes on after an input that was rendered.
@@ -655,40 +801,47 @@ impl Inputs {
                 Err(next) => return next,
             }
         };
+        let capture = self.json_capture();
         if let Err(message) = run::run_editor(
             &target.path,
             target.line,
             &self.run_env,
             &self.ui,
             self.idle_state(),
+            capture.as_ref(),
         ) {
-            return self.error(&format!("error: {message}"));
+            return self.fail(ClientError::Io, &format!("error: {message}"));
         }
         if !target.module {
             return Next::Continue;
         }
         // Loaded again if the session loads it (directly or through another module).
         let path = target.path.to_string_lossy().into_owned();
-        let quoted = shlex::try_quote(&path).map_or_else(|_| path.clone().into(), |q| q);
+        let quoted = shlex::try_quote(&path).unwrap_or_else(|_| path.clone().into());
         self.send(format!(":__edited {quoted}"), typed)
     }
 
     /// Where a target is defined, or where a module is, as the daemon says.
     fn locate(&mut self, what: &str) -> Result<EditTarget, Next> {
-        let quoted = shlex::try_quote(what).map_or_else(|_| what.into(), |q| q);
+        let quoted = shlex::try_quote(what).unwrap_or_else(|_| what.into());
         let Some((done, _)) = self.request(format!(":__locate {quoted}"), None) else {
             return Err(Next::Stop);
         };
         let location = match &done.outcome {
             Some(repl_done::Outcome::Value(value)) => {
                 // Not shown by the next input: the daemon compares with this request.
-                let printed = render::print_sources_changed(&done, self.style());
-                if !self.output(printed) {
+                if done.sources_changed
+                    && let Next::Stop = self.note(render::SOURCES_CHANGED)
+                {
                     return Err(Next::Stop);
                 }
                 serde_json::from_str::<serde_json::Value>(&value.text).ok()
             }
             Some(repl_done::Outcome::Error(_)) => {
+                if let Some(record) = self.record() {
+                    record.done(&done);
+                    return Err(self.after_rendered(Ok(render::outcome(&done))));
+                }
                 let rendered = render::render_done(&done, self.style());
                 return Err(self.after_rendered(rendered));
             }
@@ -699,11 +852,9 @@ impl Inputs {
             .as_ref()
             .and_then(|l| l.get("warning"))
             .and_then(|w| w.as_str())
+            && let Next::Stop = self.note(&format!("warning: {warning}"))
         {
-            let printed = render::print_note(self.style(), &format!("warning: {warning}"));
-            if !self.output(printed) {
-                return Err(Next::Stop);
-            }
+            return Err(Next::Stop);
         }
         let path = location
             .as_ref()
@@ -731,7 +882,10 @@ impl Inputs {
         let (path, file) = match scratch_file() {
             Ok(created) => created,
             Err(e) => {
-                return self.error(&format!("error: cannot create the scratch buffer: {e}"));
+                return self.fail(
+                    ClientError::Io,
+                    &format!("error: cannot create the scratch buffer: {e}"),
+                );
             }
         };
         let written = {
@@ -743,17 +897,27 @@ impl Inputs {
                 "cannot write the scratch buffer `{}`: {e}",
                 path.display()
             )),
-            Ok(()) => run::run_editor(&path, None, &self.run_env, &self.ui, self.idle_state())
+            Ok(()) => {
+                let capture = self.json_capture();
+                run::run_editor(
+                    &path,
+                    None,
+                    &self.run_env,
+                    &self.ui,
+                    self.idle_state(),
+                    capture.as_ref(),
+                )
                 .and_then(|()| {
                     std::fs::read_to_string(&path).map_err(|e| {
                         format!("cannot read the scratch buffer `{}`: {e}", path.display())
                     })
-                }),
+                })
+            }
         };
         let _ignored = std::fs::remove_file(&path);
         let code = match edited {
             Ok(code) => code,
-            Err(message) => return self.error(&format!("error: {message}")),
+            Err(message) => return self.fail(ClientError::Io, &format!("error: {message}")),
         };
         self.scratch = code.clone();
         if code.trim().is_empty() {

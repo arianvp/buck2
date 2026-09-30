@@ -40,6 +40,8 @@ use crate::repl::session::Session;
 pub(crate) struct SessionConfig {
     /// Most bytes the session's heap may hold at its peak.
     pub(crate) heap_limit: usize,
+    /// Values get their JSON form too (`buck2 repl --json`).
+    pub(crate) json_values: bool,
 }
 
 pub(crate) enum Job {

@@ -202,7 +202,7 @@ enum Walk<'v> {
     /// At a value of one of these types (the names the [`TypeIndex`] knows them by).
     Types(Vec<String>),
     /// At a function that returns values of these types, and takes these parameters.
-    Function(Vec<String>, DocParams),
+    Function(Vec<String>, Box<DocParams>),
 }
 
 /// The names of the types of `ty`: one for each alternative of a union. None for `Any`.
@@ -465,7 +465,9 @@ fn walk<'v>(
             let member = names.iter().find_map(|name| types.member(name, attr))?;
             Some(match member {
                 DocMember::Property(p) => Walk::Types(type_names(&p.typ)),
-                DocMember::Function(f) => Walk::Function(type_names(&f.ret.typ), f.params.clone()),
+                DocMember::Function(f) => {
+                    Walk::Function(type_names(&f.ret.typ), Box::new(f.params.clone()))
+                }
             })
         }
         (Walk::Function(returns, _), repl_chain_step::Step::Call(_)) => Some(Walk::Types(returns)),
