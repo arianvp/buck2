@@ -46,6 +46,8 @@ pub enum CommandId {
     Edit,
     Ls,
     Qdoc,
+    Locate,
+    Edited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,15 +87,17 @@ pub enum ArgKind {
     Targets,
     /// `[--print] <target> [-- args…]`, shell-split (see [`parse_run_args`]).
     Run,
-    /// A file path or label (`:load <label> [symbol…]`, `:edit [path]`).
+    /// A module to load: a label or a path (`:load <label> [symbol…]`).
     Path,
+    /// A file to edit: a path, a target (its build file) or a module label (`:edit`).
+    File,
     /// A JSON object.
     Json,
     /// `<file.bxl:function> [-- args…]`.
     BxlLabel,
     /// `[key [value]]`.
     Setting,
-    /// A glob over binding names.
+    /// Globs over binding names.
     Glob,
     /// A count.
     Count,
@@ -147,11 +151,6 @@ impl CommandSpec {
     /// The name with its colon, e.g. `:build`.
     pub fn display_name(&self) -> String {
         format!(":{}", self.name)
-    }
-
-    /// Whether the command is implemented: the P0 commands, and the P1 commands done so far.
-    pub fn is_available(&self) -> bool {
-        self.priority == Priority::P0 || matches!(self.id, CommandId::Bxl)
     }
 }
 
@@ -380,7 +379,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "info",
         ["i"],
         ":info <target>",
-        "Show a target's rule type, attributes and build file",
+        "Show a target's rule type, build file, attributes and deps",
         ArgKind::Target,
         true,
         Server,
@@ -390,8 +389,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         Set,
         "set",
         [],
-        ":set [key [value]]",
-        "Show or change session settings",
+        ":set [key [value...]]",
+        "Show or change the session's settings (target platform, colour, ...)",
         ArgKind::Setting,
         false,
         Both,
@@ -401,8 +400,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         Who,
         "who",
         ["vars"],
-        ":who [glob]",
-        "List the session's bindings",
+        ":who [glob...]",
+        "List the session's bindings with their types",
         ArgKind::Glob,
         false,
         Server,
@@ -413,7 +412,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "hist",
         ["history"],
         ":hist [n]",
-        "Show the input history, numbered like `<repl:N>`",
+        "Show the inputs of the session, numbered like `<repl:N>`",
         ArgKind::Count,
         false,
         Client,
@@ -434,9 +433,9 @@ pub static COMMANDS: &[CommandSpec] = &[
         Edit,
         "edit",
         ["e"],
-        ":edit [path]",
-        "Edit a file and reload it, or edit a scratch buffer and evaluate it",
-        ArgKind::Path,
+        ":edit [path|target]",
+        "Edit a file or a target's build file, or a scratch buffer to run",
+        ArgKind::File,
         false,
         Client,
         P1
@@ -446,7 +445,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "ls",
         [],
         ":ls [package]",
-        "List the targets in a package, with their rule types",
+        "List the targets of a package, with their rule types",
         ArgKind::Package,
         false,
         Server,
@@ -456,12 +455,36 @@ pub static COMMANDS: &[CommandSpec] = &[
         Qdoc,
         "qdoc",
         [],
-        ":qdoc [function]",
-        "Show the documentation of query functions",
+        ":qdoc [function|language]",
+        "Show the documentation of the query functions",
         ArgKind::QueryFunction,
         false,
         Server,
         P1
+    ),
+    command!(
+        Locate,
+        "__locate",
+        [],
+        ":__locate <target|module>",
+        "Print where a target is defined, or where a module is, as JSON",
+        ArgKind::Target,
+        true,
+        Server,
+        P1,
+        hidden
+    ),
+    command!(
+        Edited,
+        "__edited",
+        [],
+        ":__edited <absolute path>",
+        "Load the loaded modules again if the file is one of them (or loaded by one)",
+        ArgKind::File,
+        true,
+        Server,
+        P1,
+        hidden
     ),
 ];
 
@@ -649,6 +672,10 @@ pub enum ArgError {
     MissingBxlFunction,
     /// A word after the BXL function, before `--`.
     ExtraBxlArgument(String),
+    /// `:set` of a setting that does not exist.
+    UnknownSetting(String),
+    /// `:hist` of something that is not a count.
+    NotACount(String),
 }
 
 impl fmt::Display for ArgError {
@@ -671,6 +698,17 @@ impl fmt::Display for ArgError {
                 f,
                 "unexpected argument `{a}` (arguments for the BXL function go after `--`)"
             ),
+            ArgError::UnknownSetting(key) => {
+                write!(f, "unknown setting `{key}`; the settings are ")?;
+                for (i, s) in SETTINGS.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", s.name)?;
+                }
+                Ok(())
+            }
+            ArgError::NotACount(a) => write!(f, "`{a}` is not a number of inputs"),
         }
     }
 }
@@ -782,6 +820,123 @@ pub fn split_bxl_function(word: &str) -> Option<(&str, &str)> {
     file.ends_with(".bxl").then_some((file, function))
 }
 
+/// Parses the argument of `:hist`: nothing (every input) or a count.
+pub fn parse_count(arg: &str) -> Result<Option<usize>, ArgError> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    match arg.parse::<usize>() {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(ArgError::NotACount(arg.to_owned())),
+    }
+}
+
+/// Where a setting of `:set` lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingSide {
+    /// The daemon keeps it (it changes what the session computes).
+    Server,
+    /// The client keeps it (it changes how results are shown).
+    Client,
+}
+
+/// A setting of `:set`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct SettingSpec {
+    pub name: &'static str,
+    pub side: SettingSide,
+    /// The values it takes, e.g. `auto|on|off`.
+    pub values: &'static str,
+    /// The words it takes, for completion (empty if it takes any word).
+    pub choices: &'static [&'static str],
+    pub summary: &'static str,
+}
+
+/// The settings of `:set`, in the order `:set` lists them.
+pub static SETTINGS: &[SettingSpec] = &[
+    SettingSpec {
+        name: "target_platforms",
+        side: SettingSide::Server,
+        values: "<target>|\"\"",
+        choices: &[],
+        summary: "the target platform that configures targets (`ctx`, queries, :build, :run, \
+                  :bxl), as --target-platforms; \"\" for the default",
+    },
+    SettingSpec {
+        name: "modifiers",
+        side: SettingSide::Server,
+        values: "<modifier>...|\"\"",
+        choices: &[],
+        summary: "the configuration modifiers of every target, as -m; \"\" for none",
+    },
+    SettingSpec {
+        name: "color",
+        side: SettingSide::Client,
+        values: "auto|on|off",
+        choices: &["auto", "on", "off"],
+        summary: "colour errors and notes (auto: interactively, on a terminal, unless NO_COLOR \
+                  is set)",
+    },
+    SettingSpec {
+        name: "timing",
+        side: SettingSide::Client,
+        values: "auto|on|off",
+        choices: &["auto", "on", "off"],
+        summary: "show how long inputs take (auto: interactively, those that take a second or \
+                  more; on: every input, as :time does)",
+    },
+    SettingSpec {
+        name: "completion_timeout_ms",
+        side: SettingSide::Client,
+        values: "<milliseconds>|auto",
+        choices: &["auto"],
+        summary: "how long Tab waits for the daemon (auto: 500 for names, 1000 for targets and \
+                  modules)",
+    },
+];
+
+/// Width of the name column when `:set` lists the settings.
+pub const SETTING_NAME_WIDTH: usize = 22;
+
+/// The setting named exactly `name`.
+pub fn setting(name: &str) -> Option<&'static SettingSpec> {
+    SETTINGS.iter().find(|s| s.name == name)
+}
+
+/// The argument of `:set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetArgs {
+    /// `None`: list every setting.
+    pub key: Option<&'static SettingSpec>,
+    /// `None`: show the setting. `Some`: its new value, shell-split (`[""]` for `""`).
+    pub value: Option<Vec<String>>,
+}
+
+/// Parses `[key [value...]]`.
+pub fn parse_set_args(arg: &str) -> Result<SetArgs, ArgError> {
+    let mut words = split_args(arg)?.into_iter();
+    let Some(key) = words.next() else {
+        return Ok(SetArgs {
+            key: None,
+            value: None,
+        });
+    };
+    let Some(spec) = setting(&key) else {
+        return Err(ArgError::UnknownSetting(key));
+    };
+    let value: Vec<String> = words.collect();
+    Ok(SetArgs {
+        key: Some(spec),
+        value: (!value.is_empty()).then_some(value),
+    })
+}
+
+/// A line of the listing of `:set`: the name of the setting and its value.
+pub fn setting_line(name: &str, value: &str) -> String {
+    format!("{name:<SETTING_NAME_WIDTH$} {value}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -822,7 +977,7 @@ mod tests {
                 assert!(!c.arg_required);
             }
         }
-        assert_eq!(COMMANDS.len(), 26);
+        assert_eq!(COMMANDS.len(), 28);
         assert_eq!(
             COMMANDS
                 .iter()
@@ -1095,10 +1250,65 @@ mod tests {
     }
 
     #[test]
-    fn test_available() {
-        assert!(command(CommandId::Build).unwrap().is_available());
-        assert!(command(CommandId::Bxl).unwrap().is_available());
-        assert!(!command(CommandId::Info).unwrap().is_available());
+    fn test_hidden() {
+        assert_eq!(parsed_id(":__locate //:x"), CommandId::Locate);
+        assert_eq!(parsed_id(":__edited /a/b.bzl"), CommandId::Edited);
+        assert!(command(CommandId::Locate).unwrap().hidden);
+        // `:e` is `:edit`, `:i` is `:info`, not a prefix of a hidden command.
+        assert_eq!(parsed_id(":e"), CommandId::Edit);
+        assert_eq!(parsed_id(":i //:x"), CommandId::Info);
+        assert_eq!(parsed_id(":ed"), CommandId::Edit);
+        assert_eq!(parsed_id(":hist 3"), CommandId::Hist);
+        assert_eq!(parsed_id(":history"), CommandId::Hist);
+        assert_eq!(parsed_id(":qd"), CommandId::Qdoc);
+    }
+
+    #[test]
+    fn test_count() {
+        assert_eq!(parse_count(""), Ok(None));
+        assert_eq!(parse_count(" 12 "), Ok(Some(12)));
+        assert_eq!(parse_count("x"), Err(ArgError::NotACount("x".to_owned())));
+        assert_eq!(parse_count("-1"), Err(ArgError::NotACount("-1".to_owned())));
+    }
+
+    #[test]
+    fn test_set_args() {
+        assert_eq!(
+            parse_set_args("").unwrap(),
+            SetArgs {
+                key: None,
+                value: None
+            }
+        );
+        let args = parse_set_args("color").unwrap();
+        assert_eq!(args.key.map(|s| s.name), Some("color"));
+        assert_eq!(args.value, None);
+        let args = parse_set_args("target_platforms //p:x").unwrap();
+        assert_eq!(args.key.map(|s| s.side), Some(SettingSide::Server));
+        assert_eq!(args.value, Some(vec!["//p:x".to_owned()]));
+        assert_eq!(
+            parse_set_args("modifiers ''").unwrap().value,
+            Some(vec![String::new()])
+        );
+        assert_eq!(
+            parse_set_args("modifiers a b").unwrap().value,
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+        let err = parse_set_args("nope 1").unwrap_err();
+        assert_eq!(err, ArgError::UnknownSetting("nope".to_owned()));
+        assert!(
+            err.to_string()
+                .contains("target_platforms, modifiers, color")
+        );
+        assert_eq!(parse_set_args("color 'x"), Err(ArgError::Quoting));
+        assert_eq!(
+            setting_line("color", "on"),
+            format!("color{}on", " ".repeat(18))
+        );
+        // Every setting has a unique name.
+        let names: HashSet<&str> = SETTINGS.iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), SETTINGS.len());
+        assert!(SETTINGS.iter().all(|s| s.name.len() < SETTING_NAME_WIDTH));
     }
 
     #[test]

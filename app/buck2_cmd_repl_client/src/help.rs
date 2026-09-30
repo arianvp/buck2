@@ -16,6 +16,7 @@ use buck2_repl_syntax::commands::COMMANDS;
 use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::CommandSpec;
 use buck2_repl_syntax::commands::HELP_TOPICS;
+use buck2_repl_syntax::commands::SETTINGS;
 use buck2_repl_syntax::commands::resolve_command;
 
 /// The text of `:help [topic]`, or an error message (without `error: `) for an unknown topic.
@@ -44,9 +45,9 @@ pub(crate) fn help(topic: &str) -> Result<String, String> {
     }
 }
 
-/// The commands `:help` shows: those available (most P1 commands are not implemented yet).
+/// The commands `:help` shows: all but the hidden ones.
 fn listed(spec: &CommandSpec) -> bool {
-    !spec.hidden && spec.is_available()
+    !spec.hidden
 }
 
 fn aliases(spec: &CommandSpec) -> String {
@@ -94,6 +95,15 @@ fn command(spec: &CommandSpec) -> String {
         let _ignored = write!(out, "    (also {})", aliases(spec));
     }
     let _ignored = write!(out, "\n{}.\n\n{}", spec.summary, wrap(details(spec.id)));
+    if spec.id == CommandId::Set {
+        out.push_str("\n\nSettings:");
+        for setting in SETTINGS {
+            let _ignored = write!(out, "\n  {} {}", setting.name, setting.values);
+            for line in wrap_at(setting.summary, WRAP_COLUMNS - 6).lines() {
+                let _ignored = write!(out, "\n      {line}");
+            }
+        }
+    }
     out
 }
 
@@ -102,6 +112,11 @@ const WRAP_COLUMNS: usize = 88;
 
 /// Wraps the lines of `text` at [`WRAP_COLUMNS`], at spaces.
 fn wrap(text: &str) -> String {
+    wrap_at(text, WRAP_COLUMNS)
+}
+
+/// Wraps the lines of `text` at `columns`, at spaces.
+fn wrap_at(text: &str, columns: usize) -> String {
     let mut out = String::new();
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
@@ -110,7 +125,7 @@ fn wrap(text: &str) -> String {
         let mut width = 0;
         for (j, word) in line.split(' ').enumerate() {
             if j > 0 {
-                if width + 1 + word.len() > WRAP_COLUMNS {
+                if width + 1 + word.len() > columns {
                     out.push('\n');
                     width = 0;
                 } else {
@@ -218,7 +233,59 @@ fn details(id: CommandId) -> &'static str {
              function ensures are materialized, then its `ctx.output.print` output is shown. \
              `_` is not changed. An edit to the file is picked up by the next `:bxl`."
         }
-        _ => "",
+        CommandId::Info => {
+            "Shows what the target graph says about a target (relative to the session's \
+             directory, like `:lib`): its label, its rule (the `.bzl` file and name of the \
+             rule), its build file and the line that defines it (as recorded with \
+             `--target-call-stacks`, else the line with its `name = \"...\"`), the attributes \
+             set in the build file, and its deps. No analysis runs."
+        }
+        CommandId::Set => {
+            "Without an argument, lists the settings and their values; with a setting, shows \
+             it; with a value, changes it for the rest of the session. The daemon keeps the \
+             target platform and the modifiers, which apply to `ctx`, the queries, \
+             `:providers`, `:build`, `:run` and `:bxl`; the client keeps the others.\n\n\
+             Example: :set target_platforms //platforms:linux"
+        }
+        CommandId::Who => {
+            "Lists the bindings of the session, sorted, each with its type and the start of its \
+             value: the names assigned, defined and loaded (with the module they were loaded \
+             from), not the prelude's, `ctx` or `_`. With globs (`*` for any characters, `?` \
+             for one), only the names that match one of them.\n\nExample: :who my_*"
+        }
+        CommandId::Hist => {
+            "Shows the inputs of the session sent to the daemon, numbered like their code is \
+             named in errors (`<repl:3>` is input 3): the last `n`, or all of them. (Up and \
+             Ctrl-R search the history of every session.)"
+        }
+        CommandId::Shell => {
+            "Runs the command with your shell (`$SHELL -c`, or `/bin/sh`) in the current \
+             directory, with the terminal: Ctrl-C goes to the command. Running `buck2` from it \
+             is fine: the session holds nothing between inputs. A command that fails (exits \
+             with another status than 0) fails the input.\n\nExample: :!ls pkg"
+        }
+        CommandId::Edit => {
+            "Opens `$VISUAL` (or `$EDITOR`, or `vi`) on a file, relative to the current \
+             directory; on the build file of a target (`:edit :lib`), at the line that defines \
+             it when known (for editors that take `+<line>`); or on a module to load \
+             (`:edit //pkg:defs.bzl`). A `.bzl` or `.bxl` file that the session loads (directly \
+             or through another module) is loaded again once the editor exits, like `:reload`.\n\n\
+             Without an argument, edits a scratch buffer (it starts with what it held after the \
+             last `:edit`) and evaluates it as one input once the editor exits."
+        }
+        CommandId::Ls => {
+            "Lists the targets of a package, with their rule types: the package of the \
+             session's directory by default, or a package relative to it (`sub`, `//pkg`), or \
+             any pattern (`//pkg/...`, `//pkg:name`). No analysis runs."
+        }
+        CommandId::Qdoc => {
+            "Without an argument, lists the functions of the query languages (as used by \
+             `:uquery`, `:cquery`, `:aquery` and `ctx.cquery().eval(...)`), with the languages \
+             that have them. With a function, shows its documentation; with `uquery`, \
+             `cquery` or `aquery`, lists the functions of that language.\n\n\
+             Example: :qdoc rdeps"
+        }
+        CommandId::Complete | CommandId::Locate | CommandId::Edited => "",
     }
 }
 
@@ -280,6 +347,12 @@ mod tests {
         assert!(help("keys").unwrap().contains("Ctrl-D"));
         assert!(help("patterns").unwrap().contains("//pkg/..."));
         assert!(help("zz").is_err());
+        let set = help("set").unwrap();
+        assert!(set.contains("\n  target_platforms <target>|\"\""), "{set}");
+        assert!(set.contains("\n  completion_timeout_ms"), "{set}");
+        assert!(set.lines().all(|l| l.len() <= WRAP_COLUMNS), "{set}");
+        assert!(all.contains(":edit [path|target]"), "{all}");
+        assert!(!all.contains(":__locate"), "{all}");
         assert_eq!(wrap("a b"), "a b");
         let long = "word ".repeat(40);
         assert!(wrap(&long).lines().all(|l| l.len() <= WRAP_COLUMNS));

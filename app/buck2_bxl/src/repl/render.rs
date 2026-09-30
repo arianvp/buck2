@@ -428,6 +428,29 @@ fn render_value(
     })
 }
 
+/// Longest preview of a value (`:who`).
+const PREVIEW_BYTES: usize = 60;
+
+/// The start of the rendering of a value, on one line, cut at [`PREVIEW_BYTES`] (then it ends
+/// with `…`). Fails only when the request is interrupted.
+pub(crate) fn preview(
+    v: Value,
+    core: &BxlContextCoreData,
+    budget: &RenderBudget<'_>,
+) -> Result<String, ReplFailure> {
+    let rendering =
+        render_value(v, core, PREVIEW_BYTES, 0, budget).map_err(|_| ReplFailure::interrupted())?;
+    let mut text: String = rendering
+        .text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if rendering.truncated || rendering.timed_out {
+        text.push('…');
+    }
+    Ok(text)
+}
+
 /// `:type`: the type the type checker gives the value (`list[str]`, `def(x: int) -> str`, ...),
 /// and what `type()` returns when that differs.
 fn render_type<'v>(v: Value<'v>, heap: Heap<'v>) -> RenderedValue {

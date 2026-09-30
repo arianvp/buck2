@@ -59,6 +59,9 @@ use buck2_repl_syntax::commands::ArgKind;
 use buck2_repl_syntax::commands::COMMANDS;
 use buck2_repl_syntax::commands::HELP_TOPICS;
 use buck2_repl_syntax::commands::QueryDialect;
+use buck2_repl_syntax::commands::SETTINGS;
+use buck2_repl_syntax::commands::SettingSide;
+use buck2_repl_syntax::commands::setting;
 use buck2_repl_syntax::commands::split_bxl_function;
 use buck2_repl_syntax::lexer::KEYWORDS;
 use buck2_repl_syntax::matching::Ranked;
@@ -85,8 +88,9 @@ const STARLARK_TIMEOUT: Duration = Duration::from_millis(500);
 /// module to load or its symbols (which may load it), or a function of a `.bxl` file.
 const TARGET_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Longest wait `BUCK2_REPL_COMPLETION_TIMEOUT_MS` may ask for.
-const MAX_TIMEOUT: Duration = Duration::from_secs(600);
+/// Longest wait `BUCK2_REPL_COMPLETION_TIMEOUT_MS` (or `:set completion_timeout_ms`) may ask
+/// for.
+pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long a listing of the daemon is used again. Inputs clear them.
 const LISTING_TTL: Duration = Duration::from_secs(10);
@@ -253,8 +257,10 @@ pub(crate) struct Completer {
     next_id: Arc<AtomicU64>,
     /// The client's working directory, which paths are relative to.
     cwd: PathBuf,
-    starlark_timeout: Duration,
-    target_timeout: Duration,
+    /// The wait for every completion from `BUCK2_REPL_COMPLETION_TIMEOUT_MS`, if set.
+    env_timeout: Option<Duration>,
+    /// The wait for every completion from `:set completion_timeout_ms`, if set.
+    timeout_override: Mutex<Option<Duration>>,
     cache: Mutex<ListingCache>,
 }
 
@@ -266,17 +272,50 @@ impl Completer {
         cwd: PathBuf,
     ) -> buck2_error::Result<Self> {
         // One timeout for every completion, if set (e.g. to wait longer on a slow machine).
-        let timeout = buck2_env!("BUCK2_REPL_COMPLETION_TIMEOUT_MS", type=u64)?
+        let env_timeout = buck2_env!("BUCK2_REPL_COMPLETION_TIMEOUT_MS", type=u64)?
             .map(|ms| Duration::from_millis(ms).min(MAX_TIMEOUT));
         Ok(Completer {
             req_tx,
             answers: Mutex::new(answers),
             next_id,
             cwd,
-            starlark_timeout: timeout.unwrap_or(STARLARK_TIMEOUT),
-            target_timeout: timeout.unwrap_or(TARGET_TIMEOUT),
+            env_timeout,
+            timeout_override: Mutex::new(None),
             cache: Mutex::new(ListingCache::default()),
         })
+    }
+
+    /// The waits for names (from memory) and for targets (which may load packages), without
+    /// `:set completion_timeout_ms`.
+    pub(crate) fn timeouts(&self) -> (Duration, Duration) {
+        (
+            self.env_timeout.unwrap_or(STARLARK_TIMEOUT),
+            self.env_timeout.unwrap_or(TARGET_TIMEOUT),
+        )
+    }
+
+    /// The wait for every completion set by `:set completion_timeout_ms`.
+    pub(crate) fn timeout_override(&self) -> Option<Duration> {
+        *self
+            .timeout_override
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `:set completion_timeout_ms`: `None` goes back to [`timeouts`](Self::timeouts).
+    pub(crate) fn set_timeout_override(&self, timeout: Option<Duration>) {
+        *self
+            .timeout_override
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = timeout;
+    }
+
+    fn starlark_timeout(&self) -> Duration {
+        self.timeout_override().unwrap_or(self.timeouts().0)
+    }
+
+    fn target_timeout(&self) -> Duration {
+        self.timeout_override().unwrap_or(self.timeouts().1)
     }
 
     /// Forgets the listings: an input may have changed what they list.
@@ -332,6 +371,79 @@ impl Completer {
                 ),
                 None => self.load_paths(start, word, ModuleSite::Bxl),
             },
+            SiteKind::CommandArg {
+                arg: ArgKind::Setting,
+                word,
+                ..
+            } => Completion::new(start, setting_names(word)),
+            SiteKind::SettingValue { key, word } => match setting(key) {
+                // A target platform.
+                Some(spec) if spec.choices.is_empty() && spec.side == SettingSide::Server => {
+                    if spec.name == "target_platforms" {
+                        self.targets(start, word)
+                    } else {
+                        Completion::new(start, Vec::new())
+                    }
+                }
+                Some(spec) => Completion::new(
+                    start,
+                    spec.choices
+                        .iter()
+                        .map(|c| candidate(c, repl_candidate::Kind::Keyword, ""))
+                        .collect(),
+                ),
+                None => Completion::new(start, Vec::new()),
+            },
+            SiteKind::CommandArg {
+                arg: ArgKind::Glob,
+                word,
+                ..
+            } => {
+                // Not every global name for an empty word: `:who` lists the session's bindings.
+                if word.is_empty() || word.contains(['*', '?']) {
+                    Completion::new(start, Vec::new())
+                } else {
+                    // The names of the session, not called.
+                    let mut completion = self.ask(
+                        start,
+                        ReplComplete {
+                            kind: repl_complete::Kind::Name as i32,
+                            prefix: (*word).to_owned(),
+                            ..ReplComplete::default()
+                        },
+                        self.starlark_timeout(),
+                    );
+                    for c in &mut completion.candidates {
+                        if let Some(name) = c.replacement.strip_suffix('(') {
+                            c.replacement = name.to_owned();
+                        }
+                    }
+                    completion
+                }
+            }
+            SiteKind::CommandArg {
+                arg: ArgKind::Shell,
+                word,
+                ..
+            } => Completion::new(start, paths(&self.cwd, word, &[""])),
+            SiteKind::CommandArg {
+                arg: ArgKind::File,
+                word,
+                ..
+            } => {
+                if is_label(word) {
+                    // A target, or a module.
+                    let mut completion = self.targets(start, word);
+                    completion.merge(self.load_paths(start, word, ModuleSite::LoadCommand));
+                    completion
+                } else {
+                    Completion::new(start, paths(&self.cwd, word, &[""]))
+                }
+            }
+            SiteKind::CommandArg {
+                arg: ArgKind::QueryFunction,
+                ..
+            } => self.query_function_names(start),
             SiteKind::CommandArg { word, .. } | SiteKind::TargetString { prefix: word } => {
                 self.targets(start, word)
             }
@@ -359,7 +471,7 @@ impl Completer {
                         prefix: (*prefix).to_owned(),
                         ..ReplComplete::default()
                     },
-                    self.starlark_timeout,
+                    self.starlark_timeout(),
                 );
                 with_keywords(completion, KEYWORDS)
             }
@@ -376,7 +488,7 @@ impl Completer {
                     steps: chain_steps(steps),
                     ..ReplComplete::default()
                 },
-                self.starlark_timeout,
+                self.starlark_timeout(),
             ),
             SiteKind::CallArg {
                 root,
@@ -396,7 +508,7 @@ impl Completer {
                         positional_args: u32::try_from(*positional).unwrap_or(u32::MAX),
                         ..ReplComplete::default()
                     },
-                    self.starlark_timeout,
+                    self.starlark_timeout(),
                 );
                 with_keywords(completion, ARGUMENT_KEYWORDS)
             }
@@ -552,6 +664,46 @@ impl Completer {
         }
     }
 
+    /// What `:qdoc` takes: the functions of the query languages (without `(`), and the
+    /// languages.
+    fn query_function_names(&self, start: usize) -> Completion {
+        let mut completion = Completion::new(start, Vec::new());
+        for dialect in [
+            repl_complete::QueryDialect::Uquery,
+            repl_complete::QueryDialect::Cquery,
+            repl_complete::QueryDialect::Aquery,
+        ] {
+            let functions = self.listing(
+                start,
+                ReplComplete {
+                    kind: repl_complete::Kind::Query as i32,
+                    query_dialect: dialect as i32,
+                    ..ReplComplete::default()
+                },
+            );
+            for f in &functions.candidates {
+                let name = f.replacement.strip_suffix('(').unwrap_or(&f.replacement);
+                completion
+                    .candidates
+                    .push(candidate(name, repl_candidate::Kind::Function, ""));
+            }
+            if completion.message.is_empty() {
+                completion.message = functions.message;
+            }
+        }
+        for word in OPERATOR_WORDS {
+            completion
+                .candidates
+                .push(candidate(word, repl_candidate::Kind::Function, ""));
+        }
+        for dialect in ["uquery", "cquery", "aquery"] {
+            completion
+                .candidates
+                .push(candidate(dialect, repl_candidate::Kind::Keyword, ""));
+        }
+        completion
+    }
+
     /// The listing `request` (for a shorter prefix than `word`, the prefix the candidates are
     /// for), filtered here; or, when the daemon could not list every candidate (too many), the
     /// candidates for `word` itself.
@@ -582,7 +734,7 @@ impl Completer {
             return Completion::new(start, candidates);
         }
         let asked = Instant::now();
-        let (id, completion) = self.ask_id(start, request, self.target_timeout);
+        let (id, completion) = self.ask_id(start, request, self.target_timeout());
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         match completion.status {
             repl_completions::Status::Ok if completion.message.is_empty() => {
@@ -779,9 +931,9 @@ fn is_path(kind: repl_candidate::Kind) -> bool {
     )
 }
 
-/// The commands `:help` lists: the ones available (most P1 commands are not implemented yet).
+/// The commands `:help` lists: all but the hidden ones.
 fn available_commands() -> impl Iterator<Item = &'static buck2_repl_syntax::commands::CommandSpec> {
-    COMMANDS.iter().filter(|c| !c.hidden && c.is_available())
+    COMMANDS.iter().filter(|c| !c.hidden)
 }
 
 /// Command names and aliases, with their colon.
@@ -800,6 +952,15 @@ fn commands(prefix: &str) -> Vec<ReplCandidate> {
         }
     }
     candidates
+}
+
+/// The settings of `:set`.
+fn setting_names(word: &str) -> Vec<ReplCandidate> {
+    SETTINGS
+        .iter()
+        .filter(|s| match_tier(word, s.name).is_some())
+        .map(|s| candidate(s.name, repl_candidate::Kind::Keyword, s.values))
+        .collect()
 }
 
 /// What `:help` takes: a command (with or without its colon) or a topic.

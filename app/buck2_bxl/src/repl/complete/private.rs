@@ -23,10 +23,21 @@ use starlark::environment::FrozenModule;
 use starlark::values::OwnedFrozen;
 use starlark::values::Value;
 
+/// The string the `i`th module of the prelude is recorded with ([`PrivateBindings::import_all`]).
+pub(crate) fn prelude_id(i: usize) -> String {
+    format!("<prelude {i}>")
+}
+
+/// Whether a module was recorded with [`prelude_id`].
+pub(crate) fn is_prelude_id(id: &str) -> bool {
+    id.starts_with("<prelude ")
+}
+
 #[derive(Default)]
 pub(crate) struct PrivateBindings {
-    /// Symbols loaded by name: the local name, and the module and name it was loaded from.
-    loaded: HashMap<String, (FrozenModule, String)>,
+    /// Symbols loaded by name: the local name, and the module (with the string it was loaded
+    /// with) and name it was loaded from.
+    loaded: HashMap<String, (String, FrozenModule, String)>,
     /// Modules whose public symbols were all imported (the prelude, `:load` without symbols),
     /// by the string they were loaded with; the latest last.
     imported: Vec<(String, FrozenModule)>,
@@ -48,9 +59,11 @@ impl PrivateBindings {
 
     /// `load(<module>, local = "symbol")` bound `local`: the caller checked that `symbol` is
     /// [`exported`](Self::exported).
-    pub(crate) fn load(&mut self, local: &str, module: &FrozenModule, symbol: &str) {
-        self.loaded
-            .insert(local.to_owned(), (module.dupe(), symbol.to_owned()));
+    pub(crate) fn load(&mut self, local: &str, id: &str, module: &FrozenModule, symbol: &str) {
+        self.loaded.insert(
+            local.to_owned(),
+            (id.to_owned(), module.dupe(), symbol.to_owned()),
+        );
     }
 
     /// Every public symbol of `module` was imported.
@@ -67,14 +80,20 @@ impl PrivateBindings {
 
     /// The value of the private binding `name`, if it is known.
     pub(crate) fn get(&self, name: &str) -> Option<OwnedFrozen<Value<'static>>> {
-        if let Some((module, symbol)) = self.loaded.get(name) {
-            return Self::exported(module, symbol);
+        self.find(name).map(|(_, value)| value)
+    }
+
+    /// The value of the private binding `name` and the string its module was loaded with (as
+    /// `import_all` was given it for the prelude), if they are known.
+    pub(crate) fn find(&self, name: &str) -> Option<(&str, OwnedFrozen<Value<'static>>)> {
+        if let Some((id, module, symbol)) = self.loaded.get(name) {
+            return Self::exported(module, symbol).map(|value| (id.as_str(), value));
         }
         // Only what the import bound: a module imported later that has a private binding of
         // the same name (a symbol it loaded itself) did not rebind it.
         self.imported
             .iter()
             .rev()
-            .find_map(|(_, module)| Self::exported(module, name))
+            .find_map(|(id, module)| Self::exported(module, name).map(|value| (id.as_str(), value)))
     }
 }

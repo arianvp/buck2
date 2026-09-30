@@ -23,14 +23,19 @@ use buck2_repl_syntax::commands::QueryDialect;
 use buck2_repl_syntax::commands::parse_bxl_args;
 use buck2_repl_syntax::commands::parse_load_args;
 use buck2_repl_syntax::commands::parse_run_args;
+use buck2_repl_syntax::commands::parse_set_args;
 use buck2_repl_syntax::commands::split_args;
 use buck2_repl_syntax::text::starlark_string_literal;
 
 use crate::repl::build::BuildSpec;
 use crate::repl::build::RunSpec;
 use crate::repl::bxl::BxlSpec;
+use crate::repl::inspect::InspectSpec;
+use crate::repl::qdoc::qdoc;
 use crate::repl::render::RenderMode;
 use crate::repl::render::ReplFailure;
+use crate::repl::settings::SetWork;
+use crate::repl::settings::set_work;
 use crate::repl::thread::EvalKind;
 
 /// What a meta-command asks of the session.
@@ -43,6 +48,12 @@ pub(crate) enum CommandWork {
     Build(BuildSpec),
     /// `:bxl`: a BXL function of a file.
     Bxl(BxlSpec),
+    /// `:info`, `:ls`, `:__locate`: the target graph, read in a transaction.
+    Inspect(InspectSpec),
+    /// `:set`, for the settings of the daemon.
+    Set(SetWork),
+    /// Text made at once, without DICE (`:qdoc`).
+    Text(String),
 }
 
 /// The work of a meta-command, or why it cannot be done.
@@ -63,7 +74,7 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
                 eval(EvalKind::Sugar, load_code(&module, &args.symbols))
             }
         }
-        CommandId::Reload => eval(EvalKind::Reload, String::new()),
+        CommandId::Reload => eval(EvalKind::Reload { edited: None }, String::new()),
         CommandId::Reset => Ok(CommandWork::Reset),
         CommandId::Uquery => eval(EvalKind::Sugar, query_code(QueryDialect::Uquery, arg)),
         CommandId::Cquery => eval(EvalKind::Sugar, query_code(QueryDialect::Cquery, arg)),
@@ -112,10 +123,41 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
         CommandId::Bxl => {
             let args = parse_bxl_args(arg).map_err(|e| usage_error(command, &e))?;
             Ok(CommandWork::Bxl(BxlSpec {
-                label: args.label,
+                // As for `:load`, a leading `./` (which completion offers) is dropped.
+                label: load_module(&args.label).to_owned(),
                 args: args.args,
             }))
         }
+        CommandId::Info => Ok(CommandWork::Inspect(InspectSpec::Info {
+            target: one_word(command)?,
+        })),
+        CommandId::Ls => {
+            let words = split_args(arg).map_err(|e| usage_error(command, &e))?;
+            let package = match <[String; 1]>::try_from(words) {
+                Ok([package]) => package,
+                Err(words) if words.is_empty() => String::new(),
+                Err(_) => return Err(one_argument(command)),
+            };
+            Ok(CommandWork::Inspect(InspectSpec::Ls { package }))
+        }
+        CommandId::Locate => Ok(CommandWork::Inspect(InspectSpec::Locate {
+            what: one_word(command)?,
+        })),
+        CommandId::Edited => eval(
+            EvalKind::Reload {
+                edited: Some(one_word(command)?),
+            },
+            String::new(),
+        ),
+        CommandId::Who => {
+            let globs = split_args(arg).map_err(|e| usage_error(command, &e))?;
+            eval(EvalKind::Who { globs }, String::new())
+        }
+        CommandId::Set => {
+            let args = parse_set_args(arg).map_err(|e| usage_error(command, &e))?;
+            Ok(CommandWork::Set(set_work(args)?))
+        }
+        CommandId::Qdoc => Ok(CommandWork::Text(qdoc(arg)?)),
         _ => {
             let name = command.spec.display_name();
             Err(match command.spec.handler {
@@ -130,6 +172,26 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
             })
         }
     }
+}
+
+/// The one word of the argument (shell-split).
+fn one_word(command: &ParsedCommand<'_>) -> Result<String, ReplFailure> {
+    let words = split_args(&command.arg).map_err(|e| usage_error(command, &e))?;
+    match <[String; 1]>::try_from(words) {
+        Ok([word]) => Ok(word),
+        Err(_) => Err(one_argument(command)),
+    }
+}
+
+fn one_argument(command: &ParsedCommand<'_>) -> ReplFailure {
+    ReplFailure::new(
+        repl_error::Kind::Usage,
+        &format_args!(
+            "`{}` takes one argument; usage: {}",
+            command.spec.display_name(),
+            command.spec.usage
+        ),
+    )
 }
 
 fn usage_error(command: &ParsedCommand<'_>, e: &ArgError) -> ReplFailure {

@@ -32,19 +32,31 @@ use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 mod complete;
 mod editor;
 mod help;
+mod inputs;
 mod render;
 mod run;
 mod script;
 mod session;
+mod settings;
 
 /// Start an interactive BXL/Starlark session: evaluate code with `ctx` bound, run queries,
 /// builds and binaries.
 #[derive(Debug, clap::Parser)]
 #[clap(name = "repl")]
 pub struct ReplCommand {
-    /// Evaluate INPUT and exit (repeatable).
+    /// Files to evaluate before the first input: `.bzl` and `.bxl` files are loaded as `:load`
+    /// loads them (their public symbols become bindings), other files are evaluated as Starlark.
+    #[clap(value_name = "FILES")]
+    files: Vec<String>,
+
+    /// Evaluate INPUT and exit (repeatable; after the FILES).
     #[clap(short = 'e', long = "eval", value_name = "INPUT")]
     eval: Vec<String>,
+
+    /// Go on with the inputs of stdin (the prompt, on a terminal) after the `-e` inputs, as
+    /// without `-e`: `buck2 repl -i -e INPUT FILE`.
+    #[clap(short = 'i', long, overrides_with = "interactive")]
+    interactive: bool,
 
     /// Print one JSON object per input (non-interactive only).
     #[clap(long)]

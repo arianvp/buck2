@@ -94,6 +94,9 @@ pub enum SiteKind<'a> {
         dialect: QueryDialect,
         context: QueryContext<'a>,
     },
+    /// The value of the setting `key` of `:set` (its second word; the first one, the setting,
+    /// is a [`SiteKind::CommandArg`]).
+    SettingValue { key: &'a str, word: &'a str },
 }
 
 /// A completion site.
@@ -116,7 +119,7 @@ impl<'a> Site<'a> {
             | SiteKind::TargetString { prefix }
             | SiteKind::LoadPath { prefix }
             | SiteKind::LoadSymbol { prefix, .. } => prefix,
-            SiteKind::CommandArg { word, .. } => word,
+            SiteKind::CommandArg { word, .. } | SiteKind::SettingValue { word, .. } => word,
             SiteKind::Query { context, .. } => context.word,
         }
     }
@@ -218,10 +221,28 @@ fn command_arg_site(
         // Target patterns; flags are not completed.
         ArgKind::Targets => !word.starts_with('-'),
         // Only the first word: `:providers <target>`, `:load <module> [symbol...]`,
-        // `:help <topic>`, `:bxl <file.bxl:function> [-- args...]`.
-        ArgKind::Target | ArgKind::Topic | ArgKind::Path | ArgKind::BxlLabel => {
-            before.is_empty() && !word.starts_with('-')
-        }
+        // `:help <topic>`, `:bxl <file.bxl:function> [-- args...]`, `:edit [path]`,
+        // `:ls [package]`, `:qdoc [function]`.
+        ArgKind::Target
+        | ArgKind::Topic
+        | ArgKind::Path
+        | ArgKind::BxlLabel
+        | ArgKind::File
+        | ArgKind::Package
+        | ArgKind::QueryFunction => before.is_empty() && !word.starts_with('-'),
+        // Names (`:who [glob...]`), paths (`:!<command>`): any word.
+        ArgKind::Glob | ArgKind::Shell => true,
+        // `:set [key [value...]]`: the setting, then its value.
+        ArgKind::Setting => match before.as_slice() {
+            [] => true,
+            [key] => {
+                return Some(Site {
+                    start: offset + start,
+                    kind: SiteKind::SettingValue { key, word },
+                });
+            }
+            _ => false,
+        },
         // `[--print] <target> [-- args...]`: the target, which is the first word that is not a
         // flag, before `--`.
         ArgKind::Run => {
@@ -1168,6 +1189,55 @@ mod tests {
         assert_eq!(site(":q ▮"), None);
         assert_eq!(site(":reset ▮"), None);
         assert_eq!(site(":__complete {▮"), None);
+        assert_eq!(
+            site(":set ▮"),
+            arg_at(5, CommandId::Set, ArgKind::Setting, "")
+        );
+        assert_eq!(
+            site(":set col▮"),
+            arg_at(5, CommandId::Set, ArgKind::Setting, "col")
+        );
+        assert_eq!(
+            site(":set color o▮"),
+            Some(Site {
+                start: 11,
+                kind: SiteKind::SettingValue {
+                    key: "color",
+                    word: "o"
+                }
+            })
+        );
+        assert_eq!(site(":set modifiers a b▮"), None);
+        assert_eq!(
+            site(":who my▮"),
+            arg_at(5, CommandId::Who, ArgKind::Glob, "my")
+        );
+        assert_eq!(
+            site(":who a b▮"),
+            arg_at(7, CommandId::Who, ArgKind::Glob, "b")
+        );
+        assert_eq!(
+            site(":!cat pk▮"),
+            arg_at(6, CommandId::Shell, ArgKind::Shell, "pk")
+        );
+        assert_eq!(
+            site(":e pkg/he▮"),
+            arg_at(3, CommandId::Edit, ArgKind::File, "pkg/he")
+        );
+        assert_eq!(site(":e a b▮"), None);
+        assert_eq!(
+            site(":ls //pk▮"),
+            arg_at(4, CommandId::Ls, ArgKind::Package, "//pk")
+        );
+        assert_eq!(
+            site(":qdoc de▮"),
+            arg_at(6, CommandId::Qdoc, ArgKind::QueryFunction, "de")
+        );
+        assert_eq!(
+            site(":i :he▮"),
+            arg_at(3, CommandId::Info, ArgKind::Target, ":he")
+        );
+        assert_eq!(site(":hist 1▮"), None);
     }
 
     #[test]

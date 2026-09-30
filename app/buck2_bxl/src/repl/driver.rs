@@ -87,11 +87,17 @@ use crate::repl::complete::loads::complete_load_symbols;
 use crate::repl::complete::query::query_functions;
 use crate::repl::complete::targets::complete_load_paths;
 use crate::repl::complete::targets::complete_targets;
+use crate::repl::inspect::InspectSpec;
+use crate::repl::inspect::Inspected;
+use crate::repl::inspect::inspect;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplOutputWriter;
 use crate::repl::render::Rendered;
 use crate::repl::render::ReplFailure;
+use crate::repl::settings::SetWork;
+use crate::repl::settings::setting_changed;
+use crate::repl::settings::show_settings;
 use crate::repl::thread::EvalJob;
 use crate::repl::thread::EvalKind;
 use crate::repl::thread::EvalReply;
@@ -122,6 +128,19 @@ enum Work {
     Build(BuildRequest),
     /// `:bxl`.
     Bxl(BxlRequest),
+    /// `:info`, `:ls`, `:__locate`.
+    Inspect(InspectRequest),
+    /// `:set`, for the settings of the daemon.
+    Set {
+        id: u64,
+        work: SetWork,
+        title: String,
+    },
+    /// Text made at once, without DICE (`:qdoc`): sent as output.
+    Text {
+        id: u64,
+        text: String,
+    },
     /// `:reset`: a new session, started like the first one.
     Reset {
         id: u64,
@@ -184,6 +203,13 @@ struct BxlRequest {
     title: String,
 }
 
+struct InspectRequest {
+    id: u64,
+    spec: InspectSpec,
+    /// The input as typed, shown to other commands that wait for this one.
+    title: String,
+}
+
 /// What a completion from DICE completes.
 enum DiceCompletion {
     /// A target pattern.
@@ -225,6 +251,14 @@ enum Outcome {
     /// `:build` or `:run`.
     Built {
         result: Result<Built, ReplFailure>,
+        equality: DiceEquality,
+        t0: Instant,
+        t1: Instant,
+        t2: Instant,
+    },
+    /// `:info`, `:ls`, `:__locate`, or the check of a target platform (`:set`).
+    Inspected {
+        result: Result<Inspected, ReplFailure>,
         equality: DiceEquality,
         t0: Instant,
         t1: Instant,
@@ -340,7 +374,8 @@ impl<'a> Driver<'a> {
         let cfg = SessionConfig {
             heap_limit: usize::try_from(heap_limit).unwrap_or(usize::MAX),
         };
-        let target_cfg = open.target_cfg.unwrap_or_default();
+        // `:set` changes it.
+        let mut target_cfg = open.target_cfg.unwrap_or_default();
         let thread = ReplThread::spawn(Handle::current(), cfg, self.emitter.dupe())?;
 
         let mut pending = VecDeque::from([Work::Init { id: open_id }]);
@@ -396,6 +431,16 @@ impl<'a> Driver<'a> {
                     );
                     let outcome = self.in_flight(id, &cancel, None, fut).await;
                     self.answer_eval(id, outcome);
+                }
+                Work::Inspect(request) => {
+                    let id = request.id;
+                    let outcome = self.inspect(request).await;
+                    self.answer_eval(id, outcome);
+                }
+                Work::Set { id, work, title } => self.set(id, work, title, &mut target_cfg).await,
+                Work::Text { id, text } => {
+                    self.send_text(id, &text);
+                    self.done_without_value(id);
                 }
                 Work::Reset { id } => {
                     // The thread is idle: it drops the module at once.
@@ -526,6 +571,74 @@ impl<'a> Driver<'a> {
             }
         }
         outcome
+    }
+
+    /// Runs `:info`, `:ls` or `:__locate`, or checks a target platform.
+    async fn inspect(&mut self, request: InspectRequest) -> buck2_error::Result<Outcome> {
+        let id = request.id;
+        let cancel = Arc::new(EvalCancel::new());
+        let fut = run_inspect(self.sctx, request, cancel.dupe());
+        self.in_flight(id, &cancel, None, fut).await
+    }
+
+    /// `:set`, for the settings of the daemon, which apply from the next request on.
+    async fn set(&mut self, id: u64, work: SetWork, title: String, target_cfg: &mut TargetCfg) {
+        let setting = match work {
+            SetWork::Show(key) => {
+                self.send_text(id, &show_settings(target_cfg, key));
+                None
+            }
+            SetWork::Modifiers(modifiers) => {
+                target_cfg.cli_modifiers = modifiers;
+                Some("modifiers")
+            }
+            SetWork::TargetPlatforms(platform) if platform.is_empty() => {
+                target_cfg.target_platform = platform;
+                Some("target_platforms")
+            }
+            SetWork::TargetPlatforms(platform) => {
+                // The platform must be a target: checked (and made absolute) first.
+                let request = InspectRequest {
+                    id,
+                    spec: InspectSpec::Platform { target: platform },
+                    title,
+                };
+                let outcome = self.inspect(request).await;
+                if let Ok(Outcome::Inspected {
+                    result: Ok(Inspected::Platform(label)),
+                    ..
+                }) = &outcome
+                {
+                    target_cfg.target_platform = label.clone();
+                    self.emitter.notice(
+                        id,
+                        repl_notice::Level::Info,
+                        setting_changed(target_cfg, "target_platforms"),
+                    );
+                }
+                self.answer_eval(id, outcome);
+                return;
+            }
+        };
+        if let Some(setting) = setting {
+            self.emitter.notice(
+                id,
+                repl_notice::Level::Info,
+                setting_changed(target_cfg, setting),
+            );
+        }
+        self.done_without_value(id);
+    }
+
+    /// Answers request `id`, which has no value.
+    fn done_without_value(&self, id: u64) {
+        self.emitter.done(
+            id,
+            ReplDone {
+                heap_bytes: self.heap_bytes,
+                ..ReplDone::default()
+            },
+        );
     }
 
     /// Runs the request `id` to its end while answering the requests that arrive meanwhile.
@@ -733,6 +846,39 @@ impl<'a> Driver<'a> {
                     heap_bytes: self.heap_bytes,
                 }
             }
+            Ok(Outcome::Inspected {
+                result,
+                equality,
+                t0,
+                t1,
+                t2,
+            }) => {
+                let sources_changed = self.last_equality.is_some_and(|last| last != equality);
+                self.last_equality = Some(equality);
+                let outcome = match result {
+                    Ok(Inspected::Text(text)) => {
+                        self.send_text(id, &text);
+                        None
+                    }
+                    Ok(Inspected::Location(location)) => {
+                        Some(repl_done::Outcome::Value(ReplValue {
+                            r#type: "location".to_owned(),
+                            text: location,
+                            truncated: false,
+                            json: None,
+                        }))
+                    }
+                    Ok(Inspected::Platform(_)) => None,
+                    Err(failure) => Some(repl_done::Outcome::Error(failure_proto(failure))),
+                };
+                ReplDone {
+                    outcome,
+                    wait_ms: millis(t1 - t0),
+                    eval_ms: millis(t2 - t1),
+                    sources_changed,
+                    heap_bytes: self.heap_bytes,
+                }
+            }
             Ok(Outcome::Bxl {
                 result,
                 equality,
@@ -870,6 +1016,17 @@ fn classify(request: ReplRequest) -> Work {
                     spec,
                     title: title(&eval.input),
                 }),
+                Ok(CommandWork::Inspect(spec)) => Work::Inspect(InspectRequest {
+                    id,
+                    spec,
+                    title: title(&eval.input),
+                }),
+                Ok(CommandWork::Set(work)) => Work::Set {
+                    id,
+                    work,
+                    title: title(&eval.input),
+                },
+                Ok(CommandWork::Text(text)) => Work::Text { id, text },
                 Err(failure) => Work::Reply {
                     id,
                     message: repl_message::Message::Done(ReplDone {
@@ -1097,6 +1254,40 @@ async fn run_build(
             };
             drop(dc);
             Ok(Outcome::Built {
+                result,
+                equality: txn.equality_token(),
+                t0,
+                t1,
+                t2: Instant::now(),
+            })
+        })
+        .await
+}
+
+/// Runs `:info`, `:ls`, `:__locate` or the check of a target platform in a transaction of its
+/// own. The work races the cancellation of the request: it is DICE work, which is safe to drop.
+async fn run_inspect(
+    sctx: &dyn ServerCommandContextTrait,
+    request: InspectRequest,
+    cancel: Arc<EvalCancel>,
+) -> buck2_error::Result<Outcome> {
+    let InspectRequest { id: _, spec, title } = request;
+    let t0 = Instant::now();
+    let repl_ctx = ReplCtx::eval(sctx, &title);
+    (&repl_ctx as &dyn ServerCommandContextTrait)
+        .with_dice_ctx(|sctx, txn| async move {
+            let t1 = Instant::now();
+            if cancel.is_triggered() {
+                // Cancelled while waiting for other commands.
+                return Ok(Outcome::Interrupted { t0, t1 });
+            }
+            let mut dc = txn.ctx();
+            let result = tokio::select! {
+                result = inspect(sctx, &mut dc, &spec) => result,
+                () = cancel.cancelled() => Err(ReplFailure::interrupted()),
+            };
+            drop(dc);
+            Ok(Outcome::Inspected {
                 result,
                 equality: txn.equality_token(),
                 t0,

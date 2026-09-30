@@ -321,6 +321,99 @@ impl fmt::Write for CappedString {
     }
 }
 
+/// Whether a module to load, as typed at the prompt, is a path of the filesystem that buck2's
+/// `load()` does not take: an absolute path, or a relative one with `..` (`../x.bzl`). Labels
+/// (`//pkg:x.bzl`, `@cell//...`, `:x.bzl`) and forward relative paths (`sub/x.bzl`) are not.
+pub fn is_filesystem_path(module: &str) -> bool {
+    // `//pkg:x.bzl` is a label.
+    let absolute = (module.starts_with('/') && !module.starts_with("//"))
+        || module.starts_with('\\')
+        || matches!(module.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic());
+    if absolute {
+        return true;
+    }
+    !module.contains(':')
+        && !module.starts_with('@')
+        && module.split(['/', '\\']).any(|p| p == "..")
+}
+
+/// The words, quoted for a POSIX shell where needed and joined with spaces (as `:set` shows the
+/// words it was given).
+pub fn shell_join(words: &[String]) -> String {
+    shlex::try_join(words.iter().map(String::as_str)).unwrap_or_else(|_| words.join(" "))
+}
+
+/// Whether `name` matches the shell-like `glob`: `*` matches any run of characters, `?` any one
+/// character, everything else itself. Takes time in `glob.len() * name.len()` at most (no
+/// recursion).
+pub fn glob_match(glob: &str, name: &str) -> bool {
+    let glob: Vec<char> = glob.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut g, mut n) = (0, 0);
+    // Where the last `*` was, and the position in `name` it matches up to.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match glob.get(g) {
+            Some('*') => {
+                star = Some((g, n));
+                g += 1;
+            }
+            Some(c) if *c == '?' || Some(c) == name.get(n) => {
+                g += 1;
+                n += 1;
+            }
+            _ => match star {
+                // The last `*` matches one more character.
+                Some((star_g, star_n)) => {
+                    g = star_g + 1;
+                    n = star_n + 1;
+                    star = Some((star_g, star_n + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    glob.get(g..)
+        .is_some_and(|rest| rest.iter().all(|c| *c == '*'))
+}
+
+/// The line (1-based) of the first `name = "<target>"` (or with single quotes, with or without
+/// spaces around `=`) in the build file `content`: where the target is most likely defined when
+/// buck2 did not record it.
+pub fn find_name_line(content: &str, target: &str) -> Option<usize> {
+    const KEY: &str = "name";
+    for (i, line) in content.lines().enumerate() {
+        let mut from = 0;
+        while let Some(found) = line.get(from..).and_then(|rest| rest.find(KEY)) {
+            let at = from + found;
+            from = at + KEY.len();
+            let starts_word = line
+                .get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if !starts_word {
+                continue;
+            }
+            let Some(rest) = line.get(from..) else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            for quote in ['"', '\''] {
+                if let Some(value) = rest.strip_prefix(quote)
+                    && let Some(value) = value.strip_prefix(target)
+                    && value.starts_with(quote)
+                {
+                    return Some(i + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write;
@@ -554,5 +647,66 @@ def f(ctx, targets = [], *, deps = False):
         let mut s = CappedString::new(0);
         write!(s, "{}", 1).unwrap();
         assert!(s.is_empty() && s.truncated());
+    }
+
+    #[test]
+    fn test_is_filesystem_path() {
+        assert!(is_filesystem_path("/a/b.bzl"));
+        assert!(is_filesystem_path("../b.bzl"));
+        assert!(is_filesystem_path("a/../b.bzl"));
+        assert!(is_filesystem_path("C:\\a\\b.bzl"));
+        assert!(is_filesystem_path("C:/a/b.bzl"));
+        assert!(!is_filesystem_path("b.bzl"));
+        assert!(!is_filesystem_path("sub/b.bzl"));
+        assert!(!is_filesystem_path("//pkg:b.bzl"));
+        assert!(!is_filesystem_path(":b.bzl"));
+        assert!(!is_filesystem_path("@c//x/../y:b.bzl"));
+        assert!(!is_filesystem_path("c//x:b.bzl"));
+        assert!(!is_filesystem_path(""));
+    }
+
+    #[test]
+    fn test_shell_join() {
+        assert_eq!(shell_join(&["a b".to_owned(), "c".to_owned()]), "'a b' c");
+        assert_eq!(shell_join(&[]), "");
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("x", "x"));
+        assert!(!glob_match("x", "xy"));
+        assert!(glob_match("x*", "xy"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("*y", "xy"));
+        assert!(glob_match("a*b*c", "a__b__b__c"));
+        assert!(!glob_match("a*b*c", "a__b__b__"));
+        assert!(glob_match("?y", "xy"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("my_*", "my_value"));
+        assert!(glob_match("*é*", "aéb"));
+        // Bounded, even for many stars.
+        let long = "a".repeat(2000);
+        assert!(!glob_match(
+            &"*a".repeat(200).replace("*a*a", "*a*b"),
+            &long
+        ));
+    }
+
+    #[test]
+    fn test_find_name_line() {
+        let content =
+            "load(\":defs.bzl\", \"x\")\n\nx(\n    name = \"hello\",\n)\nx(name='greet')\n";
+        assert_eq!(find_name_line(content, "hello"), Some(4));
+        assert_eq!(find_name_line(content, "greet"), Some(6));
+        assert_eq!(find_name_line(content, "hell"), None);
+        assert_eq!(find_name_line(content, "nope"), None);
+        assert_eq!(
+            find_name_line("x(my_name = \"a\")\ny(name = \"a\")", "a"),
+            Some(2)
+        );
+        assert_eq!(find_name_line("if name == \"a\": pass", "a"), None);
+        assert_eq!(find_name_line("", "a"), None);
     }
 }

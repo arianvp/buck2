@@ -34,12 +34,16 @@ mod commands;
 mod complete;
 mod docstrings;
 mod driver;
+mod inspect;
 mod line_ctx;
 mod output;
 mod prep;
+mod qdoc;
 mod render;
 mod session;
+mod settings;
 mod thread;
+mod who;
 
 pub(crate) async fn repl_command(
     sctx: &dyn ServerCommandContextTrait,

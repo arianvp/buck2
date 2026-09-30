@@ -49,24 +49,22 @@ pub(crate) struct Style {
 }
 
 impl Style {
-    /// Non-interactive mode: no colour, no line limit, no durations.
-    pub(crate) fn script() -> Self {
+    /// `interactive`: for the interactive editor (long values are cut, slow inputs may show
+    /// their duration).
+    pub(crate) fn new(interactive: bool, color: bool, durations: bool) -> Self {
         Style {
-            interactive: false,
-            color: false,
-            durations: false,
+            interactive,
+            color,
+            durations,
         }
     }
 
-    /// The interactive editor. Colour unless stderr is not a terminal or `NO_COLOR` is set.
-    pub(crate) fn interactive() -> Self {
+    /// Whether the interactive editor colours its output by default (`:set color auto`): unless
+    /// stderr is not a terminal or `NO_COLOR` is set.
+    pub(crate) fn default_color() -> bool {
         // `NO_COLOR` is an ambient convention (https://no-color.org), not a buck2 setting.
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        Style {
-            interactive: true,
-            color: !no_color && std::io::stderr().is_terminal(),
-            durations: true,
-        }
+        !no_color && std::io::stderr().is_terminal()
     }
 
     /// Without the duration of slow inputs.
@@ -101,12 +99,7 @@ pub(crate) enum Rendered {
 /// Fails if the output cannot be written (e.g. stdout is a closed pipe): the caller stops, since
 /// nobody sees the results of later inputs.
 pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<Rendered> {
-    if done.sources_changed {
-        print_note(
-            style,
-            "note: sources changed since the previous input; values computed earlier may be stale",
-        )?;
-    }
+    print_sources_changed(done, style)?;
     let rendered = match &done.outcome {
         None => Rendered::Ok,
         Some(repl_done::Outcome::Value(value)) => {
@@ -138,6 +131,17 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
         print_duration(done, style)?;
     }
     Ok(rendered)
+}
+
+/// The note that sources changed since the previous request, if they did.
+pub(crate) fn print_sources_changed(done: &ReplDone, style: Style) -> buck2_error::Result<()> {
+    if done.sources_changed {
+        print_note(
+            style,
+            "note: sources changed since the previous input; values computed earlier may be stale",
+        )?;
+    }
+    Ok(())
 }
 
 /// What `:time` prints: `time: 1.24s total · 0.80s daemon wait · 0.40s eval`.

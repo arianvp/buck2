@@ -9,8 +9,8 @@
  */
 
 //! The session: the daemon call on the client's runtime, the thread that reads inputs (the
-//! interactive [`editor`](crate::editor) or the [`script`](crate::script) reader), and the
-//! SIGINT handler.
+//! interactive [`editor`](crate::editor) or the [`script`](crate::script) reader, which evaluate
+//! them with [`Inputs`]), and the SIGINT handler.
 //!
 //! The input thread sends requests through `req_tx` (the request stream of the call) and
 //! waits for their results on `ui_rx`, which [`ReplHandler`] feeds from the call's partial
@@ -60,8 +60,11 @@ use crate::ReplCommand;
 use crate::complete::Completer;
 use crate::editor::EditorMode;
 use crate::editor::history_path;
+use crate::inputs::FirstInputs;
+use crate::inputs::Inputs;
+use crate::inputs::Mode;
+use crate::inputs::SessionIo;
 use crate::run::RunEnv;
-use crate::script::ScriptInputs;
 use crate::script::ScriptMode;
 
 /// The id of the `Open` request. Later requests count up from here.
@@ -396,7 +399,10 @@ pub(crate) async fn run(
     buckd: &mut BuckdClientConnector,
     events_ctx: &mut EventsCtx,
 ) -> ExitResult {
-    let interactive = cmd.eval.is_empty() && std::io::stdin().is_terminal();
+    // After the files and the `-e` inputs, the inputs come from stdin (the editor, if it is a
+    // terminal), unless only `-e` inputs were given.
+    let read_stdin = cmd.eval.is_empty() || cmd.interactive;
+    let interactive = read_stdin && std::io::stdin().is_terminal();
     let history = if interactive {
         match history_path(cmd.no_history) {
             Ok(history) => history,
@@ -443,36 +449,36 @@ pub(crate) async fn run(
 
     let shutdown = cmd.shutdown.dupe();
     let sigint = sigint_loop(ui.dupe(), req_tx.downgrade(), next_id.dupe());
+    let io = SessionIo {
+        req_tx,
+        ui_rx,
+        next_id,
+        completer,
+        ui: ui.dupe(),
+        shutdown: shutdown.dupe(),
+        run_env,
+    };
+    let first = FirstInputs {
+        files: cmd.files,
+        evals: cmd.eval,
+    };
     let thread = if interactive {
         let editor = EditorMode {
-            req_tx,
-            ui_rx,
-            next_id,
-            completer,
-            ui: ui.dupe(),
+            inputs: Inputs::new(io, Mode::Interactive),
+            first,
             history,
             outcome_tx,
-            shutdown: shutdown.dupe(),
-            run_env,
         };
         thread_spawn("repl-editor", move || editor.run())
     } else {
-        let inputs = if cmd.eval.is_empty() {
-            ScriptInputs::Stdin
-        } else {
-            ScriptInputs::Args(cmd.eval)
+        let mode = Mode::Script {
+            continue_on_error: cmd.continue_on_error,
         };
         let script = ScriptMode {
-            inputs,
-            continue_on_error: cmd.continue_on_error,
-            req_tx,
-            ui_rx,
-            next_id,
-            completer,
-            ui: ui.dupe(),
+            inputs: Inputs::new(io, mode),
+            first,
+            read_stdin,
             outcome_tx,
-            shutdown: shutdown.dupe(),
-            run_env,
         };
         thread_spawn("repl-editor", move || script.run())
     };

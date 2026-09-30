@@ -67,8 +67,13 @@ pub(crate) enum EvalKind {
     /// `:load <module>` without symbols: imports every public symbol of the module (the input
     /// is empty).
     ImportAll { module: String },
-    /// `:reload`: loads the modules loaded so far again (the input is empty).
-    Reload,
+    /// `:reload`: loads the modules loaded so far again (the input is empty). With `edited` (an
+    /// absolute path, from `:edit`), only if that file is one of them or is loaded by one of
+    /// them, and silently.
+    Reload { edited: Option<String> },
+    /// `:who`: lists the bindings of the session whose names match one of the globs (all if
+    /// there are none), with their types (the input is empty).
+    Who { globs: Vec<String> },
 }
 
 /// Evaluate an input.

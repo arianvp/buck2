@@ -10,13 +10,15 @@
 
 //! `:run`: the daemon builds the target and sends its command line; the client runs it as a
 //! child process with the terminal (stdin, stdout, stderr) of the session, then prints how it
-//! ended.
+//! ended. Also `:!` (a shell command) and the editor of `:edit`.
 //!
 //! The environment is the client's, as for `buck2 run`: `BUCK_RUN_BUILD_ID` is set and the
 //! variables of the buck2 wrapper are removed. While the child runs, SIGINT (Ctrl-C) is for the
 //! child: the terminal sends it to the whole foreground process group, and the session ignores
 //! it.
 
+use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
@@ -108,6 +110,158 @@ pub(crate) fn run_program(
     let (how, rendered) = describe(status);
     render::print_note(style, &format!("[{how} in {:.2}s]", elapsed.as_secs_f64()))?;
     Ok(rendered)
+}
+
+/// `:!<command>`: runs the command with the user's shell (`$SHELL -c`, or `/bin/sh`; `cmd /C`
+/// on Windows) in the client's working directory, with the terminal of the session (stdin only
+/// interactively, as for `:run`). Prints `[exited N]` (or `[killed by signal S]`) unless it
+/// exited with 0. `after` is the state of the terminal once it has ended.
+///
+/// Fails only if the output cannot be written.
+pub(crate) fn run_shell(
+    command: &str,
+    env: &RunEnv,
+    ui: &SharedUi,
+    after: UiState,
+    style: Style,
+) -> buck2_error::Result<Rendered> {
+    // What the session printed so far comes before what the command prints.
+    render::flush()?;
+    let (shell, flag) = shell();
+    // ast-grep-ignore: rust/buck2-no-command-new
+    let mut child = std::process::Command::new(&shell);
+    child.arg(flag).arg(command).current_dir(&env.cwd);
+    for var in WRAPPER_ENV_VARS {
+        child.env_remove(var);
+    }
+    if !env.interactive {
+        child.stdin(Stdio::null());
+    }
+    ui.set(UiState::Child);
+    let status = child.status();
+    ui.set(after);
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            render::print_error(style, &format!("error: cannot run `{shell}`: {e}"))?;
+            return Ok(Rendered::Failed);
+        }
+    };
+    if status.success() {
+        return Ok(Rendered::Ok);
+    }
+    let (how, rendered) = describe(status);
+    render::print_note(style, &format!("[{how}]"))?;
+    Ok(rendered)
+}
+
+/// The shell of `:!`, and its flag to run a command.
+fn shell() -> (String, &'static str) {
+    if cfg!(windows) {
+        ("cmd".to_owned(), "/C")
+    } else {
+        // `SHELL` is the user's shell, an ambient convention, not a buck2 setting.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_owned());
+        (shell, "-c")
+    }
+}
+
+/// Editors known to take `+<line>` before a file, to open it at that line.
+const LINE_EDITORS: &[&str] = &[
+    "vi",
+    "vim",
+    "nvim",
+    "gvim",
+    "mvim",
+    "view",
+    "nano",
+    "pico",
+    "emacs",
+    "emacsclient",
+    "micro",
+    "kak",
+    "mg",
+    "joe",
+    "jed",
+    "ne",
+];
+
+/// The editor of `:edit`: `$VISUAL`, else `$EDITOR`, else `vi` (`notepad` on Windows). It is a
+/// command line for the shell (e.g. `code --wait`).
+pub(crate) fn editor() -> String {
+    // `VISUAL` and `EDITOR` are ambient conventions, not buck2 settings.
+    ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|e| !e.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".to_owned()
+            } else {
+                "vi".to_owned()
+            }
+        })
+}
+
+/// Whether the editor command takes `+<line>` (by the name of its program).
+fn takes_line(editor: &str) -> bool {
+    let program = editor.split_whitespace().next().unwrap_or("");
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    LINE_EDITORS.contains(&name)
+}
+
+/// Runs the editor of `:edit` on `path` (at `line`, if the editor is known to take one) with the
+/// terminal, and waits for it. `after` is the state of the terminal once it has ended. The
+/// error is a message (without `error: `).
+pub(crate) fn run_editor(
+    path: &Path,
+    line: Option<usize>,
+    env: &RunEnv,
+    ui: &SharedUi,
+    after: UiState,
+) -> Result<(), String> {
+    render::flush().map_err(|e| format!("{e}"))?;
+    let editor = editor();
+    let mut args: Vec<OsString> = Vec::new();
+    if let Some(line) = line
+        && takes_line(&editor)
+    {
+        args.push(format!("+{line}").into());
+    }
+    args.push(path.as_os_str().to_owned());
+    let mut command = if cfg!(windows) {
+        // ast-grep-ignore: rust/buck2-no-command-new
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C").arg(&editor);
+        command
+    } else {
+        // The editor is a command line (`code --wait`): the shell splits it, and the arguments
+        // are passed as they are (as git runs its editor).
+        // ast-grep-ignore: rust/buck2-no-command-new
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("{editor} \"$@\""))
+            .arg(&editor);
+        command
+    };
+    command.args(&args).current_dir(&env.cwd);
+    if !env.interactive {
+        command.stdin(Stdio::null());
+    }
+    ui.set(UiState::Child);
+    let status = command.status();
+    ui.set(after);
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "the editor (`{editor}`) {}; nothing was loaded or run",
+            describe(status).0
+        )),
+        Err(e) => Err(format!("cannot run the editor `{editor}`: {e}")),
+    }
 }
 
 /// `exited N` or `killed by signal S`, and what it means for the input.

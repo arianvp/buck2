@@ -21,6 +21,7 @@ use buck2_cli_proto::repl_error;
 use buck2_cli_proto::repl_notice;
 use buck2_common::events::HasEvents;
 use buck2_core::bxl::BxlFilePath;
+use buck2_core::cells::cell_path::CellPath;
 use buck2_error::buck2_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::maybe_proxy_current_span;
@@ -56,6 +57,7 @@ use crate::bxl::starlark_defs::context::starlark_async::BxlDiceComputations;
 use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
 use crate::repl::complete::names::complete_starlark;
 use crate::repl::complete::private::PrivateBindings;
+use crate::repl::complete::private::prelude_id;
 use crate::repl::complete::types::TypeIndex;
 use crate::repl::docstrings::Docstrings;
 use crate::repl::output::ReplEmitter;
@@ -68,6 +70,7 @@ use crate::repl::render::RenderBudget;
 use crate::repl::render::RenderContext;
 use crate::repl::render::RenderMode;
 use crate::repl::render::Rendered;
+use crate::repl::render::RenderedText;
 use crate::repl::render::ReplFailure;
 use crate::repl::render::render;
 use crate::repl::thread::EvalKind;
@@ -75,10 +78,17 @@ use crate::repl::thread::EvalReply;
 use crate::repl::thread::EvalWork;
 use crate::repl::thread::SessionConfig;
 use crate::repl::thread::heap_bytes;
+use crate::repl::who::who;
 
 /// The synthetic `.bxl` file of the session, in its working directory. It is never read; loads
 /// resolve relative to it.
 pub(crate) const REPL_FILE_NAME: &str = "__repl__.bxl";
+
+/// The session's synthetic `.bxl` file in its working directory `cwd`, which loads resolve
+/// relative to.
+pub(crate) fn repl_file(cwd: &CellPath) -> buck2_error::Result<BxlFilePath> {
+    BxlFilePath::new(cwd.join(ForwardRelativePath::new(REPL_FILE_NAME)?))
+}
 
 /// Most names a notice about loaded modules lists.
 const MAX_NOTICE_NAMES: usize = 64;
@@ -255,26 +265,32 @@ impl Session {
             span: _,
         } = work;
 
-        let (code, import_all) = match &kind {
-            EvalKind::ImportAll { module } => (String::new(), vec![module.clone()]),
-            EvalKind::Reload => {
+        let (code, import_all, edited) = match &kind {
+            EvalKind::ImportAll { module } => (String::new(), vec![module.clone()], None),
+            EvalKind::Reload { edited } => {
                 if self.loaded.is_empty() {
-                    self.emitter.notice(
-                        id,
-                        repl_notice::Level::Info,
-                        "nothing to reload: no module has been loaded".to_owned(),
-                    );
+                    // After `:edit`, there is nothing to say.
+                    if edited.is_none() {
+                        self.emitter.notice(
+                            id,
+                            repl_notice::Level::Info,
+                            "nothing to reload: no module has been loaded".to_owned(),
+                        );
+                    }
                     return Ok(Rendered::Nothing);
                 }
                 (
                     self.loaded.load_statements(),
                     self.loaded.import_all.clone(),
+                    edited.clone(),
                 )
             }
-            EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) => (input, Vec::new()),
+            EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) | EvalKind::Who { .. } => {
+                (input, Vec::new(), None)
+            }
         };
         // Errors in code the user did not write are shown without it.
-        let generated = matches!(kind, EvalKind::Sugar | EvalKind::Reload);
+        let generated = matches!(kind, EvalKind::Sugar | EvalKind::Reload { .. });
         let mode = match kind {
             EvalKind::Render(mode) => mode,
             _ => RenderMode::Echo,
@@ -296,9 +312,8 @@ impl Session {
             String::new()
         };
 
-        let repl_path = ForwardRelativePath::new(REPL_FILE_NAME)
-            .and_then(|name| BxlFilePath::new(cwd.join(name)))
-            .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Internal, &e))?;
+        let repl_path =
+            repl_file(&cwd).map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Internal, &e))?;
 
         let mut dc = txn.ctx();
         let prepared = self.block_on(
@@ -314,6 +329,7 @@ impl Session {
                     global_cfg_options,
                     need_prelude: self.need_prelude,
                     import_all,
+                    edited,
                 },
             ),
         )?;
@@ -326,6 +342,7 @@ impl Session {
             core,
             provider,
             digest_config,
+            edited_loaded,
         } = prepared;
 
         if let Some(prelude) = prelude {
@@ -334,7 +351,7 @@ impl Session {
                 Ok(modules) => {
                     for (i, module) in modules.iter().enumerate() {
                         env.import_public_symbols(module);
-                        self.private.import_all(&format!("<prelude {i}>"), module);
+                        self.private.import_all(&prelude_id(i), module);
                     }
                     self.prelude_loaded = !modules.is_empty();
                 }
@@ -353,6 +370,11 @@ impl Session {
                     );
                 }
             }
+        }
+
+        if edited_loaded == Some(false) {
+            // The file edited is not loaded by the session: nothing to reload.
+            return Ok(Rendered::Nothing);
         }
 
         // Modules imported whole: their public symbols become (private) bindings of the session,
@@ -442,7 +464,7 @@ impl Session {
                 if PrivateBindings::exported(module, symbol).is_none() {
                     break 'loads;
                 }
-                self.private.load(local, module, symbol);
+                self.private.load(local, module_id, module, symbol);
             }
         }
         self.last_token = Some(
@@ -487,7 +509,7 @@ impl Session {
                     );
                 }
             }
-            EvalKind::Reload => {
+            EvalKind::Reload { .. } => {
                 let mut notice = CappedString::new(MAX_NOTICE_BYTES);
                 let _ignored = fmt::write(&mut notice, format_args!("reloaded"));
                 for (i, module) in self.loaded.modules().enumerate() {
@@ -496,6 +518,15 @@ impl Session {
                 }
                 self.emitter
                     .notice(id, repl_notice::Level::Info, notice.into_string());
+            }
+            EvalKind::Who { globs } => {
+                let cancelled = || liveness.is_cancelled();
+                let budget = RenderBudget::new(&cancelled);
+                let text = who(env, &self.private, globs, &core, &budget)?;
+                return Ok(Rendered::Text(RenderedText {
+                    text,
+                    incomplete: None,
+                }));
             }
             EvalKind::Input | EvalKind::Sugar | EvalKind::Render(_) => {}
         }
