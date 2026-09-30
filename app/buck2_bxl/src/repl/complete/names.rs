@@ -41,8 +41,7 @@ use crate::repl::complete::candidates::completions_status;
 use crate::repl::complete::private::PrivateBindings;
 use crate::repl::complete::types::TypeIndex;
 
-/// Longest rendering of the type of a function defined in the session that is read for its
-/// return type.
+/// Longest rendering of the type of a `def` or a `lambda` that is read for its return type.
 const MAX_FUNCTION_TYPE_BYTES: usize = 4 << 10;
 
 /// Completes a name or an attribute (`req.kind` is `NAME` or `ATTR`).
@@ -121,11 +120,13 @@ fn names(
         }
         match binding(env, private, visibility, name) {
             Some(value) => add(candidates, name, kind_of(value), value.get_type()),
-            // A loaded symbol whose origin is not known.
-            None if visibility == Visibility::Private => {
+            // Defined in the session with a private name (`_x = 1`): the module does not give
+            // out its value.
+            None if visibility == Visibility::Private && name.starts_with('_') => {
                 add(candidates, name, repl_candidate::Kind::Value, "")
             }
-            // Declared by an input that failed before it assigned it.
+            // Declared by an input that failed before it assigned it, or by a `load` whose
+            // symbol does not exist.
             None => continue,
         }
         bound.insert(name);
@@ -283,15 +284,20 @@ fn walk<'v>(
 }
 
 /// The names of the types of what calling `v` returns, from its documentation (or, for a
-/// function defined in the session, from its type).
+/// `def` or a `lambda`, from its type).
 fn returns(v: Value) -> Option<Vec<String>> {
+    if v.parameters_spec().is_some() {
+        // A `def` or a `lambda` (only those have a parameters spec), defined in the session or
+        // loaded from a file. Its documentation would format the default values of its
+        // parameters with `repr`, without bound on their size or depth (as for `:doc`): a
+        // default that shares its parts (`x = [x, x]` 60 times) takes for ever, and one too
+        // deep for the stack aborts the daemon. Its type has the return type, and shows default
+        // values as `...`.
+        return def_returns(v);
+    }
     match v.get_type() {
-        "function" if !v.is_frozen() && Ty::of_value(v).as_function().is_some() => {
-            // A `def` (or a `lambda`) defined in the session. Its documentation would format
-            // the default values of its parameters, which may be huge or too deep for the
-            // stack (as for `:doc`); its type has the return type.
-            def_returns(v)
-        }
+        // Native functions and methods (their documentation is made once, when they are
+        // registered), types, and other callables whose documentation formats no value.
         "function" | "native_method" | "type" => match v.documentation() {
             DocItem::Member(DocMember::Function(f)) => Some(type_names(&f.ret.typ)),
             DocItem::Type(t) => Some(type_names(&t.ty)),
@@ -301,7 +307,7 @@ fn returns(v: Value) -> Option<Vec<String>> {
     }
 }
 
-/// The return types of a function defined in the session, read from its type
+/// The return types of a `def` or a `lambda`, read from its type
 /// (`def(x: int) -> bxl.CqueryContext | None`): the type of a function is not public otherwise.
 fn def_returns(v: Value) -> Option<Vec<String>> {
     let mut rendered = CappedString::new(MAX_FUNCTION_TYPE_BYTES);

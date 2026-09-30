@@ -429,12 +429,19 @@ impl Session {
             },
         )
         .map_err(|e| ReplFailure::from_buck2(repl_error::Kind::Internal, &e))?;
-        // Whether the evaluation succeeded or not, the loads it made are bindings now.
-        for (module_id, symbols) in &load_statements {
-            if let Some(module) = loader.0.get(module_id) {
-                for (local, symbol) in symbols {
-                    self.private.load(local, module, symbol);
+        // Whether the evaluation succeeded or not, the loads it made are bindings now. `load`
+        // statements run in order, and the first symbol that cannot be loaded stops the
+        // evaluation: the symbols after it are not bound. (A `load` after another statement that
+        // failed is recorded all the same: which statement failed is not known here.)
+        'loads: for (module_id, symbols) in &load_statements {
+            let Some(module) = loader.0.get(module_id) else {
+                break;
+            };
+            for (local, symbol) in symbols {
+                if PrivateBindings::exported(module, symbol).is_none() {
+                    break 'loads;
                 }
+                self.private.load(local, module, symbol);
             }
         }
         self.last_token = Some(

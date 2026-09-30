@@ -1,0 +1,28 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+# Completion through calls of functions loaded from a file (`typed().up<TAB>`,
+# `cq(ctx).de<TAB>`). `EXP` shares its parts: its `repr` is exponentially long, so completion
+# must never format the default values of these functions.
+
+def _mk_exp():
+    x = []
+    for _i in range(60):
+        x = [x, x]
+    return x
+
+EXP = _mk_exp()
+
+def typed(a = EXP) -> str:
+    return str(len(a))
+
+def cq(ctx, a = EXP) -> bxl.CqueryContext:
+    return ctx.cquery()
+
+def untyped(a = EXP):
+    return a

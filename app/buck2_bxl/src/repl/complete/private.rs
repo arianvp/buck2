@@ -33,7 +33,21 @@ pub(crate) struct PrivateBindings {
 }
 
 impl PrivateBindings {
-    /// `load(<module>, local = "symbol")`.
+    /// The value `load` (and `Module::import_public_symbols`) bind to `symbol` from `module`:
+    /// only symbols it exports, whose names do not start with `_`. `None` if a `load` of it
+    /// fails.
+    pub(crate) fn exported(
+        module: &FrozenModule,
+        symbol: &str,
+    ) -> Option<OwnedFrozen<Value<'static>>> {
+        if symbol.starts_with('_') {
+            return None;
+        }
+        module.get(symbol).ok()
+    }
+
+    /// `load(<module>, local = "symbol")` bound `local`: the caller checked that `symbol` is
+    /// [`exported`](Self::exported).
     pub(crate) fn load(&mut self, local: &str, module: &FrozenModule, symbol: &str) {
         self.loaded
             .insert(local.to_owned(), (module.dupe(), symbol.to_owned()));
@@ -43,7 +57,9 @@ impl PrivateBindings {
     pub(crate) fn import_all(&mut self, id: &str, module: &FrozenModule) {
         // The names it binds are no longer the ones loaded by name.
         for name in module.names() {
-            self.loaded.remove(name);
+            if !name.starts_with('_') {
+                self.loaded.remove(name);
+            }
         }
         self.imported.retain(|(known, _)| known != id);
         self.imported.push((id.to_owned(), module.dupe()));
@@ -52,11 +68,13 @@ impl PrivateBindings {
     /// The value of the private binding `name`, if it is known.
     pub(crate) fn get(&self, name: &str) -> Option<OwnedFrozen<Value<'static>>> {
         if let Some((module, symbol)) = self.loaded.get(name) {
-            return module.get_any_visibility(symbol).ok().map(|(v, _)| v);
+            return Self::exported(module, symbol);
         }
+        // Only what the import bound: a module imported later that has a private binding of
+        // the same name (a symbol it loaded itself) did not rebind it.
         self.imported
             .iter()
             .rev()
-            .find_map(|(_, module)| module.get_any_visibility(name).ok().map(|(v, _)| v))
+            .find_map(|(_, module)| Self::exported(module, name))
     }
 }

@@ -208,10 +208,31 @@ enum Materialized {
     Interrupted,
 }
 
-/// What happened while a request was in flight.
+/// What happened while waiting for a request, or while a request was in flight.
 enum Event {
     SessionEnded,
     Request(Option<buck2_error::Result<ReplRequest>>),
+    /// The session thread answered the completion `id` (`None`: the thread exited first).
+    Completed(u64, Option<ReplCompletions>),
+}
+
+/// A completion of a name or an attribute that the session thread is answering. The driver
+/// does not wait for it: it goes on reading requests and running the request in flight (a
+/// target completion, whose transaction must give way to other commands), and sends the answer
+/// when it comes.
+struct ThreadCompletion {
+    id: u64,
+    answer: tokio::sync::oneshot::Receiver<ReplCompletions>,
+}
+
+/// The answer to the thread completion in flight; never resolves while there is none.
+async fn thread_answer(
+    completing: &mut Option<ThreadCompletion>,
+) -> (u64, Option<ReplCompletions>) {
+    match completing {
+        Some(completion) => (completion.id, (&mut completion.answer).await.ok()),
+        None => std::future::pending().await,
+    }
 }
 
 pub(crate) struct Driver<'a> {
@@ -230,6 +251,9 @@ pub(crate) struct Driver<'a> {
     /// An input that arrived while a completion was in flight, which it cancelled: it runs
     /// next (Enter beats Tab).
     queued: Option<ReplRequest>,
+    /// The completion of a name or an attribute the session thread is answering, if any: at
+    /// most one at a time.
+    completing: Option<ThreadCompletion>,
 }
 
 impl<'a> Driver<'a> {
@@ -248,6 +272,7 @@ impl<'a> Driver<'a> {
             last_equality: None,
             heap_bytes: 0,
             queued: None,
+            completing: None,
         }
     }
 
@@ -294,19 +319,8 @@ impl<'a> Driver<'a> {
                 Work::Interrupt => {}
                 Work::Reply { id, message } => self.emitter.emit(id, message),
                 Work::CompleteStarlark { id, req } => {
-                    // Nothing is in flight: the thread is idle, and answers at once.
-                    let answer = match thread.complete(req).await {
-                        Some(answer) => answer,
-                        None => {
-                            self.client_open = false;
-                            completions_status(
-                                repl_completions::Status::Error,
-                                "the repl session thread exited; the session is over",
-                            )
-                        }
-                    };
-                    self.emitter
-                        .emit(id, repl_message::Message::Completions(answer));
+                    // Answered when the thread is done (`next_request`, `in_flight`).
+                    self.start_thread_completion(&thread, id, req);
                 }
                 Work::CompleteTargets { id, prefix } => {
                     let cancel = Arc::new(EvalCancel::new());
@@ -343,28 +357,72 @@ impl<'a> Driver<'a> {
                 break;
             }
         }
-        // No job is in flight: every one is awaited to its end.
+        // No request is in flight: every one is awaited to its end. The thread finishes a
+        // completion it is answering (it runs no code, and is bounded by the size of the values
+        // it looks at) before it exits.
         thread.shutdown().await;
         Ok(ReplResponse {})
     }
 
-    /// The next request while idle. `None` when the session is over.
+    /// The next request while idle, answering the thread completion meanwhile. `None` when the
+    /// session is over.
     async fn next_request(&mut self) -> Option<ReplRequest> {
-        if !self.client_open {
-            return None;
-        }
-        let event = tokio::select! {
-            _ = &mut self.session_obs => Event::SessionEnded,
-            m = self.req.next() => Event::Request(m),
-        };
-        match event {
-            Event::Request(Some(Ok(request))) => Some(request),
-            // The client is gone (EOF, or an error of the stream), or the command is over.
-            Event::Request(None | Some(Err(_))) | Event::SessionEnded => {
-                self.client_open = false;
-                None
+        loop {
+            if !self.client_open {
+                return None;
+            }
+            let event = tokio::select! {
+                _ = &mut self.session_obs => Event::SessionEnded,
+                m = self.req.next() => Event::Request(m),
+                (id, answer) = thread_answer(&mut self.completing) => Event::Completed(id, answer),
+            };
+            match event {
+                Event::Request(Some(Ok(request))) => return Some(request),
+                Event::Completed(id, answer) => self.answer_thread_completion(id, answer),
+                // The client is gone (EOF, or an error of the stream), or the command is over.
+                Event::Request(None | Some(Err(_))) | Event::SessionEnded => {
+                    self.client_open = false;
+                    return None;
+                }
             }
         }
+    }
+
+    /// Sends the completion `id` of a name or an attribute to the session thread, unless it is
+    /// answering one already (then the answer is `BUSY`). The driver does not wait for the
+    /// answer.
+    fn start_thread_completion(&mut self, thread: &ReplThread, id: u64, req: ReplComplete) {
+        if self.completing.is_some() {
+            self.emitter.emit(
+                id,
+                repl_message::Message::Completions(completions_status(
+                    repl_completions::Status::Busy,
+                    "busy: another completion of this session is running",
+                )),
+            );
+            return;
+        }
+        match thread.start_complete(req) {
+            Some(answer) => self.completing = Some(ThreadCompletion { id, answer }),
+            None => self.answer_thread_completion(id, None),
+        }
+    }
+
+    /// Sends the thread's answer to the completion `id`. `None`: the thread exited, which ends
+    /// the session.
+    fn answer_thread_completion(&mut self, id: u64, answer: Option<ReplCompletions>) {
+        if self.completing.as_ref().is_some_and(|c| c.id == id) {
+            self.completing = None;
+        }
+        let answer = answer.unwrap_or_else(|| {
+            self.client_open = false;
+            completions_status(
+                repl_completions::Status::Error,
+                "the repl session thread exited; the session is over",
+            )
+        });
+        self.emitter
+            .emit(id, repl_message::Message::Completions(answer));
     }
 
     /// Evaluates an input.
@@ -420,8 +478,10 @@ impl<'a> Driver<'a> {
     ///
     /// While an input runs, other requests get `BUSY` (INV-14). A completion (`completion` is
     /// the session thread, which it does not use) gives way instead: an input cancels it and runs
-    /// next, and names and attributes are completed meanwhile; only another target completion
-    /// gets `BUSY` (the one in flight keeps loading, so the next one is fast).
+    /// next, and names and attributes are completed meanwhile (by the thread, while `fut` is
+    /// still polled, so that its timeout and its preemption by other commands keep working);
+    /// only another target completion gets `BUSY` (the one in flight keeps loading, so the next
+    /// one is fast). The answer to a thread completion is sent whenever it comes.
     async fn in_flight<T>(
         &mut self,
         id: u64,
@@ -436,12 +496,19 @@ impl<'a> Driver<'a> {
                 biased;
                 outcome = &mut fut => return outcome,
                 _ = &mut self.session_obs, if self.client_open => Event::SessionEnded,
+                (answered, answer) = thread_answer(&mut self.completing) => {
+                    Event::Completed(answered, answer)
+                }
                 m = self.req.next(), if self.client_open => Event::Request(m),
             };
             let request = match event {
                 Event::SessionEnded | Event::Request(None | Some(Err(_))) => {
                     cancel.trigger();
                     self.client_open = false;
+                    continue;
+                }
+                Event::Completed(answered, answer) => {
+                    self.answer_thread_completion(answered, answer);
                     continue;
                 }
                 Event::Request(Some(Ok(request))) => request,
@@ -484,15 +551,8 @@ impl<'a> Driver<'a> {
                         repl_complete::Kind::Name | repl_complete::Kind::Attr
                     ) =>
                 {
-                    let answer = match thread.complete(complete.clone()).await {
-                        Some(answer) => answer,
-                        None => completions_status(
-                            repl_completions::Status::Error,
-                            "the repl session thread exited",
-                        ),
-                    };
-                    self.emitter
-                        .emit(request.id, repl_message::Message::Completions(answer));
+                    // The thread is not used by a target completion.
+                    self.start_thread_completion(thread, request.id, complete.clone());
                 }
                 (Some(repl_request::Request::Complete(_)), _) => self.emitter.emit(
                     request.id,

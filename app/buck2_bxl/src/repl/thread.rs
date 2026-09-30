@@ -157,7 +157,8 @@ impl ReplThread {
     }
 
     /// Starts a new session: the thread drops the session's module. Returns whether it did
-    /// (`false` if the thread has exited). The driver calls it when no job is in flight.
+    /// (`false` if the thread has exited). The driver calls it when no request is in flight (a
+    /// completion the thread is answering finishes first).
     pub(crate) async fn reset(&self) -> bool {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send(Job::Reset(ack_tx)).is_err() {
@@ -168,7 +169,7 @@ impl ReplThread {
 
     /// Binds `name` to `value` (made into a Starlark value) in the session's module. Returns the
     /// bytes allocated on the session's heap, or `None` if the thread has exited. The driver
-    /// calls it when no job is in flight.
+    /// calls it when no request is in flight (a completion the thread is answering finishes first).
     pub(crate) async fn bind(&self, name: &'static str, value: serde_json::Value) -> Option<u64> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let job = Job::Bind(BindJob {
@@ -182,18 +183,20 @@ impl ReplThread {
         ack_rx.await.ok()
     }
 
-    /// Completes a name or an attribute. `None` if the thread has exited. The driver calls it
-    /// when no job is in flight, or when the job in flight does not use the thread.
-    pub(crate) async fn complete(&self, req: ReplComplete) -> Option<ReplCompletions> {
+    /// Starts the completion of a name or an attribute, and returns where its answer comes; the
+    /// receiver fails if the thread exits first. `None` if the thread has exited. Jobs run in
+    /// the order they are sent, so a job sent after this one starts once it is answered.
+    pub(crate) fn start_complete(
+        &self,
+        req: ReplComplete,
+    ) -> Option<tokio::sync::oneshot::Receiver<ReplCompletions>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let job = Job::Complete(CompleteJob {
             req,
             reply: reply_tx,
         });
-        if self.jobs.send(job).is_err() {
-            return None;
-        }
-        reply_rx.await.ok()
+        self.jobs.send(job).ok()?;
+        Some(reply_rx)
     }
 
     /// Asks the thread to exit and waits until it has (INV-16). The driver calls it when no job
