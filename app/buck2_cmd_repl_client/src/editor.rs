@@ -27,6 +27,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use buck2_core::buck2_env;
@@ -39,6 +40,8 @@ use buck2_repl_syntax::signature::active_parameter;
 use buck2_repl_syntax::site::Step;
 use buck2_repl_syntax::site::chain_key;
 use buck2_repl_syntax::site::enclosing_call;
+use buck2_repl_syntax::terminal::Position;
+use buck2_repl_syntax::terminal::editor_position;
 use dupe::Dupe;
 use rustyline::Cmd;
 use rustyline::ColorMode;
@@ -51,6 +54,7 @@ use rustyline::Editor;
 use rustyline::Event;
 use rustyline::EventContext;
 use rustyline::EventHandler;
+use rustyline::GraphemeClusterMode;
 use rustyline::Helper;
 use rustyline::Hinter;
 use rustyline::KeyCode;
@@ -58,6 +62,8 @@ use rustyline::KeyEvent;
 use rustyline::Modifiers;
 use rustyline::RepeatCount;
 use rustyline::Validator;
+use rustyline::completion::Pair;
+use rustyline::completion::longest_common_prefix;
 use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::CmdKind;
@@ -65,6 +71,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hint;
 use rustyline::hint::HistoryHinter;
 use rustyline::history::FileHistory;
+use rustyline::line_buffer::LineBuffer;
 use rustyline::validate::ValidationContext;
 use rustyline::validate::ValidationResult;
 
@@ -151,12 +158,16 @@ struct ReplHinter {
     /// The last signature hint, and the range of its parameter that the argument at the cursor
     /// fills, which is shown in bold (the rest is faint).
     last_signature: RefCell<Option<(String, Option<Range<usize>>)>>,
+    listing: Rc<Listing>,
 }
 
 impl rustyline::hint::Hinter for ReplHinter {
     type Hint = ReplHint;
 
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<ReplHint> {
+        if self.listing.hides_hint(line, pos) {
+            return None;
+        }
         if let Some(rest) = self.history.hint(line, pos, ctx) {
             return Some(ReplHint::History(rest));
         }
@@ -227,7 +238,7 @@ struct SyntaxState {
 #[derive(Helper, Completer, Hinter, Validator)]
 struct ReplHelper {
     #[rustyline(Completer)]
-    completer: ReplCompleter,
+    completer: ListingCompleter,
     #[rustyline(Hinter)]
     hinter: ReplHinter,
     #[rustyline(Validator)]
@@ -319,29 +330,127 @@ impl ConditionalEventHandler for TabIndent {
         if before.get(line_start..)?.chars().all(char::is_whitespace) {
             Some(Cmd::Insert(n, INDENT.to_owned()))
         } else {
-            erase_signature_hint(ctx);
             None
         }
     }
 }
 
-/// Erases the signature hint shown under the input before Tab completes: rustyline lists the
-/// candidates (or asks whether to) on the rows under the input without erasing them, so the text
-/// of the hint would be left between the candidates. Only when the cursor is at the end of the
-/// input, so that it is on the input's last row and the hint is on the rows below it. The next
-/// refresh of the input shows the hint again.
-fn erase_signature_hint(ctx: &EventContext<'_>) {
-    // A signature hint inserts nothing: rustyline gives out only the text a hint inserts.
-    let signature = ctx.has_hint() && ctx.hint_text().is_none();
-    if !signature || ctx.pos() != ctx.line().len() {
-        return;
+/// What Tab does to the screen when rustyline lists several candidates (or asks whether to,
+/// `Display all N possibilities? (y or n)`): it moves the cursor to the end of the line of the
+/// cursor and writes the list on the rows under it, over what they show, without erasing it.
+/// Those rows hold the signature hint (drawn under the input) and the lines of the input after
+/// the cursor's, which would be left between the candidates. So before the list is drawn,
+/// [`ListingCompleter`] erases them, and when rustyline first inserts the candidates' common
+/// prefix (it then draws the input again, hint included, just before the list), the
+/// signature hint is hidden until the input changes or the cursor moves.
+#[derive(Default)]
+struct Listing {
+    /// The input and the cursor for which the hint is hidden.
+    hide_hint_at: RefCell<Option<(String, usize)>>,
+}
+
+impl Listing {
+    /// Whether the hint of the input `line` with the cursor at `pos` is hidden: while the input
+    /// is the one for which it was hidden (it is shown again once it changes).
+    fn hides_hint(&self, line: &str, pos: usize) -> bool {
+        let mut hidden = self.hide_hint_at.borrow_mut();
+        match &*hidden {
+            Some((l, p)) if l == line && *p == pos => true,
+            Some(_) => {
+                *hidden = None;
+                false
+            }
+            None => false,
+        }
     }
-    // Save the cursor, erase from the start of the next row to the end of the screen, put the
-    // cursor back. (The terminal is in raw mode: `\n` alone does not return the carriage.)
-    let mut stdout = std::io::stdout().lock();
-    let _ignored = stdout
-        .write_all(b"\x1b7\r\n\x1b[J\x1b8")
-        .and_then(|()| stdout.flush());
+}
+
+/// The completer of the line editor ([`ReplCompleter`]), which also clears the rows under the
+/// input when rustyline is about to list the candidates there (see [`Listing`]).
+struct ListingCompleter {
+    inner: ReplCompleter,
+    listing: Rc<Listing>,
+    /// The prompt, which the input follows on the screen.
+    prompt: String,
+    /// How the editor measures text (its configuration).
+    grapheme_mode: GraphemeClusterMode,
+    tab_stop: usize,
+}
+
+impl rustyline::completion::Completer for ListingCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let (start, candidates) = self.inner.complete(line, pos, ctx)?;
+        // One candidate is inserted; several are listed (`completion_show_all_if_ambiguous`).
+        if candidates.len() > 1 {
+            if let Some(prefix) = longest_common_prefix(&candidates)
+                && prefix.len() > pos.saturating_sub(start)
+                && let (Some(before), Some(after)) = (line.get(..start), line.get(pos..))
+            {
+                // rustyline inserts the common prefix (`update`) and draws the input again.
+                *self.listing.hide_hint_at.borrow_mut() =
+                    Some((format!("{before}{prefix}{after}"), start + prefix.len()));
+            }
+            self.erase_under_line(line, pos);
+        }
+        Ok((start, candidates))
+    }
+
+    fn update(
+        &self,
+        line: &mut LineBuffer,
+        start: usize,
+        elected: &str,
+        cl: &mut rustyline::Changeset,
+    ) {
+        self.inner.update(line, start, elected, cl)
+    }
+}
+
+impl ListingCompleter {
+    /// Erases the rows under the end of the line of the cursor (of the input `line`, the cursor
+    /// at `pos`), to the end of the screen, and puts the cursor back. Where the input is drawn is
+    /// computed as the editor computes it: after the prompt, wrapped at the terminal's width.
+    fn erase_under_line(&self, line: &str, pos: usize) {
+        let Some(columns) = render::terminal_columns() else {
+            return;
+        };
+        let (Some(before), Some(after)) = (line.get(..pos), line.get(pos..)) else {
+            return;
+        };
+        let line_end = pos + after.find('\n').unwrap_or(after.len());
+        let Some(to_line_end) = line.get(..line_end) else {
+            return;
+        };
+        let mode = self.grapheme_mode;
+        let width = |g: &str| usize::from(mode.width(g));
+        let at = |text: &str, start: Position| {
+            editor_position(text, start, columns, self.tab_stop, width)
+        };
+        let input_start = at(&self.prompt, Position::default());
+        let cursor = at(before, input_start);
+        let end = at(to_line_end, input_start);
+        // Save the cursor, go down to the row of the end of the line and to the start of the
+        // next row (the terminal is in raw mode: `\n` alone does not return the carriage), erase
+        // from there to the end of the screen, put the cursor back. The input is drawn above
+        // the hint, so there is always a row under the end of its line: `\n` does not scroll.
+        let down = end.row.saturating_sub(cursor.row);
+        let mut seq = String::from("\x1b7");
+        if down > 0 {
+            seq.push_str(&format!("\x1b[{down}B"));
+        }
+        seq.push_str("\r\n\x1b[J\x1b8");
+        let mut stdout = std::io::stdout().lock();
+        let _ignored = stdout
+            .write_all(seq.as_bytes())
+            .and_then(|()| stdout.flush());
+    }
 }
 
 /// End and Ctrl-E insert the history hint shown after the input (fish-style), as → does
@@ -411,7 +520,8 @@ impl Session {
             return;
         }
         self.inputs.print_notices(&notices);
-        let mut editor = match self.editor() {
+        let prompt = format!("{}> ", ready.cwd);
+        let mut editor = match self.editor(&prompt) {
             Ok(editor) => editor,
             Err(e) => {
                 let printed = render::print_error(
@@ -426,7 +536,6 @@ impl Session {
         if let Next::Stop = self.inputs.run_first(first) {
             return;
         }
-        let prompt = format!("{}> ", ready.cwd);
 
         // Consecutive Ctrl-Cs at the prompt.
         let mut interrupts: u32 = 0;
@@ -498,8 +607,8 @@ impl Session {
         }
     }
 
-    /// The line editor, with the history loaded.
-    fn editor(&mut self) -> rustyline::Result<Editor<ReplHelper, FileHistory>> {
+    /// The line editor, with the history loaded. `prompt` is the prompt it shows.
+    fn editor(&mut self, prompt: &str) -> rustyline::Result<Editor<ReplHelper, FileHistory>> {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .completion_show_all_if_ambiguous(true)
@@ -507,13 +616,22 @@ impl Session {
             .auto_add_history(true)
             .max_history_size(MAX_HISTORY)?
             .build();
+        let listing = Rc::new(Listing::default());
+        let completer = ListingCompleter {
+            inner: ReplCompleter::new(self.inputs.completer.dupe()),
+            listing: listing.dupe(),
+            prompt: prompt.to_owned(),
+            grapheme_mode: config.grapheme_cluster_mode(),
+            tab_stop: usize::from(config.tab_stop()),
+        };
         let mut editor = Editor::with_config(config)?;
         editor.set_helper(Some(ReplHelper {
-            completer: ReplCompleter::new(self.inputs.completer.dupe()),
+            completer,
             hinter: ReplHinter {
                 history: HistoryHinter::new(),
                 completer: self.inputs.completer.dupe(),
                 last_signature: RefCell::new(None),
+                listing,
             },
             validator: ReplValidator(self.inputs.ui.dupe()),
             syntax: SyntaxState::default(),
