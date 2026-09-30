@@ -225,8 +225,9 @@ function
 `:doc` (`:d`) shows the documentation of a function, a type or a namespace (for
 any other value, of its type), and `:qdoc rdeps` that of a query function. The
 documentation is written in Markdown and shown as text: headings are bold, code
-is highlighted and indented, and paragraphs are wrapped (plain text, without
-colours, when colour is off, in scripts and with `--json`):
+is highlighted and indented, paragraphs are wrapped and tables are shown as
+written (plain text, without colours, when colour is off, in scripts and with
+`--json`):
 
 ```text
 root//> :doc ctx.cquery().deps

@@ -21,8 +21,13 @@
 //! - The lines of a paragraph are joined (as in Markdown) and wrapped at spaces to the width;
 //!   a list item starts a line of its own (even inside a paragraph, and however it is
 //!   indented), and its lines wrap under its text. Blank lines are kept, several as one.
+//! - The rows of a table (lines that start with `|`) are lines of their own, shown as they are
+//!   (their columns stay aligned).
 //!
-//! Only the constructs that documentation uses are known; anything else is shown as it is.
+//! Only the constructs that documentation uses are known: the lines of anything else (a block
+//! quote, HTML) are paragraph text, their marks shown as they are.
+
+use std::cell::Cell as StdCell;
 
 use crate::highlight;
 use crate::terminal::char_width;
@@ -53,9 +58,14 @@ const CODE_INDENT: &str = "    ";
 /// A thematic break (`---`) is a line of this many `─`.
 const RULE_WIDTH: usize = 40;
 
-/// Paragraphs longer than this (in bytes) only get their backslash escapes replaced: finding
-/// the end of an emphasis or a code span may scan the rest of the paragraph for each delimiter.
-const MAX_INLINE_LINE: usize = 8192;
+/// The work that rendering the inline Markdown of a paragraph may take: this many steps (about
+/// a character looked at each) per byte of it, plus [`INLINE_WORK_BASE`]. Finding where an
+/// emphasis, a code span or a link ends scans ahead, possibly to the end of the paragraph, for
+/// each delimiter: when many delimiters close nothing, that would take time that grows with the
+/// square (or, code spans inside emphasis, the cube) of the paragraph's length. A paragraph that
+/// needs more only gets its backslash escapes replaced ([`unescape_only`]).
+const INLINE_WORK_PER_BYTE: usize = 32;
+const INLINE_WORK_BASE: usize = 4096;
 
 /// Emphasis nested deeper than this is shown as it is.
 const MAX_INLINE_DEPTH: usize = 8;
@@ -104,6 +114,10 @@ pub fn render(markdown: &str, width: usize, styling: Styling) -> String {
         if is_rule(text) {
             r.paragraph(para.take());
             r.rule();
+        } else if text.starts_with('|') {
+            // A row of a table: a line of its own, as it is (its columns are aligned).
+            r.paragraph(para.take());
+            r.code_line(trimmed);
         } else if let Some(item) = list_item(text) {
             // A list item starts a paragraph of its own, even in a paragraph.
             r.paragraph(para.take());
@@ -169,7 +183,7 @@ struct Paragraph {
 /// emphasis marks, escapes and link syntax are removed, code keeps its backquotes.
 pub fn inline_plain(text: &str) -> String {
     let mut cells = Vec::new();
-    inline(text, 0, Styling::Plain, 0, &mut cells);
+    inline_paragraph(text, 0, Styling::Plain, &mut cells);
     cells.into_iter().map(|(c, _)| c).collect()
 }
 
@@ -295,10 +309,65 @@ fn is_rule(text: &str) -> bool {
         && text.chars().filter(|c| *c == ch).count() >= 3
 }
 
-/// Appends the rendering of the inline Markdown `text` (one line) to `out`, every character
-/// with the style `base` added.
-fn inline(text: &str, base: Style, styling: Styling, depth: usize, out: &mut Vec<Cell>) {
-    if text.len() > MAX_INLINE_LINE || depth > MAX_INLINE_DEPTH {
+/// What is left of the work allowed for rendering the inline Markdown of a paragraph (see
+/// [`INLINE_WORK_PER_BYTE`]).
+struct Budget {
+    left: StdCell<usize>,
+    /// The work needed more than was allowed: what was rendered is not complete.
+    exceeded: StdCell<bool>,
+}
+
+impl Budget {
+    fn for_text(text: &str) -> Budget {
+        Budget {
+            left: StdCell::new(
+                text.len()
+                    .saturating_mul(INLINE_WORK_PER_BYTE)
+                    .saturating_add(INLINE_WORK_BASE),
+            ),
+            exceeded: StdCell::new(false),
+        }
+    }
+
+    /// Spends `steps`: false (from then on) if there is not that much left.
+    fn spend(&self, steps: usize) -> bool {
+        match self.left.get().checked_sub(steps) {
+            Some(left) if !self.exceeded.get() => {
+                self.left.set(left);
+                true
+            }
+            _ => {
+                self.exceeded.set(true);
+                false
+            }
+        }
+    }
+}
+
+/// Appends the rendering of the inline Markdown `text` (a paragraph, its lines joined) to `out`,
+/// every character with the style `base` added; only its backslash escapes are replaced if that
+/// takes more work than allowed (see [`INLINE_WORK_PER_BYTE`]).
+fn inline_paragraph(text: &str, base: Style, styling: Styling, out: &mut Vec<Cell>) {
+    let budget = Budget::for_text(text);
+    let mark = out.len();
+    inline(text, base, styling, 0, &budget, out);
+    if budget.exceeded.get() {
+        out.truncate(mark);
+        unescape_only(text, base, out);
+    }
+}
+
+/// Appends the rendering of the inline Markdown `text` to `out`, every character with the style
+/// `base` added. Stops early when `budget` runs out (the caller then renders `text` otherwise).
+fn inline(
+    text: &str,
+    base: Style,
+    styling: Styling,
+    depth: usize,
+    budget: &Budget,
+    out: &mut Vec<Cell>,
+) {
+    if depth > MAX_INLINE_DEPTH {
         unescape_only(text, base, out);
         return;
     }
@@ -306,6 +375,9 @@ fn inline(text: &str, base: Style, styling: Styling, depth: usize, out: &mut Vec
         |out: &mut Vec<Cell>, s: &str, style: Style| out.extend(s.chars().map(|c| (c, style)));
     let mut i = 0;
     while let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) {
+        if !budget.spend(1) {
+            return;
+        }
         let rest = text.get(i..).unwrap_or("");
         match c {
             '\\' => {
@@ -323,7 +395,7 @@ fn inline(text: &str, base: Style, styling: Styling, depth: usize, out: &mut Vec
             }
             '`' => {
                 let run = backquotes(rest);
-                if let Some((content, end)) = code_span(text, i, run) {
+                if let Some((content, end)) = code_span(text, i, run, budget) {
                     match styling {
                         Styling::Plain => push(out, text.get(i..end).unwrap_or(""), base | CODE),
                         Styling::Ansi => push(out, content, base | CODE),
@@ -336,18 +408,25 @@ fn inline(text: &str, base: Style, styling: Styling, depth: usize, out: &mut Vec
                 continue;
             }
             '[' => {
-                if let Some(end) = link(text, i, base, styling, depth, out) {
+                if let Some(end) = link(text, i, base, styling, depth, budget, out) {
                     i = end;
                     continue;
                 }
             }
             '<' => {
-                // An autolink: `<https://...>`.
-                if let Some(close) = rest.find('>') {
+                // An autolink: `<https://...>` (no spaces in it).
+                let end = rest
+                    .get(1..)
+                    .and_then(|r| r.find(|c: char| c == '>' || c == '<' || c.is_whitespace()))
+                    .map(|e| e + 1);
+                if !budget.spend(end.unwrap_or(rest.len())) {
+                    return;
+                }
+                if let Some(close) =
+                    end.filter(|e| rest.get(*e..).is_some_and(|r| r.starts_with('>')))
+                {
                     let target = rest.get(1..close).unwrap_or("");
-                    if (target.starts_with("http://") || target.starts_with("https://"))
-                        && !target.contains(char::is_whitespace)
-                    {
+                    if target.starts_with("http://") || target.starts_with("https://") {
                         push(out, target, base);
                         i += close + 1;
                         continue;
@@ -355,8 +434,8 @@ fn inline(text: &str, base: Style, styling: Styling, depth: usize, out: &mut Vec
                 }
             }
             '*' | '_' => {
-                if let Some((inner, style, end)) = emphasis(text, i, c) {
-                    inline(inner, base | style, styling, depth + 1, out);
+                if let Some((inner, style, end)) = emphasis(text, i, c, budget) {
+                    inline(inner, base | style, styling, depth + 1, budget, out);
                     i = end;
                     continue;
                 }
@@ -401,14 +480,25 @@ fn backquotes(text: &str) -> usize {
 }
 
 /// The code span that starts at `start` of `text` with `run` backquotes: its content and where
-/// it ends. `None` if no run of as many backquotes closes it.
-fn code_span(text: &str, start: usize, run: usize) -> Option<(&str, usize)> {
+/// it ends. `None` if no run of as many backquotes closes it (or `budget` runs out).
+fn code_span<'a>(
+    text: &'a str,
+    start: usize,
+    run: usize,
+    budget: &Budget,
+) -> Option<(&'a str, usize)> {
     let from = start + run;
     let mut j = from;
     while let Some(rest) = text.get(j..) {
-        let offset = rest.find('`')?;
+        let Some(offset) = rest.find('`') else {
+            budget.spend(rest.len());
+            return None;
+        };
         let at = j + offset;
         let len = backquotes(text.get(at..)?);
+        if !budget.spend(offset + len) {
+            return None;
+        }
         if len == run {
             let content = text.get(from..at)?;
             // One space on each side is not part of the code (it lets code start with `).
@@ -433,15 +523,20 @@ fn link(
     base: Style,
     styling: Styling,
     depth: usize,
+    budget: &Budget,
     out: &mut Vec<Cell>,
 ) -> Option<usize> {
-    let close = matching_bracket(text, start)?;
+    let close = matching_bracket(text, start, budget)?;
     let label = text.get(start + 1..close)?;
     let after = text.get(close + 1..)?;
     if after.starts_with('(') {
-        let paren = after.find(')')?;
+        let paren = after.find(')');
+        if !budget.spend(paren.unwrap_or(after.len())) {
+            return None;
+        }
+        let paren = paren?;
         let target = after.get(1..paren)?.split_whitespace().next().unwrap_or("");
-        inline(label, base, styling, depth + 1, out);
+        inline(label, base, styling, depth + 1, budget, out);
         // A link to a heading of the same page (`#name`) leads nowhere on a terminal.
         if !target.is_empty() && !target.starts_with('#') && target != label.trim() {
             out.extend(" (".chars().map(|c| (c, base)));
@@ -452,8 +547,8 @@ fn link(
     }
     let label = label.trim();
     let run = backquotes(label);
-    if run > 0 && code_span(label, 0, run).is_some_and(|(_, end)| end == label.len()) {
-        inline(label, base, styling, depth + 1, out);
+    if run > 0 && code_span(label, 0, run, budget).is_some_and(|(_, end)| end == label.len()) {
+        inline(label, base, styling, depth + 1, budget, out);
         return Some(close + 1);
     }
     None
@@ -461,10 +556,13 @@ fn link(
 
 /// The `]` that closes the `[` at `start` of `text` (brackets nest; escaped ones and those in
 /// code spans do not count).
-fn matching_bracket(text: &str, start: usize) -> Option<usize> {
+fn matching_bracket(text: &str, start: usize, budget: &Budget) -> Option<usize> {
     let mut depth = 0usize;
     let mut j = start;
     while let Some(c) = text.get(j..).and_then(|rest| rest.chars().next()) {
+        if !budget.spend(1) {
+            return None;
+        }
         match c {
             '\\' => {
                 j += 1 + text.get(j + 1..)?.chars().next().map_or(0, char::len_utf8);
@@ -472,7 +570,7 @@ fn matching_bracket(text: &str, start: usize) -> Option<usize> {
             }
             '`' => {
                 let run = backquotes(text.get(j..)?);
-                j = code_span(text, j, run).map_or(j + run, |(_, end)| end);
+                j = code_span(text, j, run, budget).map_or(j + run, |(_, end)| end);
                 continue;
             }
             '[' => depth += 1,
@@ -493,7 +591,12 @@ fn matching_bracket(text: &str, start: usize) -> Option<usize> {
 /// text, its style and where it ends. One delimiter is italic, two bold, three both. The
 /// opening run must be followed by a character that is not a space, the closing one preceded
 /// by one; with `_`, neither may be inside a word (`snake_case`).
-fn emphasis(text: &str, start: usize, d: char) -> Option<(&str, Style, usize)> {
+fn emphasis<'a>(
+    text: &'a str,
+    start: usize,
+    d: char,
+    budget: &Budget,
+) -> Option<(&'a str, Style, usize)> {
     let rest = text.get(start..)?;
     let run = rest.chars().take_while(|c| *c == d).count();
     let style = match run {
@@ -518,6 +621,9 @@ fn emphasis(text: &str, start: usize, d: char) -> Option<(&str, Style, usize)> {
     }
     let mut j = from;
     while let Some(c) = text.get(j..).and_then(|r| r.chars().next()) {
+        if !budget.spend(1) {
+            return None;
+        }
         match c {
             '\\' => {
                 j += 1 + text.get(j + 1..)?.chars().next().map_or(0, char::len_utf8);
@@ -525,7 +631,7 @@ fn emphasis(text: &str, start: usize, d: char) -> Option<(&str, Style, usize)> {
             }
             '`' => {
                 let len = backquotes(text.get(j..)?);
-                j = code_span(text, j, len).map_or(j + len, |(_, end)| end);
+                j = code_span(text, j, len, budget).map_or(j + len, |(_, end)| end);
                 continue;
             }
             _ if c == d => {
@@ -655,7 +761,7 @@ impl Renderer {
             prefix.push((' ', 0));
         }
         let mut cells = Vec::new();
-        inline(&para.text, para.style, self.styling, 0, &mut cells);
+        inline_paragraph(&para.text, para.style, self.styling, &mut cells);
         self.wrapped(para.indent, &prefix, &cells);
     }
 
@@ -954,13 +1060,67 @@ mod tests {
 
     #[test]
     fn test_long_lines_and_nesting() {
-        // Long lines only get their escapes replaced (finding delimiters is quadratic).
+        // Many delimiters that close nothing: only the escapes are replaced.
         let long = format!("{}a\\_b", "*x ".repeat(5000));
         let out = plain(&long);
         assert!(out.contains("a_b"));
+        assert!(out.starts_with("*x *x"));
         // Deep nesting is shown as it is.
         let nested = format!("{}x{}", "*_".repeat(40), "_*".repeat(40));
         let out = plain(&nested);
         assert!(out.contains('x'));
+    }
+
+    /// A paragraph whose delimiters close nothing, as many as fit, with code spans that do not
+    /// close either: each emphasis looks for its end over the rest of the paragraph, and at each
+    /// run of backquotes for the end of a code span.
+    fn costly_paragraph(len: usize) -> String {
+        let mut para = String::new();
+        let mut n = 1;
+        while para.len() < len {
+            para.push_str(&"*a ".repeat(30));
+            para.push_str(&"`".repeat(n));
+            para.push(' ');
+            para.push_str("[b ");
+            n += 1;
+        }
+        para
+    }
+
+    #[test]
+    fn test_inline_work_is_bounded() {
+        // Such a paragraph takes work that grows with the cube of its length; it only gets its
+        // escapes replaced once that is more than the paragraph's allowance.
+        let para = format!("{}\\_", costly_paragraph(8000));
+        let out = render(&para, 1_000_000, Styling::Plain);
+        assert_eq!(out, para.replace("\\_", "_").trim_end());
+
+        // Rendering stays fast: 100 such paragraphs (800 KB) take well under a second in an
+        // optimized build (over 30 seconds when the work was not bounded).
+        let doc = vec![costly_paragraph(8000); 100].join("\n\n");
+        let started = std::time::Instant::now();
+        let out = render(&doc, 88, Styling::Ansi);
+        let took = std::time::Instant::now().saturating_duration_since(started);
+        assert!(!out.is_empty());
+        assert!(took < std::time::Duration::from_secs(15), "{took:?}");
+
+        // Ordinary text is rendered with its delimiters, however long the paragraph.
+        let long = "*a* `b` [c](d) ".repeat(2000);
+        let out = render(&long, 1_000_000, Styling::Plain);
+        assert_eq!(out, "a `b` c (d) ".repeat(2000).trim_end());
+    }
+
+    #[test]
+    fn test_tables() {
+        let md = "A table:\n| col a | col b |\n|-------|-------|\n| `1`   | 2\\_    |\nafter it.";
+        assert_eq!(
+            plain(md),
+            "A table:\n| col a | col b |\n|-------|-------|\n| `1`   | 2\\_    |\nafter it."
+        );
+        // Indented under a list item too.
+        assert_eq!(
+            plain("- item\n  | a | b |\n  | 1 | 2 |"),
+            "- item\n  | a | b |\n  | 1 | 2 |"
+        );
     }
 }
