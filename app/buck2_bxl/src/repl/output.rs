@@ -9,8 +9,8 @@
  */
 
 //! How the session talks to the client: [`ReplEmitter`] sends `ReplMessage`s (from the driver
-//! and from the session thread alike), and [`ReplPrintHandler`] turns `print()` into buffered
-//! `ReplOutput`.
+//! and from the session thread alike), [`ReplOutputWriter`] turns bytes into `ReplOutput`, and
+//! [`ReplPrintHandler`] turns `print()` into buffered `ReplOutput`.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -90,6 +90,35 @@ impl ReplEmitter {
                 }),
             );
         }
+    }
+}
+
+/// Writes the output of one request to one of the client's streams, as `ReplOutput` chunks of
+/// at most [`MAX_OUTPUT_CHUNK`] bytes. Unbuffered: every write is sent.
+pub(crate) struct ReplOutputWriter {
+    emitter: ReplEmitter,
+    id: u64,
+    channel: repl_output::Channel,
+}
+
+impl ReplOutputWriter {
+    pub(crate) fn new(emitter: ReplEmitter, id: u64, channel: repl_output::Channel) -> Self {
+        ReplOutputWriter {
+            emitter,
+            id,
+            channel,
+        }
+    }
+}
+
+impl std::io::Write for ReplOutputWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.emitter.output(self.id, self.channel, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

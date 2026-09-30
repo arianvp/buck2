@@ -224,11 +224,11 @@ impl Session {
             |eval| {
                 let heap = eval.heap();
                 let cli_args = ValueOfUnchecked::new(heap.alloc(AllocStruct::EMPTY));
-                let ctx = BxlContext::new(heap, core, stream, cli_args, digest_config)?;
+                let ctx = BxlContext::new(heap, core.dupe(), stream, cli_args, digest_config)?;
                 env.set("ctx", heap.alloc(ctx));
                 Ok(match eval.eval_module(ast, &globals) {
                     Ok(v) => {
-                        let rendered = render_echo(v);
+                        let rendered = render_echo(v, &core);
                         if !v.is_none() {
                             env.set("_", v);
                         }

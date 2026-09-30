@@ -25,6 +25,8 @@ use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
+use buck2_build_api::bxl::result::PendingStreamingOutput;
+use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::ReplDone;
 use buck2_cli_proto::ReplError;
@@ -40,8 +42,11 @@ use buck2_cli_proto::repl_message;
 use buck2_cli_proto::repl_output;
 use buck2_cli_proto::repl_request;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_common::events::HasEvents;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::target::label::label::TargetLabel;
+use buck2_data::BxlEnsureArtifactsEnd;
+use buck2_data::BxlEnsureArtifactsStart;
 use buck2_error::buck2_error;
 use buck2_events::dispatch::current_span;
 use buck2_repl_syntax::commands::Handler;
@@ -51,18 +56,23 @@ use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
 use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use dice::DiceEquality;
+use dice::DiceTransaction;
 use dice_futures::cancellation::CancellationContext;
 use dice_futures::cancellation::CancellationObserver;
 use dice_futures::spawn::prepare_detached_cancellation;
 use dupe::Dupe;
+use dupe::IterDupedExt;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::Fuse;
 use tokio::runtime::Handle;
 
+use crate::bxl::starlark_defs::context::output::OutputStreamOutcome;
+use crate::command::materialize_ensured_artifacts;
 use crate::repl::cancel::EvalCancel;
 use crate::repl::line_ctx::ReplCtx;
 use crate::repl::output::ReplEmitter;
+use crate::repl::output::ReplOutputWriter;
 use crate::repl::render::ReplFailure;
 use crate::repl::thread::EvalJob;
 use crate::repl::thread::EvalReply;
@@ -105,6 +115,7 @@ enum Outcome {
     ThreadExited,
     Eval {
         reply: Box<EvalReply>,
+        materialized: Materialized,
         cwd: CellPath,
         target_platform: Option<TargetLabel>,
         equality: DiceEquality,
@@ -112,6 +123,15 @@ enum Outcome {
         t1: Instant,
         t2: Instant,
     },
+}
+
+/// How the materialization of the artifacts an input ensured (`ctx.output.ensure`) went.
+enum Materialized {
+    /// Every artifact was materialized, or there were none.
+    Done,
+    Failed(Vec<buck2_error::Error>),
+    /// The request was cancelled before every artifact was materialized.
+    Interrupted,
 }
 
 /// What happened while a request was in flight.
@@ -299,12 +319,12 @@ impl<'a> Driver<'a> {
             reply,
             cwd,
             target_platform,
-            equality,
             ..
         }) = &outcome
             && reply.result.is_ok()
         {
-            self.last_equality = Some(*equality);
+            // `last_equality` stays unset: the first input is never flagged as stale, since
+            // no earlier input computed anything (spec §2).
             self.emitter.emit(
                 id,
                 repl_message::Message::Ready(ReplReady {
@@ -347,12 +367,15 @@ impl<'a> Driver<'a> {
             },
             Ok(Outcome::Eval {
                 reply,
+                materialized,
                 equality,
                 t0,
                 t1,
                 t2,
                 ..
             }) => {
+                // Values computed by an earlier input may be stale. The first input has no
+                // earlier input to compare with.
                 let sources_changed = self.last_equality.is_some_and(|last| last != equality);
                 self.last_equality = Some(equality);
                 let EvalReply {
@@ -361,18 +384,26 @@ impl<'a> Driver<'a> {
                     heap_bytes,
                     prelude_loaded: _,
                 } = *reply;
-                let outcome = match (result, drained) {
-                    (Err(failure), _) => Some(repl_done::Outcome::Error(failure_proto(failure))),
-                    (Ok(_), Err(e)) => Some(repl_done::Outcome::Error(failure_proto(
+                let outcome = match (result, drained, materialized) {
+                    (Err(failure), _, _) => Some(repl_done::Outcome::Error(failure_proto(failure))),
+                    (Ok(_), Err(e), _) => Some(repl_done::Outcome::Error(failure_proto(
                         ReplFailure::from_buck2(repl_error::Kind::Buck, &e),
                     ))),
-                    (Ok(None), Ok(_)) => None,
-                    (Ok(Some(value)), Ok(_)) => Some(repl_done::Outcome::Value(ReplValue {
-                        r#type: value.type_name,
-                        text: value.text,
-                        truncated: value.truncated,
-                        json: None,
-                    })),
+                    (Ok(_), Ok(_), Materialized::Interrupted) => Some(repl_done::Outcome::Error(
+                        failure_proto(ReplFailure::interrupted()),
+                    )),
+                    (Ok(_), Ok(_), Materialized::Failed(errors)) => Some(
+                        repl_done::Outcome::Error(failure_proto(materialization_failure(&errors))),
+                    ),
+                    (Ok(None), Ok(_), Materialized::Done) => None,
+                    (Ok(Some(value)), Ok(_), Materialized::Done) => {
+                        Some(repl_done::Outcome::Value(ReplValue {
+                            r#type: value.type_name,
+                            text: value.text,
+                            truncated: value.truncated,
+                            json: None,
+                        }))
+                    }
                 };
                 ReplDone {
                     outcome,
@@ -540,8 +571,28 @@ async fn run_eval(
                 });
             };
 
-            // `ctx.output.print` output, after the evaluation as in `buck2 bxl`. Streamed output
-            // was shown as it was written.
+            // The artifacts the input ensured, unless it failed (as in `buck2 bxl`). Pending
+            // `ctx.output.stream` output is shown as its artifacts are materialized.
+            let materialized = match &reply {
+                EvalReply {
+                    result: Ok(_),
+                    drained: Ok(drained),
+                    ..
+                } if !drained.ensured_artifacts.is_empty()
+                    || !drained.pending_streaming_outputs.is_empty() =>
+                {
+                    if cancel.is_triggered() {
+                        Materialized::Interrupted
+                    } else {
+                        materialize(&txn, &cancel, &emitter, id, drained).await
+                    }
+                }
+                _ => Materialized::Done,
+            };
+
+            // `ctx.output.print` output, after the evaluation and the materialization as in
+            // `buck2 bxl` (a path it prints exists once it is shown). Streamed output was shown
+            // as it was written.
             if let Ok(drained) = &reply.drained {
                 emitter.output(id, repl_output::Channel::Stdout, &drained.output);
                 emitter.output(id, repl_output::Channel::Stderr, &drained.error);
@@ -549,6 +600,7 @@ async fn run_eval(
 
             Ok(Outcome::Eval {
                 reply: Box::new(reply),
+                materialized,
                 cwd,
                 target_platform,
                 equality: txn.equality_token(),
@@ -558,6 +610,73 @@ async fn run_eval(
             })
         })
         .await
+}
+
+/// Materializes the artifacts an input ensured, racing the cancellation of the request: this is
+/// DICE work after the evaluation, which is safe to drop.
+async fn materialize(
+    txn: &DiceTransaction,
+    cancel: &EvalCancel,
+    emitter: &ReplEmitter,
+    id: u64,
+    drained: &OutputStreamOutcome,
+) -> Materialized {
+    // `wait_on` takes only ensured artifacts, but in a session they may have been ensured by an
+    // earlier input: they are materialized again (a no-op if they still are), so that the output
+    // waiting on them is shown.
+    let mut artifacts = drained.ensured_artifacts.clone();
+    for (waits_on, _) in &drained.pending_streaming_outputs {
+        artifacts.extend(waits_on.iter().duped());
+    }
+    let artifacts = artifacts.into_iter().collect();
+    let pending = drained
+        .pending_streaming_outputs
+        .iter()
+        .map(|(waits_on, output)| PendingStreamingOutput::new(waits_on.clone(), output.clone()));
+    let mut out = ReplOutputWriter::new(emitter.dupe(), id, repl_output::Channel::Stdout);
+    let mut dc = txn.ctx();
+    let work = txn
+        .per_transaction_data()
+        .get_dispatcher()
+        .dupe()
+        .span_async(BxlEnsureArtifactsStart {}, async {
+            let result = materialize_ensured_artifacts(
+                &mut dc,
+                MaterializationAndUploadContext::materialize(),
+                artifacts,
+                pending,
+                &mut out,
+            )
+            .await;
+            (result, BxlEnsureArtifactsEnd {})
+        });
+    tokio::select! {
+        result = work => match result {
+            Ok(()) => Materialized::Done,
+            Err(errors) => Materialized::Failed(errors),
+        },
+        () = cancel.cancelled() => Materialized::Interrupted,
+    }
+}
+
+/// The failure of an input whose ensured artifacts could not all be materialized.
+fn materialization_failure(errors: &[buck2_error::Error]) -> ReplFailure {
+    struct Errors<'a>(&'a [buck2_error::Error]);
+    impl fmt::Display for Errors<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let n = self.0.len();
+            write!(
+                f,
+                "{n} ensured artifact{} could not be materialized",
+                if n == 1 { "" } else { "s" }
+            )?;
+            for e in self.0 {
+                write!(f, "\n\n{e:?}")?;
+            }
+            Ok(())
+        }
+    }
+    ReplFailure::new(repl_error::Kind::Buck, &Errors(errors))
 }
 
 /// A `Done` with an error, whose message is capped like every other (INV-13).

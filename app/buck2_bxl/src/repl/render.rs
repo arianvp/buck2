@@ -36,7 +36,10 @@ use starlark::values::string::StarlarkStr;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
 
+use crate::bxl::starlark_defs::artifacts::EnsuredArtifact;
 use crate::bxl::starlark_defs::context::BxlContext;
+use crate::bxl::starlark_defs::context::BxlContextCoreData;
+use crate::bxl::starlark_defs::context::output::get_artifact_path_display;
 use crate::bxl::starlark_defs::nodes::unconfigured::StarlarkTargetNode;
 
 /// Most text in a `ReplValue` or a `ReplError`, leaving room for the rest of the message so that
@@ -127,12 +130,14 @@ impl ReplFailure {
 }
 
 /// Renders the value of an input with `{:#}`. `None` for `None`, which is not echoed.
-pub(crate) fn render_echo(v: Value) -> Option<RenderedValue> {
+///
+/// `core` is the data of the session's `ctx`, which locates ensured artifacts.
+pub(crate) fn render_echo(v: Value, core: &BxlContextCoreData) -> Option<RenderedValue> {
     if v.is_none() {
         return None;
     }
     let type_name = truncate_to_bytes(v.get_type(), MAX_TYPE_BYTES).to_owned();
-    if let Some(text) = summary(v) {
+    if let Some(text) = summary(v, core) {
         return Some(RenderedValue {
             type_name,
             text,
@@ -192,10 +197,21 @@ const OPAQUE_BXL_TYPES: &[&str] = &[
 ];
 
 /// The summary of a top-level value of a BXL type with an unhelpful `Display`.
-fn summary(v: Value) -> Option<String> {
+fn summary(v: Value, core: &BxlContextCoreData) -> Option<String> {
     let mut out = CappedString::new(MAX_TEXT_BYTES);
     // A `CappedString` never fails.
-    let _ignored = if let Some(ctx) = v.downcast_ref::<BxlContext>() {
+    let _ignored = if let Some(ensured) = v.downcast_ref::<EnsuredArtifact>() {
+        // Its path, as `ctx.output.print` shows it: the artifact is materialized there once the
+        // input is done. (Its `Display` is `<ensured ...>`, which cannot be used as a path.)
+        let path = get_artifact_path_display(
+            ensured.get_artifact_path(),
+            ensured.abs(),
+            core.project_fs(),
+            core.artifact_fs(),
+        )
+        .ok()?;
+        out.write_str(&path)
+    } else if let Some(ctx) = v.downcast_ref::<BxlContext>() {
         match ctx.repl_cwd() {
             Some(cwd) => fmt::write(&mut out, format_args!("<bxl.Context cwd={cwd}>")),
             None => out.write_str("<bxl.Context>"),

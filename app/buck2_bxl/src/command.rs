@@ -359,55 +359,14 @@ impl BxlServerCommand {
         bxl_result: Arc<BxlResult>,
         output: &mut (impl Write + Send),
     ) -> Result<(), Vec<buck2_error::Error>> {
-        let artifacts_to_materialize: Vec<_> = bxl_result.artifacts().iter().duped().collect();
-
-        let mut futs: FuturesUnordered<_> = ctx
-            .compute_many(artifacts_to_materialize.into_iter().map(|artifact| {
-                DiceComputations::declare_closure(async |ctx| {
-                    let res = materialize_and_upload_artifact_group(
-                        ctx,
-                        &artifact,
-                        materialization_context,
-                        &ctx.per_transaction_data()
-                            .get_materialization_queue_tracker(),
-                    )
-                    .await;
-                    match res {
-                        Ok(_) => Ok(artifact),
-                        Err(e) => Err(e),
-                    }
-                })
-            }))
-            .into_iter()
-            .collect();
-
-        let mut pending_streaming =
-            PendingStreaming::new(bxl_result.pending_streaming_outputs().iter().cloned());
-
-        let mut errors: Vec<buck2_error::Error> = Vec::new();
-
-        while let Some(res) = tokio::task::unconstrained(futs.next()).await {
-            match res {
-                Ok(artifact) => {
-                    let outputs = pending_streaming.next_outputs(&artifact);
-                    for output_msg in outputs {
-                        output.write_all(&output_msg).unwrap_or_else(|e| {
-                            errors.push(e.into());
-                        });
-                    }
-                    output.flush().unwrap_or_else(|e| {
-                        errors.push(e.into());
-                    });
-                }
-                Err(e) => errors.push(e),
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        materialize_ensured_artifacts(
+            ctx,
+            materialization_context,
+            bxl_result.artifacts().iter().duped().collect(),
+            bxl_result.pending_streaming_outputs().iter().cloned(),
+            output,
+        )
+        .await
     }
 
     /// Output the outputs from BxlResult to stdout and stderr
@@ -590,6 +549,66 @@ pub(crate) fn parse_bxl_label_from_cli(
         bxl_path: BxlFilePath::new(import_path)?,
         name: bxl_fn.to_owned(),
     })
+}
+
+/// Materializes the ensured `artifacts` of a BXL evaluation (`buck2 bxl`, or an input of
+/// `buck2 repl`), and writes each of the `pending_streaming_outputs` to `output` as soon as every
+/// artifact it waits on is materialized.
+///
+/// Returns the aggregated errors encountered during materialization.
+pub(crate) async fn materialize_ensured_artifacts(
+    ctx: &mut DiceComputations<'_>,
+    materialization_context: MaterializationAndUploadContext,
+    artifacts: Vec<ArtifactGroup>,
+    pending_streaming_outputs: impl Iterator<Item = PendingStreamingOutput>,
+    output: &mut (impl Write + Send),
+) -> Result<(), Vec<buck2_error::Error>> {
+    let mut futs: FuturesUnordered<_> = ctx
+        .compute_many(artifacts.into_iter().map(|artifact| {
+            DiceComputations::declare_closure(async |ctx| {
+                let res = materialize_and_upload_artifact_group(
+                    ctx,
+                    &artifact,
+                    materialization_context,
+                    &ctx.per_transaction_data()
+                        .get_materialization_queue_tracker(),
+                )
+                .await;
+                match res {
+                    Ok(_) => Ok(artifact),
+                    Err(e) => Err(e),
+                }
+            })
+        }))
+        .into_iter()
+        .collect();
+
+    let mut pending_streaming = PendingStreaming::new(pending_streaming_outputs);
+
+    let mut errors: Vec<buck2_error::Error> = Vec::new();
+
+    while let Some(res) = tokio::task::unconstrained(futs.next()).await {
+        match res {
+            Ok(artifact) => {
+                let outputs = pending_streaming.next_outputs(&artifact);
+                for output_msg in outputs {
+                    output.write_all(&output_msg).unwrap_or_else(|e| {
+                        errors.push(e.into());
+                    });
+                }
+                output.flush().unwrap_or_else(|e| {
+                    errors.push(e.into());
+                });
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 #[derive(Debug)]

@@ -10,6 +10,8 @@
 
 //! Client side of `buck2 repl`.
 
+#![feature(used_with_arg)]
+
 use async_trait::async_trait;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
 use buck2_client_ctx::common::BuckArgMatches;
@@ -27,6 +29,7 @@ use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 
+mod editor;
 mod render;
 mod script;
 mod session;
@@ -122,6 +125,11 @@ impl StreamingCommand for ReplCommand {
 
     fn extra_subscribers(&self) -> Vec<Box<dyn EventSubscriber>> {
         vec![self.shutdown.subscriber()]
+    }
+
+    fn handles_sigint(&self) -> bool {
+        // Ctrl-C interrupts the input in flight, not the session.
+        true
     }
 
     fn should_expect_spans(&self) -> bool {

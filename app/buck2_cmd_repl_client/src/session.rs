@@ -8,16 +8,20 @@
  * above-listed licenses.
  */
 
-//! The session: the daemon call on the client's runtime, and the thread that reads inputs.
+//! The session: the daemon call on the client's runtime, the thread that reads inputs (the
+//! interactive [`editor`](crate::editor) or the [`script`](crate::script) reader), and the
+//! SIGINT handler.
 //!
 //! The input thread sends requests through `req_tx` (the request stream of the call) and
 //! waits for their results on `ui_rx`, which [`ReplHandler`] feeds from the call's partial
 //! results. Output (`ReplOutput`) is written by the handler as it arrives, so it is always
 //! printed before the `ReplDone` of its request is rendered.
 
+use std::io::IsTerminal;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -27,10 +31,12 @@ use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::ReplCompletions;
 use buck2_cli_proto::ReplDone;
 use buck2_cli_proto::ReplHangup;
+use buck2_cli_proto::ReplInterrupt;
 use buck2_cli_proto::ReplMessage;
 use buck2_cli_proto::ReplNotice;
 use buck2_cli_proto::ReplOpen;
 use buck2_cli_proto::ReplOutput;
+use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_message;
 use buck2_cli_proto::repl_output;
@@ -43,15 +49,17 @@ use buck2_client_ctx::events_ctx::PartialResultHandler;
 use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
+use buck2_error::ExitCode;
 use buck2_events::BuckEvent;
 use buck2_util::threads::thread_spawn;
 use dupe::Dupe;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::ReplCommand;
+use crate::editor::EditorMode;
+use crate::editor::history_path;
 use crate::script::ScriptInputs;
 use crate::script::ScriptMode;
-use crate::script::ScriptOutcome;
 
 /// The id of the `Open` request. Later requests count up from here.
 pub(crate) const OPEN_ID: u64 = 1;
@@ -142,13 +150,114 @@ impl EventSubscriber for ShutdownSubscriber {
 
 /// What the input thread learns from the daemon.
 pub(crate) enum UiEvent {
-    /// The answer to `Open`. (The interactive editor will need its `ReplReady` for the banner
-    /// and the prompt.)
-    Ready,
+    /// The answer to `Open`.
+    Ready(ReplReady),
     Done(u64, ReplDone),
     Notice(ReplNotice),
-    /// The daemon call is over: nothing else will arrive.
+    /// The daemon call is over (or abandoned): nothing else will arrive.
     SessionEnded,
+}
+
+/// What the terminal is doing, which decides what SIGINT (Ctrl-C) does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiState {
+    /// No input is running and the line editor is not reading: the session is starting, or a
+    /// script is waiting for its next input. SIGINT ends the client.
+    Idle,
+    /// The line editor is reading. Its raw mode turns Ctrl-C into a key, so SIGINT only comes
+    /// from elsewhere (e.g. `kill -INT`) and is ignored.
+    Prompt,
+    /// Request `id` is running. SIGINT interrupts it, warns, then ends the client.
+    Busy { id: u64, presses: u32 },
+}
+
+/// The state of the terminal, shared by the input thread, the SIGINT handler and the session.
+#[derive(Clone, Dupe)]
+pub(crate) struct SharedUi(Arc<Mutex<UiInner>>);
+
+struct UiInner {
+    state: UiState,
+    /// The daemon call is over: the input thread must not wait for input any more.
+    session_ended: bool,
+}
+
+impl SharedUi {
+    fn new() -> Self {
+        SharedUi(Arc::new(Mutex::new(UiInner {
+            state: UiState::Idle,
+            session_ended: false,
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, UiInner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set(&self, state: UiState) {
+        self.lock().state = state;
+    }
+
+    /// Enters [`UiState::Prompt`], unless the session is over. Returns whether it is not (so
+    /// that the editor may read the next input).
+    pub(crate) fn enter_prompt(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.session_ended {
+            return false;
+        }
+        inner.state = UiState::Prompt;
+        true
+    }
+
+    /// Marks the session as over. Returns whether the line editor is reading, in which case it
+    /// only notices after its next line.
+    fn end_session(&self) -> bool {
+        let mut inner = self.lock();
+        inner.session_ended = true;
+        inner.state == UiState::Prompt
+    }
+}
+
+/// How the inputs went, reported by the input thread.
+#[derive(Debug, Default)]
+pub(crate) struct InputOutcome {
+    /// An input failed (or, interactively, the session could not start or input could not be
+    /// read).
+    pub(crate) failed: bool,
+    /// An input was interrupted.
+    pub(crate) interrupted: bool,
+    /// The session ended before the inputs did.
+    pub(crate) lost: bool,
+    /// Output could not be written (e.g. stdout is a closed pipe), which stopped the inputs.
+    pub(crate) output_error: Option<buck2_error::Error>,
+    /// An input failed or was interrupted after the daemon said that it was shutting down
+    /// (which cancels the input in flight).
+    pub(crate) after_shutdown: bool,
+}
+
+impl InputOutcome {
+    /// The inputs stopped because the daemon shut down, which explains the outcome better than
+    /// its own exit code.
+    fn ended_by_shutdown(&self) -> bool {
+        self.output_error.is_none() && (self.after_shutdown || self.lost)
+    }
+
+    fn exit_result(self) -> ExitResult {
+        if let Some(e) = self.output_error {
+            // A closed pipe exits like other commands do (quietly, with its own exit code).
+            ExitResult::err(e)
+        } else if self.lost {
+            ExitResult::err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "the repl session ended before all inputs were evaluated"
+            ))
+        } else if self.interrupted {
+            ExitResult::signal_interrupt()
+        } else if self.failed {
+            ExitResult::status_with_emitted_errors(ExitCode::UserError, Vec::new())
+        } else {
+            ExitResult::success()
+        }
+    }
 }
 
 /// Routes the call's partial results.
@@ -170,8 +279,8 @@ impl PartialResultHandler for ReplHandler {
         // Send errors mean the input thread is gone, which the call's result reports.
         match message.message {
             Some(repl_message::Message::Output(output)) => write_output(&output)?,
-            Some(repl_message::Message::Ready(_)) => {
-                let _ignored = self.ui_tx.send(UiEvent::Ready);
+            Some(repl_message::Message::Ready(ready)) => {
+                let _ignored = self.ui_tx.send(UiEvent::Ready(ready));
             }
             Some(repl_message::Message::Done(done)) => {
                 let _ignored = self.ui_tx.send(UiEvent::Done(id, done));
@@ -204,18 +313,85 @@ fn write_output(output: &ReplOutput) -> buck2_error::Result<()> {
     }
 }
 
+/// Handles SIGINT (Ctrl-C) while the session runs, according to the [`UiState`]. Returns when
+/// the client should give up on the session and exit.
+async fn sigint_loop(
+    ui: SharedUi,
+    req_tx: tokio::sync::mpsc::WeakUnboundedSender<ReplRequest>,
+    next_id: Arc<AtomicU64>,
+) {
+    // The terminal echoes `^C` itself: write over it.
+    let prefix = if std::io::stderr().is_terminal() {
+        "\r"
+    } else {
+        ""
+    };
+    loop {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be installed: SIGINT keeps its default action.
+            return futures::future::pending().await;
+        }
+        let mut inner = ui.lock();
+        let presses = match &mut inner.state {
+            UiState::Idle => return,
+            UiState::Prompt => continue,
+            UiState::Busy { id, presses } => {
+                *presses = presses.saturating_add(1);
+                if *presses == 1
+                    && let Some(req_tx) = req_tx.upgrade()
+                {
+                    // Fails only if the call is over, which ends this loop anyway.
+                    let _ignored = req_tx.send(ReplRequest {
+                        id: next_id.fetch_add(1, Ordering::Relaxed),
+                        request: Some(repl_request::Request::Interrupt(ReplInterrupt {
+                            target_id: *id,
+                        })),
+                    });
+                }
+                *presses
+            }
+        };
+        drop(inner);
+        // Output errors do not matter here: the input thread reports them.
+        match presses {
+            1 => {
+                let _ignored = buck2_client_ctx::eprintln!("{}^C interrupting…", prefix);
+            }
+            2 => {
+                let _ignored = buck2_client_ctx::eprintln!(
+                    "{}^C still cancelling — the daemon may be waiting for another buck2 \
+                     command; ^C again to quit",
+                    prefix
+                );
+            }
+            _ => return,
+        }
+    }
+}
+
 pub(crate) async fn run(
     cmd: ReplCommand,
     context: ClientContext,
     buckd: &mut BuckdClientConnector,
     events_ctx: &mut EventsCtx,
 ) -> ExitResult {
+    let interactive = cmd.eval.is_empty() && std::io::stdin().is_terminal();
+    let history = if interactive {
+        match history_path(cmd.no_history) {
+            Ok(history) => history,
+            Err(e) => return ExitResult::err(e),
+        }
+    } else {
+        None
+    };
+
     let build_opts = cmd.build_opts.to_proto();
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<ReplRequest>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let (compl_tx, compl_rx) = std::sync::mpsc::channel::<(u64, ReplCompletions)>();
-    let (outcome_tx, mut outcome_rx) = tokio::sync::oneshot::channel::<ScriptOutcome>();
+    let (outcome_tx, mut outcome_rx) = tokio::sync::oneshot::channel::<InputOutcome>();
     let next_id = Arc::new(AtomicU64::new(OPEN_ID + 1));
+    let ui = SharedUi::new();
     cmd.shutdown.arm(&req_tx, next_id.dupe());
 
     let open = ReplRequest {
@@ -231,47 +407,95 @@ pub(crate) async fn run(
     let _ignored = req_tx.send(open);
 
     let shutdown = cmd.shutdown.dupe();
-    let inputs = if cmd.eval.is_empty() {
-        ScriptInputs::Stdin
+    let sigint = sigint_loop(ui.dupe(), req_tx.downgrade(), next_id.dupe());
+    let thread = if interactive {
+        let editor = EditorMode {
+            req_tx,
+            ui_rx,
+            next_id,
+            ui: ui.dupe(),
+            history,
+            outcome_tx,
+            shutdown: shutdown.dupe(),
+        };
+        thread_spawn("repl-editor", move || editor.run())
     } else {
-        ScriptInputs::Args(cmd.eval)
+        let inputs = if cmd.eval.is_empty() {
+            ScriptInputs::Stdin
+        } else {
+            ScriptInputs::Args(cmd.eval)
+        };
+        let script = ScriptMode {
+            inputs,
+            continue_on_error: cmd.continue_on_error,
+            req_tx,
+            ui_rx,
+            next_id,
+            ui: ui.dupe(),
+            outcome_tx,
+            shutdown: shutdown.dupe(),
+        };
+        thread_spawn("repl-editor", move || script.run())
     };
-    let script = ScriptMode {
-        inputs,
-        continue_on_error: cmd.continue_on_error,
-        req_tx,
-        ui_rx,
-        next_id,
-        outcome_tx,
-        shutdown: shutdown.dupe(),
-    };
-    let thread = match thread_spawn("repl-editor", move || script.run()) {
+    let thread = match thread {
         Ok(thread) => thread,
         Err(e) => return ExitResult::err(e.into()),
     };
 
     let mut handler = ReplHandler { ui_tx, compl_tx };
-    let result = buckd
-        .with_flushing()
-        .repl(
+    let result = {
+        let mut client = buckd.with_flushing();
+        let call = client.repl(
             context,
             build_opts,
             UnboundedReceiverStream::new(req_rx),
             events_ctx,
             &mut handler,
-        )
-        .await;
-    // Wakes the input thread if it is still waiting for a result.
+        );
+        tokio::select! {
+            result = call => Some(result),
+            // The call is dropped: the daemon sees the client go away and winds the session
+            // down on its own.
+            () = sigint => None,
+        }
+    };
+    let at_prompt = ui.end_session();
+    // Wakes the input thread if it is waiting for a result.
     let _ignored = handler.ui_tx.send(UiEvent::SessionEnded);
     drop(compl_rx);
 
+    let Some(result) = result else {
+        // Given up on with Ctrl-C. The editor (which is not reading) exits at once; a script
+        // may be blocked reading stdin and is left behind.
+        if interactive {
+            let _ignored = thread.join();
+        }
+        return ExitResult::signal_interrupt();
+    };
+
     // The input thread sends its outcome before it hangs up, so a session that ended because
-    // the inputs ran out always has one. Without one, the session ended early; the input thread
-    // may be blocked reading stdin and is left behind.
-    let outcome = outcome_rx.try_recv().ok();
+    // the inputs ran out always has one. Without one, the session ended early.
+    let mut outcome = outcome_rx.try_recv().ok();
     if outcome.is_some() {
         let _ignored = thread.join();
-    }
+    } else if interactive {
+        // The editor restores the terminal before it exits, which it can only do once its
+        // current line is read. (Not through rustyline's `ExternalPrinter`: while one exists,
+        // rustyline 18 waits on the terminal even when typed-ahead keys are buffered.)
+        if at_prompt {
+            let message = match shutdown.reason() {
+                Some(reason) => {
+                    format!("the buck2 daemon was shut down ({reason}); press Enter to exit")
+                }
+                None => "daemon connection lost; press Enter to exit".to_owned(),
+            };
+            // The terminal is in raw mode: end the lines explicitly.
+            let _ignored = buck2_client_ctx::eprint!("\r\n{}\r\n", message);
+        }
+        let _ignored = thread.join();
+        outcome = outcome_rx.try_recv().ok();
+    } // Otherwise a script may be blocked reading stdin: it is left behind.
+
     match result {
         Err(e) => ExitResult::err(e),
         Ok(CommandOutcome::Failure(exit)) => exit,

@@ -21,65 +21,25 @@ use buck2_cli_proto::ReplEval;
 use buck2_cli_proto::ReplHangup;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_request;
-use buck2_client_ctx::exit_result::ExitResult;
-use buck2_error::ExitCode;
 use buck2_repl_syntax::chunker::Chunker;
 use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::parse_command;
 
 use crate::render;
 use crate::render::Rendered;
+use crate::render::Style;
+use crate::session::InputOutcome;
 use crate::session::OPEN_ID;
+use crate::session::SharedUi;
 use crate::session::ShutdownHangup;
 use crate::session::UiEvent;
+use crate::session::UiState;
 
 pub(crate) enum ScriptInputs {
     /// The `-e` values, one input each.
     Args(Vec<String>),
     /// Lines from stdin, split into inputs by the [`Chunker`].
     Stdin,
-}
-
-/// How a script went.
-#[derive(Debug, Default)]
-pub(crate) struct ScriptOutcome {
-    /// An input failed.
-    failed: bool,
-    /// An input was interrupted.
-    interrupted: bool,
-    /// The session ended before the inputs did.
-    lost: bool,
-    /// Output could not be written (e.g. stdout is a closed pipe), which stopped the script.
-    output_error: Option<buck2_error::Error>,
-    /// An input failed or was interrupted after the daemon said that it was shutting down
-    /// (which cancels the input in flight).
-    after_shutdown: bool,
-}
-
-impl ScriptOutcome {
-    /// The script stopped because the daemon shut down, which explains the outcome better
-    /// than its own exit code.
-    pub(crate) fn ended_by_shutdown(&self) -> bool {
-        self.output_error.is_none() && (self.after_shutdown || self.lost)
-    }
-
-    pub(crate) fn exit_result(self) -> ExitResult {
-        if let Some(e) = self.output_error {
-            // A closed pipe exits like other commands do (quietly, with its own exit code).
-            ExitResult::err(e)
-        } else if self.lost {
-            ExitResult::err(buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Tier0,
-                "the repl session ended before all inputs were evaluated"
-            ))
-        } else if self.interrupted {
-            ExitResult::signal_interrupt()
-        } else if self.failed {
-            ExitResult::status_with_emitted_errors(ExitCode::UserError, Vec::new())
-        } else {
-            ExitResult::success()
-        }
-    }
 }
 
 /// Stop or go on after an input.
@@ -94,7 +54,8 @@ pub(crate) struct ScriptMode {
     pub(crate) req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     pub(crate) ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     pub(crate) next_id: Arc<AtomicU64>,
-    pub(crate) outcome_tx: tokio::sync::oneshot::Sender<ScriptOutcome>,
+    pub(crate) ui: SharedUi,
+    pub(crate) outcome_tx: tokio::sync::oneshot::Sender<InputOutcome>,
     pub(crate) shutdown: ShutdownHangup,
 }
 
@@ -107,6 +68,7 @@ impl ScriptMode {
             req_tx,
             ui_rx,
             next_id,
+            ui,
             outcome_tx,
             shutdown,
         } = self;
@@ -115,9 +77,10 @@ impl ScriptMode {
             req_tx,
             ui_rx,
             next_id,
+            ui,
             shutdown,
             number: 0,
-            outcome: ScriptOutcome::default(),
+            outcome: InputOutcome::default(),
         };
         session.run(inputs);
         // Report the outcome before hanging up: the session may end as soon as the daemon
@@ -135,10 +98,11 @@ struct Session {
     req_tx: tokio::sync::mpsc::UnboundedSender<ReplRequest>,
     ui_rx: std::sync::mpsc::Receiver<UiEvent>,
     next_id: Arc<AtomicU64>,
+    ui: SharedUi,
     shutdown: ShutdownHangup,
     /// Number of inputs sent so far; the daemon names input N `<repl:N>`.
     number: u32,
-    outcome: ScriptOutcome,
+    outcome: InputOutcome,
 }
 
 impl Session {
@@ -160,8 +124,10 @@ impl Session {
                     let line = match line {
                         Ok(line) => line,
                         Err(e) => {
-                            let printed =
-                                render::print_error(&format!("error: cannot read stdin: {e}"));
+                            let printed = render::print_error(
+                                Style::script(),
+                                &format!("error: cannot read stdin: {e}"),
+                            );
                             self.output(printed);
                             self.outcome.failed = true;
                             return;
@@ -184,15 +150,15 @@ impl Session {
     fn wait_for_ready(&mut self) -> bool {
         loop {
             match self.ui_rx.recv() {
-                Ok(UiEvent::Ready) => return true,
+                Ok(UiEvent::Ready(_)) => return true,
                 Ok(UiEvent::Notice(notice)) => {
-                    if !self.output(render::print_notice(&notice)) {
+                    if !self.output(render::print_notice(Style::script(), &notice)) {
                         return false;
                     }
                 }
                 Ok(UiEvent::Done(id, done)) if id == OPEN_ID => {
                     // The daemon could not start the session.
-                    let rendered = render::render_done(&done).map(|_| ());
+                    let rendered = render::render_done(&done, Style::script()).map(|_| ());
                     self.output(rendered);
                     self.outcome.failed = true;
                     return false;
@@ -212,7 +178,7 @@ impl Session {
             Ok(Some(command)) if command.spec.id == CommandId::Quit => return Next::Stop,
             Ok(_) => {}
             Err(e) => {
-                if !self.output(render::print_error(&format!("error: {e}"))) {
+                if !self.output(render::print_error(Style::script(), &format!("error: {e}"))) {
                     return Next::Stop;
                 }
                 return self.failed();
@@ -228,11 +194,15 @@ impl Session {
                 number: self.number,
             })),
         };
+        self.ui.set(UiState::Busy { id, presses: 0 });
         if self.req_tx.send(request).is_err() {
             self.outcome.lost = true;
             return Next::Stop;
         }
-        let Some(done) = self.wait_for_done(id) else {
+        let done = self.wait_for_done(id);
+        // While the script reads its next input, SIGINT ends the client.
+        self.ui.set(UiState::Idle);
+        let Some(done) = done else {
             self.outcome.lost = true;
             return Next::Stop;
         };
@@ -240,7 +210,7 @@ impl Session {
             // A notice could not be printed.
             return Next::Stop;
         }
-        let rendered = render::render_done(&done);
+        let rendered = render::render_done(&done, Style::script());
         let rendered = match rendered.and_then(|r| render::flush().map(|()| r)) {
             Ok(rendered) => rendered,
             Err(e) => {
@@ -292,10 +262,10 @@ impl Session {
             match self.ui_rx.recv() {
                 Ok(UiEvent::Done(done_id, done)) if done_id == id => return Some(done),
                 Ok(UiEvent::Notice(notice)) => {
-                    let printed = render::print_notice(&notice);
+                    let printed = render::print_notice(Style::script(), &notice);
                     self.output(printed);
                 }
-                Ok(UiEvent::Done(..) | UiEvent::Ready) => {}
+                Ok(UiEvent::Done(..) | UiEvent::Ready(_)) => {}
                 Ok(UiEvent::SessionEnded) | Err(_) => return None,
             }
         }
