@@ -19,6 +19,12 @@
 //! writing it. A top-level string is cut to the cap first; a huge string inside a container
 //! still costs a few times its size, as it does anywhere in Starlark.
 //!
+//! `:doc` asks values for their documentation, which formats nothing of the session's values
+//! except for its functions and namespaces, which are documented otherwise (see
+//! [`documentation`]). The documentation of a function loaded from a file formats the default
+//! values of its parameters with no bound, as `buck2 docs starlark` and the LSP do; only the
+//! file can give it large ones.
+//!
 //! The value of an input is echoed ([`RenderMode::Echo`]); meta-commands render it in other
 //! modes (`:type`, `:print`, `:json`, `:doc`).
 
@@ -35,8 +41,11 @@ use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::truncate_to_bytes;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
+use starlark::docs::DocModule;
+use starlark::docs::DocProperty;
+use starlark::docs::DocString;
+use starlark::docs::DocStringKind;
 use starlark::docs::markdown::render_doc_item_no_link;
-use starlark::environment::Module;
 use starlark::typing::Ty;
 use starlark::values::Heap;
 use starlark::values::Value;
@@ -53,6 +62,7 @@ use crate::bxl::starlark_defs::context::BxlContextCoreData;
 use crate::bxl::starlark_defs::context::output::get_artifact_path_display;
 use crate::bxl::starlark_defs::nodes::unconfigured::StarlarkTargetNode;
 use crate::repl::complete::types::TypeIndex;
+use crate::repl::docstrings::Docstrings;
 
 /// Most text in a `ReplValue` or a `ReplError`, leaving room for the rest of the message so that
 /// every message stays within 64 KiB (INV-13).
@@ -94,6 +104,9 @@ const BUDGET_CHECK_INTERVAL: u32 = 256;
 
 /// Longest heading of `:doc`: the expression as typed.
 const MAX_DOC_NAME_BYTES: usize = 80;
+
+/// Longest name of a function (`<repl:3>.f`) that `:doc` looks up a docstring for.
+const MAX_FUNCTION_NAME_BYTES: usize = 1 << 10;
 
 /// The type checker's type of a struct is made of the types of its fields, recursively: its type
 /// is not computed when the struct has more than this many fields in all (counting shared parts
@@ -239,8 +252,8 @@ impl Rendering {
 pub(crate) struct RenderContext<'a, 'v> {
     /// The data of the session's `ctx`, which locates ensured artifacts.
     pub(crate) core: &'a BxlContextCoreData,
-    /// The session's module, where `:doc` looks for types defined in the session.
-    pub(crate) module: &'a Module<'v>,
+    /// The docstrings of the functions defined in the session, for `:doc`.
+    pub(crate) docstrings: &'a Docstrings,
     pub(crate) heap: Heap<'v>,
     pub(crate) budget: RenderBudget<'a>,
     /// The documentation of the types of the globals (needed by `:doc` only).
@@ -564,10 +577,11 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
     let documentation = if type_too_large(v, cx.heap) {
         None
     } else {
-        Some(v.documentation())
+        Some(documentation(v, cx))
     };
     let (name, item) = match documentation {
-        Some(DocItem::Member(DocMember::Property(property))) => {
+        Some(Documentation::Own(item)) => (code_name.to_owned(), item),
+        Some(Documentation::Instance(property)) => {
             // An instance: its documentation only names its type.
             let type_name = property
                 .typ
@@ -582,7 +596,6 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
                 ),
             }
         }
-        Some(item) => (code_name.to_owned(), item),
         None => match type_documentation(v, v.get_type(), cx) {
             Some(item) => (v.get_type().to_owned(), item),
             None => {
@@ -604,18 +617,102 @@ fn render_doc<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> RenderedText {
     RenderedText::new(text, truncated)
 }
 
-/// The documentation of the type of an instance: a type of the globals, or one defined in the
-/// session (a record type bound to its name).
+/// What `:doc` knows of a value.
+enum Documentation {
+    /// The value's own documentation: a function's, a type's, a namespace's, ...
+    Own(DocItem),
+    /// The value is an instance: its documentation only names its type.
+    Instance(DocProperty),
+}
+
+impl Documentation {
+    fn into_item(self) -> DocItem {
+        match self {
+            Documentation::Own(item) => item,
+            Documentation::Instance(property) => DocItem::Member(DocMember::Property(property)),
+        }
+    }
+}
+
+/// The documentation of `v`: `Value::documentation`, except for two kinds of values defined in
+/// the session (not frozen), whose documentation formats other values of the session:
+///
+/// - A function (a `def` or a `lambda`). Its documentation formats the default values of its
+///   parameters with `repr`, which recurses on them with no stack check and takes as long as
+///   they are large: a default value nested 100000 deep overflows the stack (and aborts the
+///   daemon), one that shares its parts exponentially often never finishes. It is documented by
+///   its type instead, which shows default values as `...`, and by the docstring recorded when
+///   it was defined ([`Docstrings`]).
+/// - A namespace, whose documentation is its members': documented member by member, with this
+///   function. [`type_too_large`] bounds how many members and how deep.
+///
+/// A frozen function (loaded from a file) keeps its full documentation, which `buck2 docs
+/// starlark` and the LSP show too: only the file can give it large default values.
+fn documentation<'v>(v: Value<'v>, cx: &RenderContext<'_, 'v>) -> Documentation {
+    if !v.is_frozen() {
+        match v.get_type() {
+            "function" => {
+                let typ = Ty::of_value(v);
+                // Only a `def` (or a `lambda`) has the type of a function. The other values of
+                // type `function` (bound methods such as `ctx.cquery`, partials, record types)
+                // format no value in their documentation.
+                if typ.as_function().is_some() {
+                    let docs = function_name(v, &cx.budget)
+                        .and_then(|name| cx.docstrings.get(&name))
+                        .and_then(|raw| DocString::from_docstring(DocStringKind::Starlark, raw));
+                    return Documentation::Own(DocItem::Member(DocMember::Property(DocProperty {
+                        docs,
+                        typ,
+                    })));
+                }
+            }
+            "namespace" => {
+                let members = v
+                    .dir_attr()
+                    .into_iter()
+                    .filter_map(|name| {
+                        let member = v.get_attr(&name, cx.heap).ok().flatten()?;
+                        Some((name, documentation(member, cx).into_item()))
+                    })
+                    .collect();
+                return Documentation::Own(DocItem::Module(DocModule {
+                    docs: None,
+                    members,
+                }));
+            }
+            _ => {}
+        }
+    }
+    match v.documentation() {
+        // A value of type `function` documented by its type (a record type, an enum type, ...)
+        // is not an instance: its type is what it creates, not the `function` type.
+        DocItem::Member(DocMember::Property(property)) if v.get_type() != "function" => {
+            Documentation::Instance(property)
+        }
+        item => Documentation::Own(item),
+    }
+}
+
+/// The name a function shows (`<repl:3>.f`: its `Display`), unless it is longer than
+/// [`MAX_FUNCTION_NAME_BYTES`].
+fn function_name(v: Value, budget: &RenderBudget<'_>) -> Option<String> {
+    let mut out = RenderWriter {
+        buf: CappedString::new(MAX_FUNCTION_NAME_BYTES),
+        stack_exhausted: false,
+        budget,
+        writes: 0,
+        stopped: None,
+    };
+    // The writer fails once the name is too long.
+    fmt::write(&mut out, format_args!("{v}")).ok()?;
+    Some(out.buf.into_string())
+}
+
+/// The documentation of the type of an instance, from the types of the globals.
 fn type_documentation(v: Value, type_name: &str, cx: &RenderContext<'_, '_>) -> Option<DocItem> {
-    if let Some(types) = cx.types
-        && let Some(ty) = types.get(type_name).or_else(|| types.get(v.get_type()))
-    {
-        return Some(DocItem::Type(ty.clone()));
-    }
-    match cx.module.get(type_name)?.documentation() {
-        item @ DocItem::Type(_) => Some(item),
-        _ => None,
-    }
+    let types = cx.types?;
+    let ty = types.get(type_name).or_else(|| types.get(v.get_type()))?;
+    Some(DocItem::Type(ty.clone()))
 }
 
 /// BXL types whose `Display` is their derived `Debug`, which is huge (a dump of the whole
@@ -703,18 +800,29 @@ impl Write for RenderWriter<'_> {
 /// one chunk per container on its path, however large the containers are.
 const CHILDREN_CHUNK: usize = 1024;
 
+/// Fetching the children of a struct or a record from the `n`th one on takes time in `n` (their
+/// iterators cannot skip), so fetching all `n` of them in chunks of `c` takes time in
+/// `n * n / 2c`. Their chunks double in size, up to this, rather than stay at
+/// [`CHILDREN_CHUNK`]: the check of a struct with 3 million fields takes 70 million steps rather
+/// than 4 billion, and holds at most 512 KiB of its fields.
+const MAX_FIELDS_CHUNK: usize = 64 << 10;
+
 /// Up to `max` of the values that formatting `v` recurses into, from the `from`th on, in the
 /// order the formatter visits them; `None` if `v` is not a container.
 fn children<'v>(v: Value<'v>, from: usize, max: usize) -> Option<Vec<Value<'v>>> {
     fn chunk<'v>(it: impl Iterator<Item = Value<'v>>, from: usize, max: usize) -> Vec<Value<'v>> {
         it.skip(from).take(max).collect()
     }
+    // The iterators of lists, tuples and of the keys and the values of a dict skip in constant
+    // time; the iterator of a dict's entries does not.
     if let Some(list) = ListRef::from_value(v) {
         Some(chunk(list.iter(), from, max))
     } else if let Some(tuple) = TupleRef::from_value(v) {
         Some(chunk(tuple.iter(), from, max))
     } else if let Some(dict) = DictRef::from_value(v) {
-        Some(chunk(dict.iter().flat_map(|(k, v)| [k, v]), from, max))
+        let entry = from / 2;
+        let entries = dict.keys().skip(entry).zip(dict.values().skip(entry));
+        Some(chunk(entries.flat_map(|(k, v)| [k, v]), from % 2, max))
     } else if let Some(s) = StructRef::from_value(v) {
         Some(chunk(s.iter().map(|(_, v)| v), from, max))
     } else {
@@ -729,32 +837,43 @@ struct Frame<'v> {
     pending: Vec<Value<'v>>,
     /// How many children have been fetched.
     fetched: usize,
+    /// How many children the next fetch asks for.
+    chunk: usize,
+    /// The chunks grow (see [`MAX_FIELDS_CHUNK`]).
+    growing: bool,
     /// Every child has been fetched.
     complete: bool,
 }
 
 impl<'v> Frame<'v> {
-    fn new(value: Value<'v>, first: Vec<Value<'v>>) -> Self {
+    /// The frame of `value`, with its first children; `None` if it is not a container.
+    fn enter(value: Value<'v>) -> Option<Self> {
+        let first = children(value, 0, CHILDREN_CHUNK)?;
         let mut frame = Frame {
             value,
             pending: Vec::new(),
             fetched: 0,
+            chunk: CHILDREN_CHUNK,
+            growing: StructRef::from_value(value).is_some() || Record::from_value(value).is_some(),
             complete: false,
         };
         frame.add(first);
-        frame
+        Some(frame)
     }
 
     fn add(&mut self, mut chunk: Vec<Value<'v>>) {
-        self.complete = chunk.len() < CHILDREN_CHUNK;
+        self.complete = chunk.len() < self.chunk;
         self.fetched = self.fetched.saturating_add(chunk.len());
+        if self.growing {
+            self.chunk = self.chunk.saturating_mul(2).min(MAX_FIELDS_CHUNK);
+        }
         chunk.reverse();
         self.pending = chunk;
     }
 
     fn next_child(&mut self) -> Option<Value<'v>> {
         if self.pending.is_empty() && !self.complete {
-            let chunk = children(self.value, self.fetched, CHILDREN_CHUNK).unwrap_or_default();
+            let chunk = children(self.value, self.fetched, self.chunk).unwrap_or_default();
             self.add(chunk);
         }
         self.pending.pop()
@@ -780,11 +899,11 @@ fn nesting_depth(
     max_visits: usize,
     budget: &RenderBudget<'_>,
 ) -> Result<usize, Stop> {
-    let Some(first) = children(root, 0, CHILDREN_CHUNK) else {
+    let Some(frame) = Frame::enter(root) else {
         return Ok(0);
     };
     let mut on_path = HashSet::from([root.identity()]);
-    let mut path = vec![Frame::new(root, first)];
+    let mut path = vec![frame];
     let mut deepest = 1;
     let mut visits = 0usize;
     while let Some(frame) = path.last_mut() {
@@ -803,14 +922,14 @@ fn nesting_depth(
         if on_path.contains(&child.identity()) {
             continue;
         }
-        let Some(grandchildren) = children(child, 0, CHILDREN_CHUNK) else {
+        let Some(frame) = Frame::enter(child) else {
             continue;
         };
         if path.len() >= limit {
             return Ok(limit + 1);
         }
         on_path.insert(child.identity());
-        path.push(Frame::new(child, grandchildren));
+        path.push(frame);
         deepest = deepest.max(path.len());
     }
     Ok(deepest)

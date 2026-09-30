@@ -52,10 +52,12 @@ use crate::bxl::starlark_defs::context::output::OutputStreamState;
 use crate::bxl::starlark_defs::context::starlark_async::BxlDiceComputations;
 use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
 use crate::repl::complete::types::TypeIndex;
+use crate::repl::docstrings::Docstrings;
 use crate::repl::output::ReplEmitter;
 use crate::repl::output::ReplPrintHandler;
 use crate::repl::prep::PrepRequest;
 use crate::repl::prep::Prepared;
+use crate::repl::prep::input_file_name;
 use crate::repl::prep::prepare;
 use crate::repl::render::RenderBudget;
 use crate::repl::render::RenderContext;
@@ -96,6 +98,8 @@ pub(crate) struct Session {
     loaded: LoadedModules,
     /// The documentation of the types of the globals, built when `:doc` first needs it.
     types: Option<TypeIndex>,
+    /// The docstrings of the functions defined in the session, for `:doc`.
+    docstrings: Docstrings,
 }
 
 /// The modules the session has loaded, to load again on `:reload`.
@@ -173,6 +177,7 @@ impl Session {
             last_token: None,
             loaded: LoadedModules::default(),
             types: None,
+            docstrings: Docstrings::default(),
         }
     }
 
@@ -344,6 +349,9 @@ impl Session {
             self.types = Some(TypeIndex::build(&globals));
         }
         let types = self.types.as_ref();
+        // Before the evaluation, which may define some of the functions and then fail.
+        self.docstrings.record(&ast, &input_file_name(number));
+        let docstrings = &self.docstrings;
 
         let loader = ReplLoader(loads);
         let stream = self.stream.dupe();
@@ -373,7 +381,7 @@ impl Session {
                         let cancelled = || liveness.is_cancelled();
                         let cx = RenderContext {
                             core: &core,
-                            module: &**env,
+                            docstrings,
                             heap,
                             budget: RenderBudget::new(&cancelled),
                             types,

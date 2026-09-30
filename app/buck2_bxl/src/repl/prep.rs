@@ -77,6 +77,12 @@ pub(crate) struct Prepared {
     pub(crate) digest_config: DigestConfig,
 }
 
+/// The name of the code of input `number` (in errors, and in the names of the functions it
+/// defines: `<repl:3>.f`).
+pub(crate) fn input_file_name(number: u32) -> String {
+    format!("<repl:{number}>")
+}
+
 fn buck(e: buck2_error::Error) -> ReplFailure {
     ReplFailure::from_buck2(repl_error::Kind::Buck, &e)
 }
@@ -100,7 +106,7 @@ pub(crate) async fn prepare(
     let dialect = StarlarkFileType::Bxl.dialect(gis.disable_starlark_types);
     // Not through the interpreter's own parsing, which names the code after the file and
     // rejects tabs anywhere.
-    let ast = AstModule::parse(&format!("<repl:{number}>"), code, &dialect)
+    let ast = AstModule::parse(&input_file_name(number), code, &dialect)
         .map_err(ReplFailure::from_starlark)?;
     let load_ids: Vec<String> = ast
         .loads()

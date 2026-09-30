@@ -30,6 +30,7 @@ use crate::repl::output::ReplEmitter;
 mod cancel;
 mod commands;
 mod complete;
+mod docstrings;
 mod driver;
 mod line_ctx;
 mod output;

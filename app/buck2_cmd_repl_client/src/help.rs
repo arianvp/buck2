@@ -238,9 +238,10 @@ buck2 command line:
   ...              every target at or below the session's directory
 
 This holds for the commands that take targets or queries (:providers, :cquery, :uquery,
-:aquery) and for everything `ctx` resolves: `ctx.configured_targets(\":lib\")`, patterns and
-file names in `ctx.cquery().eval(...)`, and so on. Relative `load()`s are relative to the
-session's directory too. (`buck2 bxl` resolves them against the cell root.)";
+:aquery) and for everything `ctx` resolves: `ctx.configured_targets(\":lib\")`, patterns
+and file names in `ctx.cquery().eval(...)`, and so on (`buck2 bxl` resolves these
+against the cell root). A relative `load()` is relative to the session's directory, as
+if the session were a .bxl file there.";
 
 #[cfg(test)]
 mod tests {
