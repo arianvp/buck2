@@ -16,11 +16,13 @@
 //! a superconsole shows what the daemon does while an input runs (build progress, running
 //! actions), as `buck2 build` does. It is created when the input starts, drawn once the input
 //! has run for [`SHOW_AFTER`] (quick inputs draw nothing), and erased before the result of the
-//! input is passed on to be printed. Between inputs nothing is drawn: a simple console prints
-//! the events, as the session's console does without live progress, and it is not ticked (it
-//! would print `Waiting on ...` over the prompt). What it would print while the line editor reads
-//! a line, or while a program that the session runs has the terminal, is held back until the
-//! terminal is free again ([`Held`]).
+//! input is passed on to be printed. While it exists, what is typed is not echoed (it is kept for
+//! the line editor, which shows it at the next prompt): echoed keys would move the cursor under
+//! the canvas, which would then be redrawn and erased from the wrong line. Between inputs nothing
+//! is drawn: a simple console prints the events, as the session's console does without live
+//! progress, and it is not ticked (it would print `Waiting on ...` over the prompt). What it would
+//! print while the line editor reads a line, or while a program that the session runs has the
+//! terminal, is held back until the terminal is free again ([`Held`]).
 //!
 //! The terminal has one writer at a time: everything here runs on the client's runtime (the event
 //! subscriber, the partial result handler and the SIGINT handler, which never run at the same
@@ -43,6 +45,7 @@ use buck2_cli_proto::ReplOutput;
 use buck2_cli_proto::repl_output;
 use buck2_client_ctx::common::ui::ConsoleType;
 use buck2_client_ctx::common::ui::get_console_with_root;
+use buck2_client_ctx::console_interaction_stream::NoEcho;
 use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 use buck2_client_ctx::subscribers::superconsole::StatefulSuperConsole;
@@ -144,6 +147,10 @@ enum Display {
         /// Output written to the terminal did not end its line (on this channel): the canvas is
         /// not drawn below it until it does.
         open_line: Option<repl_output::Channel>,
+        /// Typed keys are not echoed while the superconsole runs. Dropped (the echo restored)
+        /// once it is erased, before the input thread (and so the line editor, which saves and
+        /// restores the terminal modes it finds) can use the terminal again.
+        no_echo: Option<NoEcho>,
     },
 }
 
@@ -192,10 +199,15 @@ impl ReplConsole {
     pub(crate) async fn before_notice(&self) -> buck2_error::Result<()> {
         let mut state = self.0.lock().await;
         if let Display::Live {
-            console, open_line, ..
+            console,
+            open_line,
+            no_echo,
+            ..
         } = &mut state.display
             && is_running(console)
         {
+            // The echo comes back once the canvas is erased (or on an error).
+            let _no_echo = no_echo.take();
             end_line(open_line)?;
             console.erase_interactive_output().await?;
         }
@@ -295,6 +307,9 @@ impl State {
                     console,
                     show_at: Instant::now() + SHOW_AFTER,
                     open_line: None,
+                    // From the start: keys typed before the canvas is first drawn would move
+                    // the cursor as well. (The line editor is not reading: the input runs.)
+                    no_echo: NoEcho::enable(),
                 };
             }
             // stderr is not a terminal that can show one (any more).
@@ -310,7 +325,8 @@ impl State {
     }
 
     /// Erases the superconsole of the input that ran, if any, and goes on with a new simple
-    /// console, which knows nothing of the input (so that it never waits for its work).
+    /// console, which knows nothing of the input (so that it never waits for its work). Typed
+    /// keys are echoed again.
     async fn end_input(&mut self) -> buck2_error::Result<()> {
         if !matches!(self.display, Display::Live { .. }) {
             return Ok(());
@@ -322,13 +338,17 @@ impl State {
         let Display::Live {
             mut console,
             mut open_line,
+            no_echo,
             ..
         } = std::mem::replace(&mut self.display, next)
         else {
             return Ok(());
         };
         end_line(&mut open_line)?;
-        console.erase_interactive_output().await
+        console.erase_interactive_output().await?;
+        // Also dropped on an error above.
+        drop(no_echo);
+        Ok(())
     }
 
     /// Holds `item` back (see [`Held`]) if the terminal is someone else's now, and there is room.

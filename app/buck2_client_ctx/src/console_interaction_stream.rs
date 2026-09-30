@@ -53,6 +53,40 @@ impl Drop for ConsoleInteractionStream<'_> {
     }
 }
 
+/// Turns off the echo of what is typed on the terminal while it lives, for a superconsole drawn
+/// while a later reader of stdin (e.g. a line editor, between commands) owns the input. Echoed
+/// keys would move the cursor under the canvas (a typed newline, or a line wider than the
+/// terminal), which is then redrawn and erased from the wrong line. Unlike
+/// [`ConsoleInteractionStream`], nothing is read and the terminal stays in canonical mode: what is
+/// typed meanwhile is kept, and processed as before, for that reader.
+///
+/// As for [`ConsoleInteractionStream`], only done when stdin, stdout and stderr are all terminals.
+pub struct NoEcho {
+    term: InteractiveTerminal,
+}
+
+impl NoEcho {
+    /// `None` if the echo is not turned off (see above).
+    pub fn enable() -> Option<Self> {
+        match InteractiveTerminal::enable_no_echo() {
+            Ok(Some(term)) => Some(Self { term }),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("Failed to disable terminal echo: {:#}", e);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        if let Err(e) = self.term.disable() {
+            tracing::warn!("Failed to restore terminal echo: {:#}", e);
+        }
+    }
+}
+
 #[cfg(unix)]
 mod interactive_terminal {
     use std::io::IsTerminal;
@@ -67,6 +101,22 @@ mod interactive_terminal {
 
     impl InteractiveTerminal {
         pub fn enable() -> buck2_error::Result<Option<Self>> {
+            Self::enable_with(|termios| {
+                // Switch to non-canonical mode to get input immediately, and disable echo.
+                termios.c_lflag &= !(ICANON | ECHO);
+
+                // Keep blocking reads.
+                termios.c_cc[VMIN] = 1;
+                termios.c_cc[VTIME] = 0;
+            })
+        }
+
+        /// Only disables echo (of newlines too): input stays line by line.
+        pub fn enable_no_echo() -> buck2_error::Result<Option<Self>> {
+            Self::enable_with(|termios| termios.c_lflag &= !(ECHO | ECHONL))
+        }
+
+        fn enable_with(change: impl FnOnce(&mut Termios)) -> buck2_error::Result<Option<Self>> {
             let fd = std::io::stdin().as_raw_fd();
 
             if !std::io::stdin().is_terminal() {
@@ -98,13 +148,7 @@ mod interactive_terminal {
                 Termios::from_fd(fd).buck_error_context("Failed to access current termios")?;
 
             let mut termios = orig;
-
-            // Switch to non-canonical mode to get input immediately, and disable echo.
-            termios.c_lflag &= !(ICANON | ECHO);
-
-            // Keep blocking reads.
-            termios.c_cc[VMIN] = 1;
-            termios.c_cc[VTIME] = 0;
+            change(&mut termios);
 
             tcsetattr(fd, TCSANOW, &termios).buck_error_context("Failed to set termios")?;
 
@@ -154,6 +198,16 @@ mod interactive_terminal {
 
     impl InteractiveTerminal {
         pub fn enable() -> buck2_error::Result<Option<Self>> {
+            // Switch to non-canonical mode to get input immediately, and disable echo.
+            Self::enable_with(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+        }
+
+        /// Only disables echo: input stays line by line.
+        pub fn enable_no_echo() -> buck2_error::Result<Option<Self>> {
+            Self::enable_with(ENABLE_ECHO_INPUT)
+        }
+
+        fn enable_with(clear: u32) -> buck2_error::Result<Option<Self>> {
             let handle = std::io::stdin().as_raw_handle() as HANDLE;
 
             if !std::io::stdin().is_terminal()
@@ -164,8 +218,7 @@ mod interactive_terminal {
             }
 
             let mode = get_console_mode(handle)?;
-            // Switch to non-canonical mode to get input immediately, and disable echo.
-            set_console_mode(handle, mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))?;
+            set_console_mode(handle, mode & !clear)?;
             Ok(Some(Self { mode }))
         }
 
@@ -183,6 +236,10 @@ mod interactive_terminal {
 
     impl InteractiveTerminal {
         pub fn enable() -> buck2_error::Result<Option<Self>> {
+            Ok(None)
+        }
+
+        pub fn enable_no_echo() -> buck2_error::Result<Option<Self>> {
             Ok(None)
         }
 
