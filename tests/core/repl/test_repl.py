@@ -12,7 +12,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.api.buck_result import ExitCodeV2
@@ -24,16 +24,30 @@ def _json_lines(stdout: str) -> List[Dict[str, Any]]:
     return [json.loads(line) for line in stdout.splitlines()]
 
 
-async def _complete(buck: Buck, *bufs: str) -> List[List[str]]:
+# Completion answers once the daemon has loaded what it needs (packages, modules), however
+# long that takes on a slow machine.
+_COMPLETION_ENV = {"BUCK2_REPL_COMPLETION_TIMEOUT_MS": "120000"}
+
+
+def _complete_input(buf: str) -> str:
+    return ":__complete " + json.dumps({"buf": buf})
+
+
+def _replacements(answer: Dict[str, Any]) -> List[str]:
+    return [c["replacement"] for c in answer["candidates"]]
+
+
+async def _complete(
+    buck: Buck, *bufs: str, rel_cwd: Optional[Path] = None
+) -> List[List[str]]:
     """The replacements `:__complete` offers for each buffer (completed at its end)."""
-    inputs = [":__complete " + json.dumps({"buf": buf}) for buf in bufs]
-    args = [arg for i in inputs for arg in ("-e", i)]
-    result = await buck.repl(*args)
+    args = [arg for buf in bufs for arg in ("-e", _complete_input(buf))]
+    result = await buck.repl(*args, rel_cwd=rel_cwd, env=_COMPLETION_ENV)
     answers = _json_lines(result.stdout)
     assert len(answers) == len(bufs), result.stdout
     for answer in answers:
         assert answer["status"] == "ok", answer
-    return [[c["replacement"] for c in answer["candidates"]] for answer in answers]
+    return [_replacements(answer) for answer in answers]
 
 
 # Evaluation (inputs, values, errors, limits).
@@ -69,6 +83,20 @@ async def test_repl_ctx(buck: Buck) -> None:
 async def test_repl_print(buck: Buck) -> None:
     result = await buck.repl("-e", 'print("hi")', "-e", 'ctx.output.print("out")')
     assert result.stdout == "hi\nout\n"
+
+
+@buck_test()
+async def test_repl_ensure(buck: Buck) -> None:
+    # An ensured artifact is built and materialized after the input, and prints as its path.
+    result = await buck.repl(
+        "-e",
+        'a = ctx.analysis(ctx.configured_targets("//:hello")).providers()[DefaultInfo].default_outputs[0]',
+        "-e",
+        "ctx.output.ensure(a)",
+    )
+    path = result.stdout.splitlines()[-1]
+    assert path.startswith("buck-out/")
+    assert (buck.cwd / path).read_text() == "hello\n"
 
 
 @buck_test()
@@ -130,9 +158,7 @@ async def test_repl_limits(buck: Buck) -> None:
 
     # The heap of the session is limited.
     await expect_failure(
-        buck.repl(
-            "--max-heap-mb", "64", "-e", "y = [str(i) for i in range(5000000)]"
-        ),
+        buck.repl("--max-heap-mb", "64", "-e", "y = [str(i) for i in range(5000000)]"),
         stderr_regex="--max-heap-mb",
     )
 
@@ -186,6 +212,27 @@ async def test_repl_load_command(buck: Buck) -> None:
         exit_code=ExitCodeV2.USER_ERROR,
         stderr_regex="double",
     )
+
+
+# `:!` runs a POSIX shell command here.
+@buck_test(skip_for_os=["windows"])
+async def test_repl_reload_edited(buck: Buck) -> None:
+    # `:reload` loads a module again once it was changed (here, by the session itself).
+    (buck.cwd / "pkg" / "edit.bxl").write_text("def f(x):\n    return x * 2\n")
+    result = await buck.repl(
+        "-e",
+        ":l //pkg:edit.bxl",
+        "-e",
+        "f(2)",
+        "-e",
+        ":!printf 'def f(x):\\n    return x * 3\\n' > pkg/edit.bxl",
+        "-e",
+        ":r",
+        "-e",
+        "f(2)",
+    )
+    assert result.stdout == "4\n6\n"
+    assert "reloaded //pkg:edit.bxl" in result.stderr
 
 
 @buck_test()
@@ -269,7 +316,8 @@ async def test_repl_build(buck: Buck) -> None:
     assert failure.stdout == "2\n"
 
 
-@buck_test()
+# The program of `//:greet` is `echo`.
+@buck_test(skip_for_os=["windows"])
 async def test_repl_run(buck: Buck) -> None:
     result = await buck.repl("-e", ":run //:greet -- a b")
     assert "hello from greet a b" in result.stdout
@@ -307,6 +355,63 @@ async def test_repl_complete(buck: Buck) -> None:
     assert answers[7] == ['//pkg:helpers.bxl"']
     assert sorted(answers[8]) == ['double"', 'main"']
     assert answers[9] == ["//pkg:helpers.bxl:main"]
+
+
+@buck_test()
+async def test_repl_complete_names(buck: Buck) -> None:
+    answers = await _complete(
+        buck,
+        "ctx.c",
+        "ctx.output.p",
+        ":b //",
+        ":b //:",
+        'ctx.analysis("//pkg:l',
+        "nope.x",
+    )
+    assert {"cquery(", "configured_targets(", "cell_root("} <= set(answers[0])
+    assert {"print(", "print_json("} <= set(answers[1])
+    assert {"//pkg/", "//pkg:", "//:", "//..."} <= set(answers[2])
+    assert answers[3] == ["//:greet", "//:hello"]
+    assert answers[4] == ['//pkg:lib"']
+    assert answers[5] == []
+
+    # Relative patterns complete in the session's directory.
+    [answer] = await _complete(buck, ":b :", rel_cwd=Path("pkg"))
+    assert answer == [":lib"]
+
+
+@buck_test()
+async def test_repl_complete_session(buck: Buck) -> None:
+    # Completion sees what earlier inputs defined or loaded.
+    result = await buck.repl(
+        "-e",
+        "s = struct(foo=1, far=2)",
+        "-e",
+        _complete_input("s.f"),
+        "-e",
+        ":l //pkg:helpers.bxl",
+        "-e",
+        _complete_input("dou"),
+        "-e",
+        "1 + 1",
+        "-e",
+        _complete_input("_"),
+        "-e",
+        _complete_input(":b //nope/"),
+        "-e",
+        "2 + 2",
+        env=_COMPLETION_ENV,
+    )
+    lines = result.stdout.splitlines()
+    assert len(lines) == 6, result.stdout
+    assert _replacements(json.loads(lines[0])) == ["far", "foo"]
+    assert _replacements(json.loads(lines[1])) == ["double("]
+    assert lines[2] == "2"
+    assert "_" in _replacements(json.loads(lines[3]))
+    # A package that does not exist has no candidates (or fails): the session goes on.
+    nope = json.loads(lines[4])
+    assert nope["status"] == "error" or nope["candidates"] == [], nope
+    assert lines[5] == "4"
 
 
 @buck_test()

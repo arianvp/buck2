@@ -27,6 +27,7 @@ use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_cli_proto::ClientContext;
@@ -193,8 +194,23 @@ struct UiInner {
     state: UiState,
     /// The line editor is reading a line, and only notices the end of the session after it.
     reading: bool,
+    /// A script waits for its next line of stdin, which may never come.
+    reading_stdin: bool,
     /// The daemon call is over: the input thread must not wait for input any more.
     session_ended: bool,
+}
+
+/// What the input thread does when the session ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtEnd {
+    /// The line editor reads a line: it only notices the end after it.
+    EditorReading,
+    /// A script waits for its next line of stdin, which may never come. Every input it read
+    /// before is done (and reported); it stops without evaluating the line it gets.
+    StdinReading,
+    /// Anything else, e.g. waiting for the result of an input: the thread notices the end at
+    /// once (or when the program that it runs, `:!`, is over) and reports the input.
+    Running,
 }
 
 impl SharedUi {
@@ -202,6 +218,7 @@ impl SharedUi {
         SharedUi(Arc::new(Mutex::new(UiInner {
             state: UiState::Idle,
             reading: false,
+            reading_stdin: false,
             session_ended: false,
         })))
     }
@@ -251,12 +268,37 @@ impl SharedUi {
         self.lock().session_ended
     }
 
-    /// Marks the session as over. Returns whether the line editor is reading, in which case it
-    /// only notices after its current line.
-    fn end_session(&self) -> bool {
+    /// A script starts waiting for its next line of stdin, unless the session is over. Returns
+    /// whether it is not (so that the script may read).
+    pub(crate) fn start_reading_stdin(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.session_ended {
+            return false;
+        }
+        inner.reading_stdin = true;
+        true
+    }
+
+    /// A script got its next line of stdin (or the end of stdin). Returns whether the session
+    /// is still on. If it ended meanwhile, the session did not wait for the input thread (see
+    /// [`AtEnd::StdinReading`]), which must not start anything more.
+    pub(crate) fn stop_reading_stdin(&self) -> bool {
+        let mut inner = self.lock();
+        inner.reading_stdin = false;
+        !inner.session_ended
+    }
+
+    /// Marks the session as over. Returns what the input thread is doing.
+    fn end_session(&self) -> AtEnd {
         let mut inner = self.lock();
         inner.session_ended = true;
-        inner.reading
+        if inner.reading {
+            AtEnd::EditorReading
+        } else if inner.reading_stdin {
+            AtEnd::StdinReading
+        } else {
+            AtEnd::Running
+        }
     }
 }
 
@@ -548,14 +590,17 @@ pub(crate) async fn run(
     // Nothing is drawn after the call: the terminal is the input thread's (and the messages
     // below are printed after the progress of an input that was cut off).
     let _ignored = console.end().await;
-    let reading = ui.end_session();
+    let at_end = ui.end_session();
     // Wakes the input thread if it is waiting for a result.
     let _ignored = handler.ui_tx.send(UiEvent::SessionEnded);
 
     let Some(result) = result else {
-        // Given up on with Ctrl-C. The editor (which is not reading) exits at once; a script
-        // may be blocked reading stdin and is left behind.
-        if interactive {
+        // Given up on with Ctrl-C. The editor (which is not reading) exits at once. A script
+        // that runs an input reports it (with `--json`, its record); one that waits for stdin
+        // is left behind.
+        let stopped = interactive
+            || (at_end == AtEnd::Running && script_outcome(&mut outcome_rx).await.is_some());
+        if stopped {
             let _ignored = thread.join();
         }
         return ExitResult::signal_interrupt();
@@ -564,13 +609,18 @@ pub(crate) async fn run(
     // The input thread sends its outcome before it hangs up, so a session that ended because
     // the inputs ran out always has one. Without one, the session ended early.
     let mut outcome = outcome_rx.try_recv().ok();
+    if outcome.is_none() && !interactive && at_end == AtEnd::Running {
+        // The script runs an input, whose result will not come: it reports it (with `--json`,
+        // the input gets its record) and stops.
+        outcome = script_outcome(&mut outcome_rx).await;
+    }
     if outcome.is_some() {
         let _ignored = thread.join();
     } else if interactive {
         // The editor restores the terminal before it exits, which it can only do once its
         // current line is read. (Not through rustyline's `ExternalPrinter`: while one exists,
         // rustyline 18 waits on the terminal even when typed-ahead keys are buffered.)
-        if reading {
+        if at_end == AtEnd::EditorReading {
             let message = match shutdown.reason() {
                 Some(reason) => {
                     format!("the buck2 daemon was shut down ({reason}); press Enter to exit")
@@ -588,7 +638,7 @@ pub(crate) async fn run(
         }
         let _ignored = thread.join();
         outcome = outcome_rx.try_recv().ok();
-    } // Otherwise a script may be blocked reading stdin: it is left behind.
+    } // Otherwise a script waits for stdin (or took too long to stop): it is left behind.
 
     match result {
         Err(e) => ExitResult::err(e),
@@ -605,6 +655,20 @@ pub(crate) async fn run(
             )),
         },
     }
+}
+
+/// How long a script that runs an input when the session ends is given to report it. It is
+/// quick unless a program that the input runs (`:!`) goes on, or nobody reads stdout.
+const SCRIPT_WIND_DOWN: Duration = Duration::from_secs(10);
+
+/// The outcome of a script that ran an input when the session ended, once it has reported it.
+async fn script_outcome(
+    outcome_rx: &mut tokio::sync::oneshot::Receiver<InputOutcome>,
+) -> Option<InputOutcome> {
+    tokio::time::timeout(SCRIPT_WIND_DOWN, outcome_rx)
+        .await
+        .ok()?
+        .ok()
 }
 
 fn daemon_shutdown_error(reason: &str) -> ExitResult {

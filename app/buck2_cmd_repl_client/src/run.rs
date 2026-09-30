@@ -18,6 +18,7 @@
 //! it.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -26,6 +27,7 @@ use std::time::Instant;
 
 use buck2_cli_proto::ReplRun;
 use buck2_cli_proto::repl_output;
+use buck2_util::threads::thread_spawn_scoped;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_UUID_ENV_VAR;
 use buck2_wrapper_common::BUCK2_WRAPPER_ENV_VAR;
@@ -187,14 +189,58 @@ fn run_child(
     ui.set(UiState::Child);
     let result = match capture {
         None => command.status(),
-        Some(capture) => command.output().map(|output| {
-            capture.write(repl_output::Channel::Stdout, &output.stdout);
-            capture.write(repl_output::Channel::Stderr, &output.stderr);
-            output.status
-        }),
+        Some(capture) => run_captured(command, capture),
     };
     ui.set(after);
     result
+}
+
+/// Runs a program with an empty stdin and what it writes captured into `capture`, as it
+/// writes it: past what the capture keeps, the output is read and dropped, so that a program
+/// that writes without end (`:!yes`) does not fill the client's memory.
+fn run_captured(
+    command: &mut std::process::Command,
+    capture: &JsonCapture,
+) -> std::io::Result<ExitStatus> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    // Both pipes are read at once: a program may fill one while the other is read.
+    let drained = std::thread::scope(|scope| {
+        if let Some(stderr) = stderr {
+            thread_spawn_scoped("repl-capture", scope, move || {
+                drain(stderr, capture, repl_output::Channel::Stderr)
+            })?;
+        }
+        if let Some(stdout) = stdout {
+            drain(stdout, capture, repl_output::Channel::Stdout);
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    if let Err(e) = drained {
+        let _ignored = child.kill();
+        let _ignored = child.wait();
+        return Err(e);
+    }
+    child.wait()
+}
+
+/// Reads `pipe` to its end into `capture`.
+fn drain(mut pipe: impl Read, capture: &JsonCapture, channel: repl_output::Channel) {
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => capture.write(channel, buf.get(..n).unwrap_or_default()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // The program's output cannot be read: what it writes next is lost.
+            Err(_) => return,
+        }
+    }
 }
 
 /// The shell of `:!`, and its flag to run a command.

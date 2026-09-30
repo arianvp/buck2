@@ -391,6 +391,11 @@ printf ':cq rdeps(//..., //foo:lib)\nlen(_)\n' | buck2 repl
 buck2 repl -i tools/helpers.bxl -e 'x = double(21)'
 ```
 
+Inputs on stdin are split as the prompt splits them, so a block (`def`, `for`,
+`if`, ...) is evaluated once a later line ends it. A program that drives the
+session through a pipe, waiting for each result, should follow a block with an
+empty line.
+
 ### Preloading files
 
 `buck2 repl FILES...` evaluates the files before the other inputs, in order:
@@ -414,20 +419,22 @@ $ buck2 repl --json -e 'x = 1' -e 'x + 1' -e ':cq deps(//:hello)' -e 'nope'
 {"n":4,"input":"nope","ok":false,"error":{"kind":"eval","message":"error: Variable `nope` not found, ..."},"stdout":"","stderr":"","wait_ms":0,"eval_ms":1,"sources_changed":false}
 ```
 
-| Field                                   | Meaning                                                                                                                                              |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `n`                                     | The input's number (`<repl:N>` in errors), or `null` for an input the client handles alone (`:help`, `:hist`, `:!`, ...)                             |
-| `input`                                 | The input (for a file of the command line: its code, and `file` is its path)                                                                         |
-| `ok`                                    | Whether the input succeeded                                                                                                                          |
-| `type`, `text`                          | The value's type and text, when the input has a value (`truncated` is `true` if the text was cut)                                                    |
-| `json`                                  | The value as JSON, when it has a JSON form of at most 1 MiB (as `:json` would show it)                                                               |
-| `run`                                   | For `:run`: the command (`argv`, `label`), which is not run (`stdout` has it, as `:run --print` prints it)                                           |
-| `error`                                 | When `ok` is false: `kind` (`syntax`, `eval`, `buck`, `interrupted`, `usage`, `busy`, `unsupported`, `internal`, `io`, `exit`, `lost`) and `message` |
-| `notices`                               | What the daemon said about the input (`{"level": "info", "text": "loaded ..."}`)                                                                     |
-| `stdout`, `stderr`                      | What the input wrote (`print()`, `ctx.output`, `:print`, `:help`, a `:!` command, ...); `stdout_truncated`/`stderr_truncated` past 64 MiB            |
-| `wait_ms`, `eval_ms`, `sources_changed` | How long the daemon waited and evaluated, and whether sources changed since the previous input, when the daemon answered                             |
+| Field                                   | Meaning                                                                                                                                                         |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `n`                                     | The input's number (`<repl:N>` in errors), or `null` for an input the client handles alone (`:help`, `:hist`, `:!`, ...)                                        |
+| `input`                                 | The input (for a file of the command line: its code, and `file` is its path)                                                                                    |
+| `ok`                                    | Whether the input succeeded                                                                                                                                     |
+| `type`, `text`                          | The value's type and text, when the input has a value (`truncated` is `true` if the text was cut)                                                               |
+| `json`                                  | The value as JSON, when it has a JSON form of at most 1 MiB (as `:json` would show it)                                                                          |
+| `run`                                   | For `:run`: the command (`argv`, `label`), which is not run (`stdout` has it, as `:run --print` prints it)                                                      |
+| `error`                                 | When `ok` is false: `kind` (`syntax`, `eval`, `buck`, `interrupted`, `usage`, `busy`, `unsupported`, `internal`, `unknown`, `io`, `exit`, `lost`) and `message` |
+| `notices`                               | What the daemon said about the input (`{"level": "info", "text": "loaded ..."}`)                                                                                |
+| `stdout`, `stderr`                      | What the input wrote (`print()`, `ctx.output`, `:print`, `:help`, a `:!` command, ...); `stdout_truncated`/`stderr_truncated` past 64 MiB                       |
+| `wait_ms`, `eval_ms`, `sources_changed` | How long the daemon waited and evaluated, and whether sources changed since the previous input, when the daemon answered                                        |
 
-`--json` requires non-interactive inputs.
+`--json` requires non-interactive inputs. An input that is still running when the
+session ends gets a record too: its error kind is `interrupted` when the daemon
+cancelled it (`buck2 kill`), and `lost` when no answer came (the daemon died).
 
 ### Exit codes
 

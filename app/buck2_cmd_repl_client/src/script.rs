@@ -60,7 +60,23 @@ fn run(inputs: &mut Inputs, first: FirstInputs, read_stdin: bool) {
         return;
     }
     let mut chunker = Chunker::new();
-    for line in std::io::stdin().lock().lines() {
+    let mut lines = std::io::stdin().lock().lines();
+    loop {
+        // The session does not wait for a script that waits for stdin: once it has ended, the
+        // script must not start another input (its result could be cut short, e.g. half of a
+        // `--json` record printed).
+        if !inputs.ui.start_reading_stdin() {
+            inputs.outcome.lost = true;
+            return;
+        }
+        let line = lines.next();
+        if !inputs.ui.stop_reading_stdin() {
+            inputs.outcome.lost = true;
+            return;
+        }
+        let Some(line) = line else {
+            break;
+        };
         let line = match line {
             Ok(line) => line,
             Err(e) => {
