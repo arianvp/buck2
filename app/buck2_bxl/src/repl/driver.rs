@@ -76,6 +76,9 @@ use crate::command::materialize_ensured_artifacts;
 use crate::repl::build::BuildSpec;
 use crate::repl::build::Built;
 use crate::repl::build::build;
+use crate::repl::bxl::BxlSpec;
+use crate::repl::bxl::complete_bxl_functions;
+use crate::repl::bxl::run_bxl;
 use crate::repl::cancel::EvalCancel;
 use crate::repl::commands::CommandWork;
 use crate::repl::commands::command_work;
@@ -100,9 +103,9 @@ const DEFAULT_HEAP_LIMIT: u64 = 4 << 30;
 /// Longest excerpt of an input kept to describe its request to other commands.
 const MAX_TITLE_BYTES: usize = 256;
 
-/// Longest a target completion may take. The client stops waiting sooner; the work goes on
+/// Longest a completion from DICE (of a target pattern or a BXL function) may take. The client stops waiting sooner; the work goes on
 /// meanwhile (unless an input cancels it), so that the next completion is fast.
-const TARGET_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const DICE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A request, classified.
 enum Work {
@@ -113,6 +116,8 @@ enum Work {
     Eval(EvalRequest),
     /// `:build`, `:run`.
     Build(BuildRequest),
+    /// `:bxl`.
+    Bxl(BxlRequest),
     /// `:reset`: a new session, started like the first one.
     Reset {
         id: u64,
@@ -122,10 +127,10 @@ enum Work {
         id: u64,
         req: ReplComplete,
     },
-    /// Completion of a target pattern, in a transaction of its own.
-    CompleteTargets {
+    /// Completion from DICE, in a transaction of its own.
+    CompleteDice {
         id: u64,
-        prefix: String,
+        what: DiceCompletion,
     },
     /// Answered at once, without DICE.
     Reply {
@@ -167,6 +172,21 @@ struct BuildRequest {
     title: String,
 }
 
+struct BxlRequest {
+    id: u64,
+    spec: BxlSpec,
+    /// The input as typed, shown to other commands that wait for this one.
+    title: String,
+}
+
+/// What a completion from DICE completes.
+enum DiceCompletion {
+    /// A target pattern.
+    Targets { prefix: String },
+    /// A function of a `.bxl` file (`:bxl <file.bxl>:<prefix>`).
+    BxlFunctions { module: String, prefix: String },
+}
+
 /// The first line of `input`, cut to [`MAX_TITLE_BYTES`].
 fn title(input: &str) -> String {
     let first_line = input.trim_start().lines().next().unwrap_or("");
@@ -197,6 +217,14 @@ enum Outcome {
         t1: Instant,
         t2: Instant,
     },
+    /// `:bxl`, which has no value: its output went to the client as it ran.
+    Bxl {
+        result: Result<(), ReplFailure>,
+        equality: DiceEquality,
+        t0: Instant,
+        t1: Instant,
+        t2: Instant,
+    },
 }
 
 /// How the materialization of the artifacts an input ensured (`ctx.output.ensure`) went.
@@ -218,8 +246,8 @@ enum Event {
 
 /// A completion of a name or an attribute that the session thread is answering. The driver
 /// does not wait for it: it goes on reading requests and running the request in flight (a
-/// target completion, whose transaction must give way to other commands), and sends the answer
-/// when it comes.
+/// completion from DICE, whose transaction must give way to other commands), and sends the
+/// answer when it comes.
 struct ThreadCompletion {
     id: u64,
     answer: tokio::sync::oneshot::Receiver<ReplCompletions>,
@@ -322,9 +350,9 @@ impl<'a> Driver<'a> {
                     // Answered when the thread is done (`next_request`, `in_flight`).
                     self.start_thread_completion(&thread, id, req);
                 }
-                Work::CompleteTargets { id, prefix } => {
+                Work::CompleteDice { id, what } => {
                     let cancel = Arc::new(EvalCancel::new());
-                    let fut = run_complete_targets(self.sctx, prefix, cancel.dupe());
+                    let fut = run_dice_completion(self.sctx, what, cancel.dupe());
                     let answer = self.in_flight(id, &cancel, Some(&thread), fut).await;
                     self.emitter
                         .emit(id, repl_message::Message::Completions(answer));
@@ -341,6 +369,19 @@ impl<'a> Driver<'a> {
                 Work::Build(request) => {
                     let id = request.id;
                     let outcome = self.build(&thread, &target_cfg, request).await;
+                    self.answer_eval(id, outcome);
+                }
+                Work::Bxl(request) => {
+                    let id = request.id;
+                    let cancel = Arc::new(EvalCancel::new());
+                    let fut = run_bxl_request(
+                        self.sctx,
+                        target_cfg.clone(),
+                        request,
+                        cancel.dupe(),
+                        self.emitter.dupe(),
+                    );
+                    let outcome = self.in_flight(id, &cancel, None, fut).await;
                     self.answer_eval(id, outcome);
                 }
                 Work::Reset { id } => {
@@ -480,8 +521,8 @@ impl<'a> Driver<'a> {
     /// the session thread, which it does not use) gives way instead: an input cancels it and runs
     /// next, and names and attributes are completed meanwhile (by the thread, while `fut` is
     /// still polled, so that its timeout and its preemption by other commands keep working);
-    /// only another target completion gets `BUSY` (the one in flight keeps loading, so the next
-    /// one is fast). The answer to a thread completion is sent whenever it comes.
+    /// only another completion from DICE (a target pattern, a BXL function) gets `BUSY` (the one
+    /// in flight keeps loading, so the next one is fast). The answer to a thread completion is sent whenever it comes.
     async fn in_flight<T>(
         &mut self,
         id: u64,
@@ -551,7 +592,7 @@ impl<'a> Driver<'a> {
                         repl_complete::Kind::Name | repl_complete::Kind::Attr
                     ) =>
                 {
-                    // The thread is not used by a target completion.
+                    // The thread is not used by a completion from DICE.
                     self.start_thread_completion(thread, request.id, complete.clone());
                 }
                 (Some(repl_request::Request::Complete(_)), _) => self.emitter.emit(
@@ -664,6 +705,25 @@ impl<'a> Driver<'a> {
                 };
                 ReplDone {
                     outcome: Some(outcome),
+                    wait_ms: millis(t1 - t0),
+                    eval_ms: millis(t2 - t1),
+                    sources_changed,
+                    heap_bytes: self.heap_bytes,
+                }
+            }
+            Ok(Outcome::Bxl {
+                result,
+                equality,
+                t0,
+                t1,
+                t2,
+            }) => {
+                let sources_changed = self.last_equality.is_some_and(|last| last != equality);
+                self.last_equality = Some(equality);
+                ReplDone {
+                    outcome: result
+                        .err()
+                        .map(|failure| repl_done::Outcome::Error(failure_proto(failure))),
                     wait_ms: millis(t1 - t0),
                     eval_ms: millis(t2 - t1),
                     sources_changed,
@@ -783,6 +843,11 @@ fn classify(request: ReplRequest) -> Work {
                     spec,
                     title: title(&eval.input),
                 }),
+                Ok(CommandWork::Bxl(spec)) => Work::Bxl(BxlRequest {
+                    id,
+                    spec,
+                    title: title(&eval.input),
+                }),
                 Err(failure) => Work::Reply {
                     id,
                     message: repl_message::Message::Done(ReplDone {
@@ -801,9 +866,16 @@ fn classify(request: ReplRequest) -> Work {
             repl_complete::Kind::Name | repl_complete::Kind::Attr => {
                 Work::CompleteStarlark { id, req }
             }
-            repl_complete::Kind::TargetPattern => Work::CompleteTargets {
+            repl_complete::Kind::TargetPattern => Work::CompleteDice {
                 id,
-                prefix: req.prefix,
+                what: DiceCompletion::Targets { prefix: req.prefix },
+            },
+            repl_complete::Kind::BxlFunction => Work::CompleteDice {
+                id,
+                what: DiceCompletion::BxlFunctions {
+                    module: req.load_module,
+                    prefix: req.prefix,
+                },
             },
             _ => Work::Reply {
                 id,
@@ -991,12 +1063,51 @@ async fn run_build(
         .await
 }
 
-/// Completes a target pattern in a transaction of its own, taken with the completion policy
-/// (it never waits for commands that use another state, and gives way to them). The work races
-/// the cancellation of the request and a timeout: it is DICE computations, which are safe to drop.
-async fn run_complete_targets(
+/// Runs `:bxl` in a transaction of its own. The run races the cancellation of the request: it is
+/// DICE work, which is safe to drop.
+async fn run_bxl_request(
     sctx: &dyn ServerCommandContextTrait,
-    prefix: String,
+    target_cfg: TargetCfg,
+    request: BxlRequest,
+    cancel: Arc<EvalCancel>,
+    emitter: ReplEmitter,
+) -> buck2_error::Result<Outcome> {
+    let BxlRequest { id, spec, title } = request;
+    let t0 = Instant::now();
+    let repl_ctx = ReplCtx::eval(sctx, &title);
+    (&repl_ctx as &dyn ServerCommandContextTrait)
+        .with_dice_ctx(|sctx, txn| async move {
+            let t1 = Instant::now();
+            if cancel.is_triggered() {
+                // Cancelled while waiting for other commands.
+                return Ok(Outcome::Interrupted { t0, t1 });
+            }
+            let result = tokio::select! {
+                result = run_bxl(sctx, &txn, &target_cfg, &spec, &emitter, id) => match result {
+                    Ok(errors) if errors.is_empty() => Ok(()),
+                    Ok(errors) => Err(materialization_failure(&errors)),
+                    Err(e) => Err(ReplFailure::from_buck2(repl_error::Kind::Buck, &e)),
+                },
+                () = cancel.cancelled() => Err(ReplFailure::interrupted()),
+            };
+            Ok(Outcome::Bxl {
+                result,
+                equality: txn.equality_token(),
+                t0,
+                t1,
+                t2: Instant::now(),
+            })
+        })
+        .await
+}
+
+/// Completes a target pattern or a BXL function in a transaction of its own, taken with the
+/// completion policy (it never waits for commands that use another state, and gives way to
+/// them). The work races the cancellation of the request and a timeout: it is DICE computations,
+/// which are safe to drop.
+async fn run_dice_completion(
+    sctx: &dyn ServerCommandContextTrait,
+    what: DiceCompletion,
     cancel: Arc<EvalCancel>,
 ) -> ReplCompletions {
     let repl_ctx = ReplCtx::completion(sctx);
@@ -1010,14 +1121,21 @@ async fn run_complete_targets(
             }
             let mut dc = txn.ctx();
             let work = async {
-                let cwd = dc
-                    .get_cell_resolver()
-                    .await?
-                    .get_cell_path(sctx.working_dir());
-                complete_targets(&mut dc, &cwd, &prefix).await
+                match &what {
+                    DiceCompletion::Targets { prefix } => {
+                        let cwd = dc
+                            .get_cell_resolver()
+                            .await?
+                            .get_cell_path(sctx.working_dir());
+                        complete_targets(&mut dc, &cwd, prefix).await
+                    }
+                    DiceCompletion::BxlFunctions { module, prefix } => {
+                        complete_bxl_functions(&mut dc, sctx.working_dir(), module, prefix).await
+                    }
+                }
             };
             Ok(tokio::select! {
-                result = tokio::time::timeout(TARGET_COMPLETION_TIMEOUT, work) => match result {
+                result = tokio::time::timeout(DICE_COMPLETION_TIMEOUT, work) => match result {
                     Ok(Ok(candidates)) => candidates.into_completions(),
                     Ok(Err(e)) => completion_error(&e),
                     Err(_) => completions_status(

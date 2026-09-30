@@ -148,6 +148,11 @@ impl CommandSpec {
     pub fn display_name(&self) -> String {
         format!(":{}", self.name)
     }
+
+    /// Whether the command is implemented: the P0 commands, and the P1 commands done so far.
+    pub fn is_available(&self) -> bool {
+        self.priority == Priority::P0 || matches!(self.id, CommandId::Bxl)
+    }
 }
 
 macro_rules! command {
@@ -640,6 +645,10 @@ pub enum ArgError {
     MissingTarget,
     ExtraArgument(String),
     UnknownFlag(String),
+    /// `:bxl` without `<file.bxl>:<function>`.
+    MissingBxlFunction,
+    /// A word after the BXL function, before `--`.
+    ExtraBxlArgument(String),
 }
 
 impl fmt::Display for ArgError {
@@ -655,6 +664,13 @@ impl fmt::Display for ArgError {
                 "unexpected argument `{a}` (arguments for the program go after `--`)"
             ),
             ArgError::UnknownFlag(a) => write!(f, "unknown flag `{a}`"),
+            ArgError::MissingBxlFunction => {
+                write!(f, "missing BXL function (`<file.bxl>:<function>`)")
+            }
+            ArgError::ExtraBxlArgument(a) => write!(
+                f,
+                "unexpected argument `{a}` (arguments for the BXL function go after `--`)"
+            ),
         }
     }
 }
@@ -727,6 +743,43 @@ pub fn parse_load_args(arg: &str) -> Result<LoadArgs, ArgError> {
         module,
         symbols: words.collect(),
     })
+}
+
+/// The argument of `:bxl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BxlArgs {
+    /// `<file.bxl>:<function>`, as typed: the file is a label (`//pkg:x.bxl`, `//pkg/x.bxl`,
+    /// `:x.bxl`) or a path (`x.bxl`, `sub/x.bxl`), as `buck2 bxl` takes it.
+    pub label: String,
+    /// The function's command-line arguments (after `--`).
+    pub args: Vec<String>,
+}
+
+/// Parses `<file.bxl:function> [-- args…]`.
+pub fn parse_bxl_args(arg: &str) -> Result<BxlArgs, ArgError> {
+    let (before, args) = split_dashdash(split_args(arg)?);
+    let mut label = None;
+    for word in before {
+        if label.is_some() {
+            return Err(ArgError::ExtraBxlArgument(word));
+        } else if word.starts_with('-') {
+            return Err(ArgError::UnknownFlag(word));
+        } else {
+            label = Some(word);
+        }
+    }
+    Ok(BxlArgs {
+        label: label.ok_or(ArgError::MissingBxlFunction)?,
+        args,
+    })
+}
+
+/// Splits a word of `:bxl` that names a function of a `.bxl` file (`//pkg:x.bxl:ma`) into the
+/// file and the (partial) function name. `None` if the word does not name a function yet
+/// (`//pkg:x.b`, `sub/x.bxl`).
+pub fn split_bxl_function(word: &str) -> Option<(&str, &str)> {
+    let (file, function) = word.rsplit_once(':')?;
+    file.ends_with(".bxl").then_some((file, function))
 }
 
 #[cfg(test)]
@@ -981,6 +1034,71 @@ mod tests {
             parse_run_args("-x //:a"),
             Err(ArgError::UnknownFlag("-x".to_owned()))
         );
+    }
+
+    #[test]
+    fn test_bxl_args() {
+        assert_eq!(
+            parse_bxl_args("//pkg:x.bxl:main").unwrap(),
+            BxlArgs {
+                label: "//pkg:x.bxl:main".to_owned(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_bxl_args("x.bxl:main -- --name 'a b' -- c").unwrap(),
+            BxlArgs {
+                label: "x.bxl:main".to_owned(),
+                args: vec![
+                    "--name".to_owned(),
+                    "a b".to_owned(),
+                    "--".to_owned(),
+                    "c".to_owned()
+                ],
+            }
+        );
+        assert_eq!(
+            parse_bxl_args("x.bxl:main --name a"),
+            Err(ArgError::ExtraBxlArgument("--name".to_owned()))
+        );
+        assert_eq!(
+            parse_bxl_args("--x x.bxl:main"),
+            Err(ArgError::UnknownFlag("--x".to_owned()))
+        );
+        assert_eq!(
+            parse_bxl_args("-- --name a"),
+            Err(ArgError::MissingBxlFunction)
+        );
+        assert_eq!(parse_bxl_args("'x.bxl:main"), Err(ArgError::Quoting));
+        assert!(
+            ArgError::ExtraBxlArgument("a".to_owned())
+                .to_string()
+                .contains("after `--`")
+        );
+    }
+
+    #[test]
+    fn test_split_bxl_function() {
+        assert_eq!(
+            split_bxl_function("//pkg:x.bxl:ma"),
+            Some(("//pkg:x.bxl", "ma"))
+        );
+        assert_eq!(split_bxl_function("x.bxl:"), Some(("x.bxl", "")));
+        assert_eq!(
+            split_bxl_function("cell//a/x.bxl:m"),
+            Some(("cell//a/x.bxl", "m"))
+        );
+        assert_eq!(split_bxl_function("//pkg:x.b"), None);
+        assert_eq!(split_bxl_function("//pkg:x.bxl"), None);
+        assert_eq!(split_bxl_function("sub/x.bxl"), None);
+        assert_eq!(split_bxl_function(""), None);
+    }
+
+    #[test]
+    fn test_available() {
+        assert!(command(CommandId::Build).unwrap().is_available());
+        assert!(command(CommandId::Bxl).unwrap().is_available());
+        assert!(!command(CommandId::Info).unwrap().is_available());
     }
 
     #[test]

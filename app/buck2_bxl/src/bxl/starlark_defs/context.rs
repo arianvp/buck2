@@ -97,8 +97,8 @@ enum BxlContextError {
 pub(crate) enum ReplUnsupported {
     #[error(
         "`ctx.bxl_actions()` is not available in `buck2 repl`: actions declared at the prompt are \
-         not owned by a real .bxl file and cannot be built. Put this code in a .bxl file and run \
-         it with `buck2 bxl` (or `:bxl` once available)."
+         not owned by a real .bxl file and cannot be built. Put this code in a BXL function of \
+         a .bxl file and run it with `:bxl <file.bxl>:<function>` (or `buck2 bxl`)."
     )]
     BxlActions,
 }

@@ -12,9 +12,10 @@
 //! it on a given buffer and prints the candidates as JSON.
 //!
 //! The site of the cursor is classified locally ([`classify`]). Command names, help topics and
-//! the paths of `:load` are completed here; names, attributes and target patterns by the
-//! daemon, which is asked with a `Complete` request and given a short time to answer: Tab must
-//! not hang. A late answer is dropped when the next completion reads its own.
+//! the paths of `:load` and `:bxl` are completed here; names, attributes, target patterns and
+//! the functions of a `.bxl` file (`:bxl x.bxl:<TAB>`) by the daemon, which is asked with a
+//! `Complete` request and given a short time to answer: Tab must not hang. A late answer is
+//! dropped when the next completion reads its own.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,7 +43,7 @@ use buck2_core::buck2_env;
 use buck2_repl_syntax::commands::ArgKind;
 use buck2_repl_syntax::commands::COMMANDS;
 use buck2_repl_syntax::commands::HELP_TOPICS;
-use buck2_repl_syntax::commands::Priority;
+use buck2_repl_syntax::commands::split_bxl_function;
 use buck2_repl_syntax::lexer::KEYWORDS;
 use buck2_repl_syntax::site::SiteKind;
 use buck2_repl_syntax::site::Step;
@@ -52,7 +53,8 @@ use rustyline::completion::Pair;
 /// How long to wait for the daemon to complete a name or an attribute (from memory).
 const STARLARK_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How long to wait for the daemon to complete a target pattern (which may load a package).
+/// How long to wait for the daemon to complete a target pattern (which may load a package), or
+/// a function of a `.bxl` file (which may load it).
 const TARGET_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Longest wait `BUCK2_REPL_COMPLETION_TIMEOUT_MS` may ask for.
@@ -142,7 +144,25 @@ impl Completer {
                 arg: ArgKind::Path,
                 word,
                 ..
-            } => Completion::new(start, paths(&self.cwd, word)),
+            } => Completion::new(start, paths(&self.cwd, word, &[".bzl", ".bxl"])),
+            SiteKind::CommandArg {
+                arg: ArgKind::BxlLabel,
+                word,
+                ..
+            } => match split_bxl_function(word) {
+                // `x.bxl:ma`: the functions of the file.
+                Some((module, prefix)) => self.ask(
+                    start,
+                    ReplComplete {
+                        kind: repl_complete::Kind::BxlFunction as i32,
+                        prefix: prefix.to_owned(),
+                        load_module: module.to_owned(),
+                        ..ReplComplete::default()
+                    },
+                    self.target_timeout,
+                ),
+                None => Completion::new(start, paths(&self.cwd, word, &[".bxl"])),
+            },
             SiteKind::CommandArg { word, .. } | SiteKind::TargetString { prefix: word } => self
                 .ask(
                     start,
@@ -271,11 +291,9 @@ fn candidate(replacement: &str, kind: repl_candidate::Kind, detail: &str) -> Rep
     }
 }
 
-/// The commands `:help` lists: the ones available (P1 commands are not implemented yet).
+/// The commands `:help` lists: the ones available (most P1 commands are not implemented yet).
 fn available_commands() -> impl Iterator<Item = &'static buck2_repl_syntax::commands::CommandSpec> {
-    COMMANDS
-        .iter()
-        .filter(|c| !c.hidden && c.priority == Priority::P0)
+    COMMANDS.iter().filter(|c| !c.hidden && c.is_available())
 }
 
 /// Command names and aliases, with their colon.
@@ -318,9 +336,9 @@ fn topics(word: &str) -> Vec<ReplCandidate> {
     candidates
 }
 
-/// Files that `:load` can load (`.bzl` and `.bxl`) and directories, relative to `cwd`. Labels
-/// (`//pkg:x.bzl`) are not completed.
-fn paths(cwd: &Path, word: &str) -> Vec<ReplCandidate> {
+/// Files with one of the `extensions` (those `:load` can load, the `.bxl` files of `:bxl`) and
+/// directories, relative to `cwd`. Labels (`//pkg:x.bzl`) are not completed.
+fn paths(cwd: &Path, word: &str, extensions: &[&str]) -> Vec<ReplCandidate> {
     if word.starts_with(['/', '@']) || word.contains(':') {
         return Vec::new();
     }
@@ -350,7 +368,7 @@ fn paths(cwd: &Path, word: &str) -> Vec<ReplCandidate> {
                 repl_candidate::Kind::Directory,
                 "",
             ));
-        } else if name.ends_with(".bzl") || name.ends_with(".bxl") {
+        } else if extensions.iter().any(|e| name.ends_with(e)) {
             candidates.push(candidate(
                 &format!("{dir_part}{name}"),
                 repl_candidate::Kind::File,

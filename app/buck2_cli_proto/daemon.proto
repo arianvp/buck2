@@ -940,6 +940,9 @@ message ReplComplete {
     LOAD_PATH = 5;
     LOAD_SYMBOL = 6;
     QUERY = 7;
+    // The BXL functions of the `.bxl` file `load_module` (as `:bxl` takes it)
+    // whose names start with `prefix`.
+    BXL_FUNCTION = 8;
   }
   enum QueryDialect {
     UQUERY = 0;

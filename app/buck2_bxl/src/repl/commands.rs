@@ -20,6 +20,7 @@ use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::ParsedCommand;
 use buck2_repl_syntax::commands::QueryDialect;
+use buck2_repl_syntax::commands::parse_bxl_args;
 use buck2_repl_syntax::commands::parse_load_args;
 use buck2_repl_syntax::commands::parse_run_args;
 use buck2_repl_syntax::commands::split_args;
@@ -27,6 +28,7 @@ use buck2_repl_syntax::text::starlark_string_literal;
 
 use crate::repl::build::BuildSpec;
 use crate::repl::build::RunSpec;
+use crate::repl::bxl::BxlSpec;
 use crate::repl::render::RenderMode;
 use crate::repl::render::ReplFailure;
 use crate::repl::thread::EvalKind;
@@ -39,6 +41,8 @@ pub(crate) enum CommandWork {
     Reset,
     /// `:build`, `:run`: a native build.
     Build(BuildSpec),
+    /// `:bxl`: a BXL function of a file.
+    Bxl(BxlSpec),
 }
 
 /// The work of a meta-command, or why it cannot be done.
@@ -103,6 +107,13 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
                     args: args.args,
                     print: args.print,
                 }),
+            }))
+        }
+        CommandId::Bxl => {
+            let args = parse_bxl_args(arg).map_err(|e| usage_error(command, &e))?;
+            Ok(CommandWork::Bxl(BxlSpec {
+                label: args.label,
+                args: args.args,
             }))
         }
         _ => {

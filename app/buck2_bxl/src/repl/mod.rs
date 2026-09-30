@@ -28,6 +28,7 @@ use crate::repl::driver::Driver;
 use crate::repl::output::ReplEmitter;
 
 mod build;
+mod bxl;
 mod cancel;
 mod commands;
 mod complete;

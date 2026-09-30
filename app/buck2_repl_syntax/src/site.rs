@@ -47,7 +47,7 @@ pub enum SiteKind<'a> {
     /// A meta-command name. The prefix includes the colon (`:bu`).
     Command { prefix: &'a str },
     /// A word of a meta-command's argument: a target pattern (`:build`, `:run`, `:providers`,
-    /// or a pattern in a query), a path (`:load`) or a help topic.
+    /// or a pattern in a query), a path (`:load`), a BXL function (`:bxl`) or a help topic.
     CommandArg {
         command: CommandId,
         arg: ArgKind,
@@ -172,8 +172,8 @@ fn command_arg_site(
         // Target patterns; flags are not completed.
         ArgKind::Targets => !word.starts_with('-'),
         // Only the first word: `:providers <target>`, `:load <module> [symbol...]`,
-        // `:help <topic>`.
-        ArgKind::Target | ArgKind::Topic | ArgKind::Path => {
+        // `:help <topic>`, `:bxl <file.bxl:function> [-- args...]`.
+        ArgKind::Target | ArgKind::Topic | ArgKind::Path | ArgKind::BxlLabel => {
             before.is_empty() && !word.starts_with('-')
         }
         // `[--print] <target> [-- args...]`: the target, which is the first word that is not a
@@ -745,6 +745,17 @@ mod tests {
         assert_eq!(site(":b -▮"), None);
         assert_eq!(site(":b \"//a▮"), None);
         assert_eq!(site(":run ▮"), arg_at(5, CommandId::Run, ArgKind::Run, ""));
+        assert_eq!(
+            site(":bxl pkg/x.bxl:ma▮"),
+            arg_at(5, CommandId::Bxl, ArgKind::BxlLabel, "pkg/x.bxl:ma")
+        );
+        assert_eq!(
+            site(":bxl //pkg:x▮"),
+            arg_at(5, CommandId::Bxl, ArgKind::BxlLabel, "//pkg:x")
+        );
+        assert_eq!(site(":bxl x.bxl:main --▮"), None);
+        assert_eq!(site(":bxl x.bxl:main -- --na▮"), None);
+        assert_eq!(site(":bxl x.bxl:main -- a▮"), None);
         assert_eq!(
             site(":run --print //:gr▮"),
             arg_at(13, CommandId::Run, ArgKind::Run, "//:gr")

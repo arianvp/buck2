@@ -16,7 +16,6 @@ use buck2_repl_syntax::commands::COMMANDS;
 use buck2_repl_syntax::commands::CommandId;
 use buck2_repl_syntax::commands::CommandSpec;
 use buck2_repl_syntax::commands::HELP_TOPICS;
-use buck2_repl_syntax::commands::Priority;
 use buck2_repl_syntax::commands::resolve_command;
 
 /// The text of `:help [topic]`, or an error message (without `error: `) for an unknown topic.
@@ -45,9 +44,9 @@ pub(crate) fn help(topic: &str) -> Result<String, String> {
     }
 }
 
-/// The commands `:help` shows: those available (P1 commands are not implemented yet).
+/// The commands `:help` shows: those available (most P1 commands are not implemented yet).
 fn listed(spec: &CommandSpec) -> bool {
-    !spec.hidden && spec.priority == Priority::P0
+    !spec.hidden && spec.is_available()
 }
 
 fn aliases(spec: &CommandSpec) -> String {
@@ -209,6 +208,16 @@ fn details(id: CommandId) -> &'static str {
              it. The pattern must match exactly one target, which is never skipped: if it is \
              incompatible with the target platform, that is an error."
         }
+        CommandId::Bxl => {
+            "Runs a BXL function as `buck2 bxl` does, so it may declare actions \
+             (`ctx.bxl_actions()`) and build them: `:bxl //pkg:x.bxl:main -- --name a` is \
+             `buck2 bxl //pkg:x.bxl:main -- --name a`, with the session's target platform. The \
+             file is a label or a path relative to the session's directory (`x.bxl:main`, \
+             `sub/x.bxl:main`), and the function's arguments go after `--` (`-- --help` shows \
+             them).\n\n`ctx.output.stream` output is shown as it is written, the artifacts the \
+             function ensures are materialized, then its `ctx.output.print` output is shown. \
+             `_` is not changed. An edit to the file is picked up by the next `:bxl`."
+        }
         _ => "",
     }
 }
@@ -219,8 +228,9 @@ Key bindings:
   Alt-Enter, Esc Enter  Start a new line
   Tab                   Indent (at the start of a line), otherwise complete: commands,
                         names, attributes (also after calls: `ctx.cquery().de`), target
-                        patterns (after :build, :run, ... and in strings: `\"//pkg:`) and
-                        the files of :load
+                        patterns (after :build, :run, ... and in strings: `\"//pkg:`),
+                        the files of :load and :bxl, and the functions of a file
+                        after `:bxl x.bxl:`
   Ctrl-C                Clear the input; while an input runs, interrupt it (a third
                         press ends the session)
   Ctrl-D                End the session (on an empty line)

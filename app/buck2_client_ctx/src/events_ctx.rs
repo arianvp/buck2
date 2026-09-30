@@ -210,6 +210,13 @@ impl<'a> DaemonEventsCtx<'a> {
                     events.push(event);
                 }
                 StreamValue::PartialResult(partial_res) => {
+                    // The events that came before it are handled first, so that what they print
+                    // (such as streamed BXL output) is not printed after what it prints.
+                    if !events.is_empty() {
+                        self.inner
+                            .handle_events(std::mem::take(&mut events), shutdown)
+                            .await?;
+                    }
                     let partial_res = partial_res
                         .partial_result
                         .internal_error("Empty partial result")?
