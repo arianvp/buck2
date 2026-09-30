@@ -73,6 +73,7 @@ use tower_lsp_server::UriExt as _;
 use crate::error::eval_message_to_lsp_diagnostic;
 use crate::server::LspContext;
 use crate::server::LspEvalResult;
+use crate::server::LspServerError;
 use crate::server::LspServerSettings;
 use crate::server::LspUri;
 use crate::server::StringLiteralResult;
@@ -303,6 +304,24 @@ impl LspContext for TestServerContext {
                 .collect(),
         }
     }
+}
+
+/// Starts a server with no files and no builtins, for tests that drive the connection by hand
+/// (e.g. that drop the client's end of it). Returns the client's end of the connection and the
+/// thread that runs the server, which returns what the server returned.
+pub(crate) fn start_bare_server() -> (
+    Connection,
+    std::thread::JoinHandle<Result<(), LspServerError>>,
+) {
+    let (server_connection, client_connection) = Connection::memory();
+    let ctx = TestServerContext {
+        file_contents: Arc::new(RwLock::new(HashMap::new())),
+        dirs: Arc::new(RwLock::new(HashSet::new())),
+        builtin_docs: Arc::new(HashMap::new()),
+        builtin_symbols: Arc::new(HashMap::new()),
+    };
+    let server = std::thread::spawn(move || server_with_connection(server_connection, ctx));
+    (client_connection, server)
 }
 
 /// A server for use in testing that provides helpers for sending requests, correlating
@@ -563,8 +582,11 @@ impl TestServer {
     }
 
     pub fn get_notification<T: Notification>(&mut self) -> anyhow::Result<T::Params> {
-        for _ in 0..10 {
-            self.receive()?;
+        for i in 0..11 {
+            // One that arrived while waiting for something else comes first.
+            if i > 0 || self.notifications.is_empty() {
+                self.receive()?;
+            }
             let notification = self
                 .notifications
                 .iter()
