@@ -661,6 +661,53 @@ impl StatefulSuperConsole {
         )
     }
 
+    /// A superconsole for a command that shows one only while it works, and writes to the
+    /// terminal itself in between (`buck2 repl`, one per input). Its output blocks, so that
+    /// everything it wrote is on the terminal once [`clear`](Self::clear) or
+    /// `erase_interactive_output` returns. `None` when stderr is not a terminal that can show a
+    /// superconsole, unless `forced`.
+    pub fn new_blocking(
+        trace_id: TraceId,
+        command_name: &str,
+        verbosity: Verbosity,
+        expect_spans: bool,
+        timekeeper: Timekeeper,
+        config: SuperConsoleConfig,
+        forced: bool,
+    ) -> buck2_error::Result<Option<Self>> {
+        let builder = ::superconsole::Builder::new();
+        let super_console = if forced {
+            builder.build_forced(Self::FALLBACK_SIZE)?
+        } else {
+            match builder.build()? {
+                Some(super_console) => super_console,
+                None => return Ok(None),
+            }
+        };
+        Self::new(
+            command_name,
+            trace_id,
+            super_console,
+            verbosity,
+            expect_spans,
+            timekeeper,
+            config,
+            None,
+        )
+        .map(Some)
+    }
+
+    /// Takes the canvas off the terminal, after writing out every line emitted so far, so that
+    /// the caller can write to the terminal: the next tick draws the canvas again, below what was
+    /// written. From then on the console writes with blocking I/O (see
+    /// [`new_blocking`](Self::new_blocking)).
+    pub fn clear(&mut self) -> buck2_error::Result<()> {
+        match self {
+            Self::Running(c) => c.clear(),
+            Self::Finalized(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn new(
         command_name: &str,
         trace_id: TraceId,
@@ -1507,21 +1554,42 @@ impl StatefulSuperConsoleImpl {
 
     /// Erase the canvas from the terminal instead of leaving a final frame behind,
     /// for when the display is being replaced rather than concluded.
+    ///
+    /// Every line emitted so far is written out first (a normal render writes at most a
+    /// screenful), and the output is finished when this returns (a non-blocking output's thread
+    /// is joined), so that nothing it still had to write lands after what follows.
     fn erase(
-        mut self,
+        self,
     ) -> (
         SuperConsoleState,
         Option<superconsole::Error<buck2_error::Error>>,
     ) {
-        let err = self
-            .super_console
-            .render(&superconsole::components::Blank)
+        let err = Self::finalize_blank(self.super_console);
+        (self.state, err)
+    }
+
+    /// Writes out every emitted line and removes the canvas (see [`erase`](Self::erase)), then
+    /// goes on with a new, empty canvas, which the next tick draws.
+    fn clear(&mut self) -> buck2_error::Result<()> {
+        let fresh =
+            ::superconsole::Builder::new().build_forced(StatefulSuperConsole::FALLBACK_SIZE)?;
+        let old = std::mem::replace(&mut self.super_console, fresh);
+        match Self::finalize_blank(old) {
+            None => Ok(()),
+            Some(e) => Err(e.into()),
+        }
+    }
+
+    fn finalize_blank(
+        super_console: SuperConsole,
+    ) -> Option<superconsole::Error<buck2_error::Error>> {
+        super_console
+            .finalize(&superconsole::components::Blank)
             .err()
             .map(|e| match e {
                 superconsole::Error::Draw(infallible) => match infallible {},
                 superconsole::Error::Output(e) => superconsole::Error::Output(e),
-            });
-        (self.state, err)
+            })
     }
 }
 

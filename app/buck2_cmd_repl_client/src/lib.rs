@@ -12,6 +12,8 @@
 
 #![feature(used_with_arg)]
 
+use std::io::IsTerminal;
+
 use async_trait::async_trait;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
 use buck2_client_ctx::common::BuckArgMatches;
@@ -28,8 +30,10 @@ use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
+use dupe::Dupe;
 
 mod complete;
+mod console;
 mod editor;
 mod help;
 mod inputs;
@@ -88,6 +92,59 @@ pub struct ReplCommand {
 
     #[clap(skip)]
     shutdown: session::ShutdownHangup,
+
+    #[clap(skip)]
+    console: console::ReplConsole,
+}
+
+/// How the session shows what the daemon does.
+#[derive(Clone, Copy, Debug)]
+enum ConsoleMode {
+    /// A superconsole while each input runs, nothing between inputs (see [`console`]); `forced`:
+    /// even when stderr is not a terminal.
+    Live { forced: bool },
+    /// The console of this type for the whole session, as other commands show theirs (never
+    /// `auto` or `super`).
+    Plain(ConsoleType),
+}
+
+impl ReplCommand {
+    /// Whether inputs are read from stdin (the editor, if it is a terminal) after the files and
+    /// the `-e` inputs: unless only `-e` inputs were given.
+    fn reads_stdin(&self) -> bool {
+        self.eval.is_empty() || self.interactive
+    }
+
+    /// Whether the inputs are read by the line editor.
+    fn is_interactive(&self) -> bool {
+        self.reads_stdin() && std::io::stdin().is_terminal()
+    }
+
+    fn console_mode(&self) -> ConsoleMode {
+        if self.json {
+            return ConsoleMode::Plain(ConsoleType::None);
+        }
+        match self.common_opts.console_opts.console_type {
+            // Live progress only for the line editor with stdout and stderr on a terminal, where
+            // the canvas can be erased before each result; scripts keep the simple console's
+            // line by line output.
+            ConsoleType::Auto => {
+                if self.is_interactive()
+                    && std::io::stderr().is_terminal()
+                    && std::io::stdout().is_terminal()
+                {
+                    ConsoleMode::Live { forced: false }
+                } else {
+                    ConsoleMode::Plain(ConsoleType::Simple)
+                }
+            }
+            ConsoleType::Super => ConsoleMode::Live { forced: true },
+            console_type @ (ConsoleType::None
+            | ConsoleType::Simple
+            | ConsoleType::SimpleNoTty
+            | ConsoleType::SimpleTty) => ConsoleMode::Plain(console_type),
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -108,23 +165,42 @@ impl StreamingCommand for ReplCommand {
             ));
         }
         let context = ctx.client_context(matches, &self)?;
-        session::run(self, context, buckd, events_ctx).await
+        let trace_id = ctx.trace_id.dupe();
+        session::run(self, context, trace_id, ctx.verbosity, buckd, events_ctx).await
     }
 
     fn console_opts(&self) -> &CommonConsoleOptions {
-        // The REPL owns the terminal: a superconsole would redraw over the prompt, and an
-        // interactive console would read stdin.
-        static SIMPLE: CommonConsoleOptions = CommonConsoleOptions {
-            console_type: ConsoleType::Simple,
-            ui: vec![],
-            no_interactive_console: true,
-        };
+        // The REPL owns the terminal: the session's own console must not redraw (the live
+        // progress of inputs is the `console` subscriber's, which draws only while an input
+        // runs), and an interactive console would read stdin.
         static NONE: CommonConsoleOptions = CommonConsoleOptions {
             console_type: ConsoleType::None,
             ui: vec![],
             no_interactive_console: true,
         };
-        if self.json { &NONE } else { &SIMPLE }
+        static SIMPLE: CommonConsoleOptions = CommonConsoleOptions {
+            console_type: ConsoleType::Simple,
+            ui: vec![],
+            no_interactive_console: true,
+        };
+        static SIMPLE_TTY: CommonConsoleOptions = CommonConsoleOptions {
+            console_type: ConsoleType::SimpleTty,
+            ui: vec![],
+            no_interactive_console: true,
+        };
+        static SIMPLE_NO_TTY: CommonConsoleOptions = CommonConsoleOptions {
+            console_type: ConsoleType::SimpleNoTty,
+            ui: vec![],
+            no_interactive_console: true,
+        };
+        match self.console_mode() {
+            ConsoleMode::Live { .. } | ConsoleMode::Plain(ConsoleType::None) => &NONE,
+            ConsoleMode::Plain(ConsoleType::SimpleTty) => &SIMPLE_TTY,
+            ConsoleMode::Plain(ConsoleType::SimpleNoTty) => &SIMPLE_NO_TTY,
+            ConsoleMode::Plain(ConsoleType::Simple | ConsoleType::Auto | ConsoleType::Super) => {
+                &SIMPLE
+            }
+        }
     }
 
     fn event_log_opts(&self) -> &CommonEventLogOptions {
@@ -140,7 +216,11 @@ impl StreamingCommand for ReplCommand {
     }
 
     fn extra_subscribers(&self) -> Vec<Box<dyn EventSubscriber>> {
-        vec![self.shutdown.subscriber()]
+        let mut subscribers = vec![self.shutdown.subscriber()];
+        if let ConsoleMode::Live { .. } = self.console_mode() {
+            subscribers.push(self.console.subscriber());
+        }
+        subscribers
     }
 
     fn handles_sigint(&self) -> bool {

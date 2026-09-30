@@ -15,10 +15,11 @@
 //! The input thread sends requests through `req_tx` (the request stream of the call) and
 //! waits for their results on `ui_rx`, which [`ReplHandler`] feeds from the call's partial
 //! results. Output (`ReplOutput`) is written by the handler as it arrives, so it is always
-//! printed before the `ReplDone` of its request is rendered.
+//! printed before the `ReplDone` of its request is rendered. The handler writes it through the
+//! [`ReplConsole`], which also shows the live progress of inputs (and erases it before the input
+//! thread prints anything of an input).
 
 use std::io::IsTerminal;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -36,28 +37,30 @@ use buck2_cli_proto::ReplInterrupt;
 use buck2_cli_proto::ReplMessage;
 use buck2_cli_proto::ReplNotice;
 use buck2_cli_proto::ReplOpen;
-use buck2_cli_proto::ReplOutput;
 use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
 use buck2_cli_proto::repl_message;
-use buck2_cli_proto::repl_output;
 use buck2_cli_proto::repl_request;
 use buck2_client_ctx::command_outcome::CommandOutcome;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::events_ctx::PartialResultCtx;
 use buck2_client_ctx::events_ctx::PartialResultHandler;
-use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 use buck2_error::ExitCode;
+use buck2_event_observer::verbosity::Verbosity;
 use buck2_events::BuckEvent;
 use buck2_util::threads::thread_spawn;
+use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::ConsoleMode;
 use crate::ReplCommand;
 use crate::complete::Completer;
+use crate::console::ReplConsole;
+use crate::console::Setup;
 use crate::editor::EditorMode;
 use crate::editor::history_path;
 use crate::inputs::FirstInputs;
@@ -210,6 +213,14 @@ impl SharedUi {
         self.lock().state = state;
     }
 
+    /// The id of the request that runs, if any.
+    pub(crate) fn busy(&self) -> Option<u64> {
+        match self.lock().state {
+            UiState::Busy { id, .. } => Some(id),
+            UiState::Idle | UiState::Editor | UiState::Child => None,
+        }
+    }
+
     /// The line editor starts reading a line, unless the session is over. Returns whether it
     /// is not (so that the editor may read).
     pub(crate) fn start_reading(&self) -> bool {
@@ -288,6 +299,9 @@ impl InputOutcome {
 struct ReplHandler {
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     compl_tx: std::sync::mpsc::Sender<(u64, ReplCompletions)>,
+    /// Writes the output, and erases the live progress of an input before the input thread
+    /// prints something of it.
+    console: ReplConsole,
 }
 
 #[async_trait]
@@ -302,14 +316,18 @@ impl PartialResultHandler for ReplHandler {
         let id = message.id;
         // Send errors mean the input thread is gone, which the call's result reports.
         match message.message {
-            Some(repl_message::Message::Output(output)) => write_output(&output)?,
+            Some(repl_message::Message::Output(output)) => {
+                self.console.write_output(&output).await?
+            }
             Some(repl_message::Message::Ready(ready)) => {
                 let _ignored = self.ui_tx.send(UiEvent::Ready(ready));
             }
             Some(repl_message::Message::Done(done)) => {
+                self.console.before_done(id).await?;
                 let _ignored = self.ui_tx.send(UiEvent::Done(id, done));
             }
             Some(repl_message::Message::Notice(notice)) => {
+                self.console.before_notice().await?;
                 let _ignored = self.ui_tx.send(UiEvent::Notice(notice));
             }
             Some(repl_message::Message::Completions(completions)) => {
@@ -321,28 +339,13 @@ impl PartialResultHandler for ReplHandler {
     }
 }
 
-fn write_output(output: &ReplOutput) -> buck2_error::Result<()> {
-    match output.channel() {
-        repl_output::Channel::Stdout => {
-            buck2_client_ctx::stdio::print_bytes(&output.data)?;
-            buck2_client_ctx::stdio::flush()
-        }
-        repl_output::Channel::Stderr => {
-            let mut stderr = std::io::stderr().lock();
-            stderr
-                .write_all(&output.data)
-                .and_then(|()| stderr.flush())
-                .map_err(|e| ClientIoError::from(e).into())
-        }
-    }
-}
-
 /// Handles SIGINT (Ctrl-C) while the session runs, according to the [`UiState`]. Returns when
 /// the client should give up on the session and exit.
 async fn sigint_loop(
     ui: SharedUi,
     req_tx: tokio::sync::mpsc::WeakUnboundedSender<ReplRequest>,
     next_id: Arc<AtomicU64>,
+    console: ReplConsole,
 ) {
     // The terminal echoes `^C` itself: write over it.
     let prefix = if std::io::stderr().is_terminal() {
@@ -379,14 +382,15 @@ async fn sigint_loop(
         // Output errors do not matter here: the input thread reports them.
         match presses {
             1 => {
-                let _ignored = buck2_client_ctx::eprintln!("{}^C interrupting…", prefix);
+                let _ignored = console.message(&format!("{prefix}^C interrupting…")).await;
             }
             2 => {
-                let _ignored = buck2_client_ctx::eprintln!(
-                    "{}^C still cancelling — the daemon may be waiting for another buck2 \
-                     command; ^C again to quit",
-                    prefix
-                );
+                let _ignored = console
+                    .message(&format!(
+                        "{prefix}^C still cancelling — the daemon may be waiting for another \
+                         buck2 command; ^C again to quit"
+                    ))
+                    .await;
             }
             _ => return,
         }
@@ -396,13 +400,13 @@ async fn sigint_loop(
 pub(crate) async fn run(
     cmd: ReplCommand,
     context: ClientContext,
+    trace_id: TraceId,
+    verbosity: Verbosity,
     buckd: &mut BuckdClientConnector,
     events_ctx: &mut EventsCtx,
 ) -> ExitResult {
-    // After the files and the `-e` inputs, the inputs come from stdin (the editor, if it is a
-    // terminal), unless only `-e` inputs were given.
-    let read_stdin = cmd.eval.is_empty() || cmd.interactive;
-    let interactive = read_stdin && std::io::stdin().is_terminal();
+    let read_stdin = cmd.reads_stdin();
+    let interactive = cmd.is_interactive();
     let history = if interactive {
         match history_path(cmd.no_history) {
             Ok(history) => history,
@@ -434,6 +438,18 @@ pub(crate) async fn run(
     };
     let ui = SharedUi::new();
     cmd.shutdown.arm(&req_tx, next_id.dupe());
+    let console = cmd.console.dupe();
+    if let ConsoleMode::Live { forced } = cmd.console_mode() {
+        console
+            .start(Setup {
+                trace_id,
+                verbosity,
+                config: cmd.common_opts.console_opts.superconsole_config(),
+                forced,
+                ui: ui.dupe(),
+            })
+            .await;
+    }
 
     let open = ReplRequest {
         id: OPEN_ID,
@@ -448,7 +464,12 @@ pub(crate) async fn run(
     let _ignored = req_tx.send(open);
 
     let shutdown = cmd.shutdown.dupe();
-    let sigint = sigint_loop(ui.dupe(), req_tx.downgrade(), next_id.dupe());
+    let sigint = sigint_loop(
+        ui.dupe(),
+        req_tx.downgrade(),
+        next_id.dupe(),
+        console.dupe(),
+    );
     let io = SessionIo {
         req_tx,
         ui_rx,
@@ -487,7 +508,11 @@ pub(crate) async fn run(
         Err(e) => return ExitResult::err(e.into()),
     };
 
-    let mut handler = ReplHandler { ui_tx, compl_tx };
+    let mut handler = ReplHandler {
+        ui_tx,
+        compl_tx,
+        console: console.dupe(),
+    };
     let result = {
         let mut client = buckd.with_flushing();
         let call = client.repl(
@@ -504,6 +529,9 @@ pub(crate) async fn run(
             () = sigint => None,
         }
     };
+    // Nothing is drawn after the call: the terminal is the input thread's (and the messages
+    // below are printed after the progress of an input that was cut off).
+    let _ignored = console.end().await;
     let reading = ui.end_session();
     // Wakes the input thread if it is waiting for a result.
     let _ignored = handler.ui_tx.send(UiEvent::SessionEnded);
