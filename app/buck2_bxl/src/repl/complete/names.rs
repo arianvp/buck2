@@ -199,11 +199,12 @@ fn attributes<'v>(
             let type_name = v.get_type();
             // Sorted: the first candidates are the ones kept.
             for name in v.dir_attr() {
-                if candidates.is_full() {
-                    break;
-                }
                 if !matches(prefix, &name) {
                     continue;
+                }
+                if candidates.is_full() {
+                    candidates.mark_truncated();
+                    break;
                 }
                 match types.and_then(|t| t.member(type_name, &name)) {
                     Some(DocMember::Function(_)) => {

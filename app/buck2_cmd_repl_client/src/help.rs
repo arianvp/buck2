@@ -217,7 +217,10 @@ const KEYS: &str = "\
 Key bindings:
   Enter                 Submit the input if it is complete, otherwise start a new line
   Alt-Enter, Esc Enter  Start a new line
-  Tab                   Indent (at the start of a line), otherwise complete
+  Tab                   Indent (at the start of a line), otherwise complete: commands,
+                        names, attributes (also after calls: `ctx.cquery().de`), target
+                        patterns (after :build, :run, ... and in strings: `\"//pkg:`) and
+                        the files of :load
   Ctrl-C                Clear the input; while an input runs, interrupt it (a third
                         press ends the session)
   Ctrl-D                End the session (on an empty line)

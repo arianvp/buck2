@@ -96,11 +96,15 @@ pub(crate) fn history_path(no_history: bool) -> buck2_error::Result<Option<PathB
     })
 }
 
-/// Enter submits the buffer only when it is complete.
-struct ReplValidator;
+/// Enter submits the buffer only when it is complete, or when the session is over (so that
+/// Enter ends the line, as the message about the end of the session says).
+struct ReplValidator(SharedUi);
 
 impl rustyline::validate::Validator for ReplValidator {
     fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        if self.0.session_ended() {
+            return Ok(ValidationResult::Valid(None));
+        }
         Ok(match completeness(ctx.input()) {
             Completeness::Complete => ValidationResult::Valid(None),
             Completeness::Incomplete(_) => ValidationResult::Incomplete,
@@ -266,6 +270,11 @@ impl Session {
             }
             let line = editor.readline(&prompt);
             self.ui.stop_reading();
+            if self.ui.session_ended() {
+                // The line was ended to exit; the caller reports why.
+                self.outcome.lost = true;
+                return;
+            }
             let line = match line {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => {
@@ -313,7 +322,7 @@ impl Session {
         editor.set_helper(Some(ReplHelper {
             completer: ReplCompleter(self.completer.dupe()),
             hinter: HistoryHinter::new(),
-            validator: ReplValidator,
+            validator: ReplValidator(self.ui.dupe()),
             brackets: MatchingBracketHighlighter::new(),
         }));
         // Alt-Enter (or Esc then Enter) adds a line even to a complete input.

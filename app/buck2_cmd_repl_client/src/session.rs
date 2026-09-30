@@ -224,6 +224,11 @@ impl SharedUi {
         self.lock().reading = false;
     }
 
+    /// The daemon call is over.
+    pub(crate) fn session_ended(&self) -> bool {
+        self.lock().session_ended
+    }
+
     /// Marks the session as over. Returns whether the line editor is reading, in which case it
     /// only notices after its current line.
     fn end_session(&self) -> bool {

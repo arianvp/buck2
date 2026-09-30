@@ -48,6 +48,11 @@ impl Candidates {
         self.by_replacement.len() >= MAX_CANDIDATES
     }
 
+    /// Records that some candidates were left out.
+    pub(crate) fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
     /// Adds a candidate. The first one added with a replacement wins. `detail` is shown next to
     /// the candidate (e.g. its type).
     pub(crate) fn add(&mut self, replacement: String, kind: repl_candidate::Kind, detail: &str) {

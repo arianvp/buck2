@@ -84,6 +84,7 @@ pub(crate) async fn complete_targets(
         names.sort_unstable();
         for name in names {
             if candidates.is_full() {
+                candidates.mark_truncated();
                 break;
             }
             candidates.add(
