@@ -11,9 +11,11 @@
 //! Server side of `buck2 repl`.
 //!
 //! This is the protocol stub: it answers `Open` with `Ready`, echoes every `Eval` input back as a
-//! string value and answers every `Complete` with no candidates. The session proper replaces it.
+//! string value (cut to 64 KiB) and answers every `Complete` with no candidates. The session
+//! proper replaces it.
 
 use buck2_cli_proto::ReplDone;
+use buck2_cli_proto::ReplError;
 use buck2_cli_proto::ReplMessage;
 use buck2_cli_proto::ReplReady;
 use buck2_cli_proto::ReplRequest;
@@ -21,14 +23,19 @@ use buck2_cli_proto::ReplResponse;
 use buck2_cli_proto::ReplValue;
 use buck2_cli_proto::repl_completions;
 use buck2_cli_proto::repl_done;
+use buck2_cli_proto::repl_error;
 use buck2_cli_proto::repl_message;
 use buck2_cli_proto::repl_request;
 use buck2_events::dispatch::span_async;
+use buck2_repl_syntax::text::truncate_to_bytes;
 use buck2_server_ctx::commands::command_end;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use futures::StreamExt;
+
+/// Most text in a `ReplValue`.
+const MAX_VALUE_BYTES: usize = 64 << 10;
 
 pub(crate) async fn repl_command(
     sctx: &dyn ServerCommandContextTrait,
@@ -59,15 +66,18 @@ async fn stub_loop(
                 target_platform: String::new(),
                 prelude_loaded: false,
             }),
-            Some(repl_request::Request::Eval(eval)) => repl_message::Message::Done(ReplDone {
-                outcome: Some(repl_done::Outcome::Value(ReplValue {
-                    r#type: "str".to_owned(),
-                    text: eval.input,
-                    truncated: false,
-                    json: None,
-                })),
-                ..ReplDone::default()
-            }),
+            Some(repl_request::Request::Eval(eval)) => {
+                let text = truncate_to_bytes(&eval.input, MAX_VALUE_BYTES);
+                repl_message::Message::Done(ReplDone {
+                    outcome: Some(repl_done::Outcome::Value(ReplValue {
+                        r#type: "str".to_owned(),
+                        text: text.to_owned(),
+                        truncated: text.len() < eval.input.len(),
+                        json: None,
+                    })),
+                    ..ReplDone::default()
+                })
+            }
             Some(repl_request::Request::Complete(_)) => {
                 repl_message::Message::Completions(buck2_cli_proto::ReplCompletions {
                     status: repl_completions::Status::Ok as i32,
@@ -78,7 +88,13 @@ async fn stub_loop(
             // Nothing is ever in flight, so there is nothing to interrupt.
             Some(repl_request::Request::Interrupt(_)) => continue,
             Some(repl_request::Request::Hangup(_)) => break,
-            None => continue,
+            None => repl_message::Message::Done(ReplDone {
+                outcome: Some(repl_done::Outcome::Error(ReplError {
+                    kind: repl_error::Kind::Internal as i32,
+                    message: "error: malformed repl request (no request)".to_owned(),
+                })),
+                ..ReplDone::default()
+            }),
         };
         prd.emit(ReplMessage {
             id,

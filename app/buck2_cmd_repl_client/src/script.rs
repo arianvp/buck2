@@ -48,11 +48,16 @@ pub(crate) struct ScriptOutcome {
     interrupted: bool,
     /// The session ended before the inputs did.
     lost: bool,
+    /// Output could not be written (e.g. stdout is a closed pipe), which stopped the script.
+    output_error: Option<buck2_error::Error>,
 }
 
 impl ScriptOutcome {
-    pub(crate) fn exit_result(&self) -> ExitResult {
-        if self.lost {
+    pub(crate) fn exit_result(self) -> ExitResult {
+        if let Some(e) = self.output_error {
+            // A closed pipe exits like other commands do (quietly, with its own exit code).
+            ExitResult::err(e)
+        } else if self.lost {
             ExitResult::err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Tier0,
                 "the repl session ended before all inputs were evaluated"
@@ -141,7 +146,9 @@ impl Session {
                     let line = match line {
                         Ok(line) => line,
                         Err(e) => {
-                            render::print_error(&format!("error: cannot read stdin: {e}"));
+                            let printed =
+                                render::print_error(&format!("error: cannot read stdin: {e}"));
+                            self.output(printed);
                             self.outcome.failed = true;
                             return;
                         }
@@ -164,10 +171,15 @@ impl Session {
         loop {
             match self.ui_rx.recv() {
                 Ok(UiEvent::Ready) => return true,
-                Ok(UiEvent::Notice(notice)) => render::print_notice(&notice),
+                Ok(UiEvent::Notice(notice)) => {
+                    if !self.output(render::print_notice(&notice)) {
+                        return false;
+                    }
+                }
                 Ok(UiEvent::Done(id, done)) if id == OPEN_ID => {
                     // The daemon could not start the session.
-                    let _ignored = render::render_done(&done);
+                    let rendered = render::render_done(&done).map(|_| ());
+                    self.output(rendered);
                     self.outcome.failed = true;
                     return false;
                 }
@@ -186,7 +198,9 @@ impl Session {
             Ok(Some(command)) if command.spec.id == CommandId::Quit => return Next::Stop,
             Ok(_) => {}
             Err(e) => {
-                render::print_error(&format!("error: {e}"));
+                if !self.output(render::print_error(&format!("error: {e}"))) {
+                    return Next::Stop;
+                }
                 return self.failed();
             }
         }
@@ -208,14 +222,37 @@ impl Session {
             self.outcome.lost = true;
             return Next::Stop;
         };
+        if self.outcome.output_error.is_some() {
+            // A notice could not be printed.
+            return Next::Stop;
+        }
         let rendered = render::render_done(&done);
-        render::flush();
+        let rendered = match rendered.and_then(|r| render::flush().map(|()| r)) {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                self.output(Err(e));
+                return Next::Stop;
+            }
+        };
         match rendered {
             Rendered::Ok => Next::Continue,
             Rendered::Failed => self.failed(),
             Rendered::Interrupted => {
                 self.outcome.interrupted = true;
                 Next::Stop
+            }
+        }
+    }
+
+    /// Records the first output error. Returns whether the output was written.
+    fn output(&mut self, result: buck2_error::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                if self.outcome.output_error.is_none() {
+                    self.outcome.output_error = Some(e);
+                }
+                false
             }
         }
     }
@@ -229,13 +266,16 @@ impl Session {
         }
     }
 
-    /// Waits for the result of request `id`, printing notices meanwhile. `None` if the session
-    /// ended first.
+    /// Waits for the result of request `id`, printing notices meanwhile (an output error is
+    /// recorded). `None` if the session ended first.
     fn wait_for_done(&mut self, id: u64) -> Option<ReplDone> {
         loop {
             match self.ui_rx.recv() {
                 Ok(UiEvent::Done(done_id, done)) if done_id == id => return Some(done),
-                Ok(UiEvent::Notice(notice)) => render::print_notice(&notice),
+                Ok(UiEvent::Notice(notice)) => {
+                    let printed = render::print_notice(&notice);
+                    self.output(printed);
+                }
                 Ok(UiEvent::Done(..) | UiEvent::Ready) => {}
                 Ok(UiEvent::SessionEnded) | Err(_) => return None,
             }

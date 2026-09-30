@@ -26,21 +26,21 @@ pub(crate) enum Rendered {
 
 /// Prints the result of an input.
 ///
-/// Output errors (e.g. a closed pipe) are ignored here: the next write to stdout by the
-/// client's own machinery reports them.
-pub(crate) fn render_done(done: &ReplDone) -> Rendered {
-    match &done.outcome {
+/// Fails if the output cannot be written (e.g. stdout is a closed pipe): the caller stops, since
+/// nobody sees the results of later inputs.
+pub(crate) fn render_done(done: &ReplDone) -> buck2_error::Result<Rendered> {
+    Ok(match &done.outcome {
         None => Rendered::Ok,
         Some(repl_done::Outcome::Value(value)) => {
-            print_value(value);
+            print_value(value)?;
             Rendered::Ok
         }
         Some(repl_done::Outcome::Error(error)) => {
             if error.kind() == repl_error::Kind::Interrupted {
-                print_error("interrupted");
+                print_error("interrupted")?;
                 Rendered::Interrupted
             } else {
-                print_error(&error.message);
+                print_error(&error.message)?;
                 Rendered::Failed
             }
         }
@@ -48,33 +48,33 @@ pub(crate) fn render_done(done: &ReplDone) -> Rendered {
             // Running the program is not implemented yet: print its command line.
             let argv = run.argv.iter().map(String::as_str);
             let command = shlex::try_join(argv).unwrap_or_else(|_| run.argv.join(" "));
-            let _ignored = buck2_client_ctx::println!("{}", command);
+            buck2_client_ctx::println!("{}", command)?;
             Rendered::Ok
         }
-    }
+    })
 }
 
-fn print_value(value: &ReplValue) {
-    let _ignored = buck2_client_ctx::println!("{}", value.text.trim_end_matches('\n'));
+fn print_value(value: &ReplValue) -> buck2_error::Result<()> {
+    buck2_client_ctx::println!("{}", value.text.trim_end_matches('\n'))?;
     if value.truncated {
-        let _ignored =
-            buck2_client_ctx::println!("... (value truncated; `:print _` shows all of it)");
+        buck2_client_ctx::println!("... (value truncated; `:print _` shows all of it)")?;
     }
+    Ok(())
 }
 
 /// Prints `message` on stderr, on its own line.
-pub(crate) fn print_error(message: &str) {
-    let _ignored = buck2_client_ctx::eprintln!("{}", message.trim_end_matches('\n'));
+pub(crate) fn print_error(message: &str) -> buck2_error::Result<()> {
+    buck2_client_ctx::eprintln!("{}", message.trim_end_matches('\n'))
 }
 
-pub(crate) fn print_notice(notice: &ReplNotice) {
+pub(crate) fn print_notice(notice: &ReplNotice) -> buck2_error::Result<()> {
     let prefix = match notice.level() {
         repl_notice::Level::Info => "note",
         repl_notice::Level::Warning => "warning",
     };
-    let _ignored = buck2_client_ctx::eprintln!("{}: {}", prefix, notice.text);
+    buck2_client_ctx::eprintln!("{}: {}", prefix, notice.text)
 }
 
-pub(crate) fn flush() {
-    let _ignored = buck2_client_ctx::stdio::flush();
+pub(crate) fn flush() -> buck2_error::Result<()> {
+    buck2_client_ctx::stdio::flush()
 }

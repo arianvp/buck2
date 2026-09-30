@@ -24,4 +24,5 @@ pub mod chunker;
 pub mod commands;
 pub mod completeness;
 pub mod lexer;
+mod nesting;
 pub mod text;

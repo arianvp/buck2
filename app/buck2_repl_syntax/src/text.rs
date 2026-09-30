@@ -26,6 +26,15 @@ pub const MAX_BRACKET_DEPTH: usize = 64;
 /// reason.
 pub const MAX_UNARY_RUN: usize = 64;
 
+/// Deepest syntax tree the daemon accepts for a statement, as bounded by the nesting of its
+/// operators, attribute accesses, calls, conditionals, lambdas, brackets and blocks (see
+/// [`precheck`]): the parser, the compiler and the code that drops the tree recurse on its
+/// depth, and a thread that overflows its stack aborts the daemon.
+///
+/// A debug build on a 4 MiB stack overflows at about 1600 levels of `+`, 800 nested blocks or
+/// 550 nested lambdas; this limit leaves room for the frames below the parser.
+pub const MAX_NESTING: usize = 200;
+
 /// Removes the leading whitespace common to all non-blank lines, so that indented code (e.g.
 /// pasted from a function body) can be evaluated.
 ///
@@ -86,10 +95,19 @@ fn lines_starting_in_string(code: &str) -> Vec<bool> {
 /// Why the daemon refuses to evaluate an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrecheckError {
-    TooLarge { size: usize },
-    Tab { line: usize, column: usize },
+    TooLarge {
+        size: usize,
+    },
+    Tab {
+        line: usize,
+        column: usize,
+    },
     TooDeep,
     UnaryRun,
+    /// The statement starting on this line (1-based) may nest deeper than [`MAX_NESTING`].
+    TooComplex {
+        line: usize,
+    },
 }
 
 impl fmt::Display for PrecheckError {
@@ -111,6 +129,12 @@ impl fmt::Display for PrecheckError {
                 f,
                 "too many unary operators in a row (the limit is {MAX_UNARY_RUN})"
             ),
+            PrecheckError::TooComplex { line } => write!(
+                f,
+                "the statement on line {line} is nested too deeply to evaluate safely (a long \
+                 chain of operators, attribute accesses, calls, conditionals or lambdas, or \
+                 deeply nested blocks); split it into smaller statements"
+            ),
         }
     }
 }
@@ -118,8 +142,15 @@ impl fmt::Display for PrecheckError {
 impl std::error::Error for PrecheckError {}
 
 /// Checks that `code` is safe to hand to the parser: at most [`MAX_INPUT_BYTES`], no tabs,
-/// brackets nested at most [`MAX_BRACKET_DEPTH`] deep and at most [`MAX_UNARY_RUN`] unary
-/// operators in a row.
+/// brackets nested at most [`MAX_BRACKET_DEPTH`] deep, at most [`MAX_UNARY_RUN`] unary
+/// operators in a row, and no statement whose syntax tree may be deeper than [`MAX_NESTING`].
+///
+/// The depth is bounded from the tokens, without parsing: every operator, attribute access,
+/// call, subscript, conditional and lambda of an element (the text between commas) counts, and
+/// so do the brackets, f-strings, blocks and `elif`s it is nested in. Long flat literals and
+/// argument lists are fine; long chains and deep nesting are not.
+///
+/// Run it on exactly the text given to the parser (after [`dedent`]).
 pub fn precheck(code: &str) -> Result<(), PrecheckError> {
     if code.len() > MAX_INPUT_BYTES {
         return Err(PrecheckError::TooLarge { size: code.len() });
@@ -131,36 +162,7 @@ pub fn precheck(code: &str) -> Result<(), PrecheckError> {
         let column = before.get(line_start..).map_or(0, |s| s.chars().count()) + 1;
         return Err(PrecheckError::Tab { line, column });
     }
-    let mut depth = 0usize;
-    let mut unary_run = 0usize;
-    for t in lex(code) {
-        match t.kind {
-            TokenKind::Open(_) => {
-                depth += 1;
-                if depth > MAX_BRACKET_DEPTH {
-                    return Err(PrecheckError::TooDeep);
-                }
-            }
-            TokenKind::Close(_) => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        let unary = match t.kind {
-            TokenKind::Op => matches!(t.text(code), "-" | "+" | "~"),
-            TokenKind::Keyword => t.text(code) == "not",
-            // These do not break a run.
-            TokenKind::Newline | TokenKind::Comment | TokenKind::Continuation => continue,
-            _ => false,
-        };
-        if unary {
-            unary_run += 1;
-            if unary_run > MAX_UNARY_RUN {
-                return Err(PrecheckError::UnaryRun);
-            }
-        } else {
-            unary_run = 0;
-        }
-    }
-    Ok(())
+    crate::nesting::check(code)
 }
 
 /// A double-quoted Starlark string literal whose value is `s`.
@@ -311,7 +313,7 @@ mod tests {
         let unary = format!("x = {}1", "-".repeat(64));
         assert_eq!(precheck(&unary), Ok(()));
         // Binary operators between operands do not make a run.
-        let binary = format!("x = 1{}", " - 1".repeat(200));
+        let binary = format!("x = 1{}", " - 1".repeat(150));
         assert_eq!(precheck(&binary), Ok(()));
     }
 
@@ -349,6 +351,78 @@ mod tests {
         assert_eq!(precheck(&unary), Err(PrecheckError::UnaryRun));
         let mixed = format!("x = {}1", "not - + ~ ".repeat(17));
         assert_eq!(precheck(&mixed), Err(PrecheckError::UnaryRun));
+    }
+
+    #[test]
+    fn test_precheck_nesting() {
+        // Short inputs that overflow a 4 MiB stack in the parser or compiler.
+        let deep = [
+            format!("x = {}", vec!["1"; 2000].join("+")),
+            format!("x = Y{}", "[0]".repeat(3000)),
+            format!("x = Z{}", "()".repeat(3000)),
+            format!("x = Y{}", ".a".repeat(3000)),
+            format!("x = {}", vec!["True"; 3000].join(" and ")),
+            format!("x = {}1", "1 if False else ".repeat(3000)),
+            format!("x = {}1", "lambda: ".repeat(600)),
+            format!(
+                "def f(v):\n    if v:\n        pass\n{}",
+                "    elif v:\n        pass\n".repeat(1000)
+            ),
+            (0..800).fold(String::new(), |code, i| {
+                format!("{code}{}def f():\n", " ".repeat(i))
+            }) + &" ".repeat(800)
+                + "pass",
+        ];
+        for code in &deep {
+            assert!(
+                matches!(precheck(code), Err(PrecheckError::TooComplex { .. })),
+                "{}...",
+                truncate_to_bytes(code, 40)
+            );
+        }
+        assert!(
+            PrecheckError::TooComplex { line: 3 }
+                .to_string()
+                .starts_with("the statement on line 3 is nested too deeply")
+        );
+        // Ordinary code is fine.
+        let code = "\
+def f(ctx, targets = [], *, deps = False):
+    '''Doc.'''
+    result = {}
+    for t in ctx.cquery().eval(\"deps(%s)\" % \" + \".join(targets)):
+        if deps and t.label.name.startswith(\"lib\") or not t.label.package:
+            result[str(t.label)] = [str(d) for d in (t.attrs_eager().deps or [])]
+        elif t.rule_type == \"genrule\":
+            result.setdefault(\"g\", []).append(lambda x, y = 1: x.y if y else x.z(y)[0])
+        else:
+            pass
+    return result, f\"{len(result)} {'results'} for {targets}\"
+";
+        assert_eq!(precheck(code), Ok(()));
+    }
+
+    #[test]
+    fn test_precheck_big_inputs() {
+        // Inputs of about the maximum size, of various shapes, are checked quickly and
+        // without panicking.
+        let n = MAX_INPUT_BYTES / 16;
+        let inputs = [
+            "x".repeat(MAX_INPUT_BYTES),
+            "x = 1\n".repeat(MAX_INPUT_BYTES / 6),
+            format!("x = [{}]", "f'{a}{b}', ".repeat(n)),
+            format!("x = ({})", "'a', ".repeat(MAX_INPUT_BYTES / 6)),
+            "(".repeat(MAX_INPUT_BYTES),
+            "f'{".repeat(MAX_INPUT_BYTES / 3),
+            "f'".repeat(MAX_INPUT_BYTES / 2),
+            "a.".repeat(MAX_INPUT_BYTES / 2),
+            "if x:\n elif y:\n".repeat(n),
+            "\\\n".repeat(MAX_INPUT_BYTES / 2),
+            "#\n".repeat(MAX_INPUT_BYTES / 2),
+        ];
+        for code in &inputs {
+            let _ignored = precheck(code);
+        }
     }
 
     #[test]
@@ -406,9 +480,10 @@ mod tests {
     #[test]
     fn test_capped_string() {
         let mut s = CappedString::new(5);
-        write!(s, "{}", "abc").unwrap();
+        write!(s, "abc").unwrap();
         assert!(!s.truncated());
-        write!(s, "{}{}", "de", "fgh").unwrap();
+        let (de, fgh) = ("de", "fgh");
+        write!(s, "{de}{fgh}").unwrap();
         assert_eq!(s.as_str(), "abcde");
         assert!(s.truncated());
         write!(s, "more").unwrap();

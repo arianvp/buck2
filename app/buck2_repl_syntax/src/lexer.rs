@@ -100,7 +100,8 @@ impl Quote {
         self.delimiter().len()
     }
 
-    fn quote_byte(self) -> u8 {
+    /// The quote character.
+    pub fn quote_byte(self) -> u8 {
         match self {
             Quote::Single | Quote::TripleSingle => b'\'',
             Quote::Double | Quote::TripleDouble => b'"',
@@ -274,6 +275,25 @@ pub fn lex_from(src: &str, state: LexState) -> (Vec<Token>, LexState) {
     )
 }
 
+/// The first token that starts at or after byte `pos` of `src`, lexed as if `pos` were not
+/// inside a string literal. `None` if there is none.
+///
+/// This lets a caller lex a text piece by piece, e.g. to resume after a construct it scans
+/// itself. `pos` should be on a character boundary.
+pub fn next_token(src: &str, pos: usize) -> Option<Token> {
+    let mut lexer = Lexer {
+        src,
+        bytes: src.as_bytes(),
+        pos,
+        tokens: Vec::new(),
+        open_string: None,
+    };
+    while lexer.tokens.is_empty() && lexer.pos < lexer.bytes.len() {
+        lexer.step();
+    }
+    lexer.tokens.pop()
+}
+
 struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],
@@ -312,8 +332,16 @@ impl Lexer<'_> {
     }
 
     fn run(&mut self) {
-        while let Some(b) = self.byte(self.pos) {
-            let start = self.pos;
+        while self.pos < self.bytes.len() {
+            self.step();
+        }
+    }
+
+    /// Lexes from `self.pos`: skips one whitespace character or pushes one token. Either way
+    /// `self.pos` moves forward, unless it is at the end.
+    fn step(&mut self) {
+        let start = self.pos;
+        if let Some(b) = self.byte(start) {
             match b {
                 b' ' | b'\t' | b'\r' | b'\x0c' => self.pos += 1,
                 b'\n' => self.push(TokenKind::Newline, start, start + 1),
@@ -806,6 +834,34 @@ mod tests {
                     assert!(s.get(r).is_some(), "{s:?}: {t:?}");
                 }
             }
+            assert_eq!(tokens_one_by_one(s), tokens, "{s:?}");
         }
+    }
+
+    /// Lexes `src` with [`next_token`], resuming after each token.
+    fn tokens_one_by_one(src: &str) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        let mut pos = 0;
+        while let Some(t) = next_token(src, pos) {
+            assert!(t.end > pos, "{src:?}: {t:?}");
+            pos = t.end;
+            tokens.push(t);
+        }
+        tokens
+    }
+
+    #[test]
+    fn test_next_token() {
+        let src = "x = f(1, 'a\\'')  # c\n  y.z[2] \\\n\"\"\"doc\n\"\"\"";
+        assert_eq!(tokens_one_by_one(src), lex(src));
+        assert_eq!(next_token(src, src.len()), None);
+        assert_eq!(next_token(src, src.len() + 5), None);
+        assert_eq!(next_token("   ", 0), None);
+        // It starts outside any string: the rest of a string lexes as code.
+        let t = next_token("'ab cd'", 4);
+        assert_eq!(
+            t.map(|t| (t.kind, t.start, t.end)),
+            Some((TokenKind::Ident, 4, 6))
+        );
     }
 }
