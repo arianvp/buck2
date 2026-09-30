@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use buck2_cli_proto::ReplDone;
 use buck2_cli_proto::ReplNotice;
+use buck2_cli_proto::ReplRun;
 use buck2_cli_proto::ReplValue;
 use buck2_cli_proto::repl_done;
 use buck2_cli_proto::repl_error;
@@ -91,9 +92,11 @@ pub(crate) enum Rendered {
     Ok,
     Failed,
     Interrupted,
+    /// `:run`: the program is to be run (see [`run_program`](crate::run::run_program)).
+    Run(ReplRun),
 }
 
-/// Prints the result of an input.
+/// Prints the result of an input. For `:run` (without `--print`), the caller runs the program.
 ///
 /// Fails if the output cannot be written (e.g. stdout is a closed pipe): the caller stops, since
 /// nobody sees the results of later inputs.
@@ -120,11 +123,15 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
             }
         }
         Some(repl_done::Outcome::Run(run)) => {
-            // Running the program is not implemented yet: print its command line.
-            let argv = run.argv.iter().map(String::as_str);
-            let command = shlex::try_join(argv).unwrap_or_else(|_| run.argv.join(" "));
-            buck2_client_ctx::println!("{}", command)?;
-            Rendered::Ok
+            if run.print_only {
+                // `:run --print`: the command line, quoted for a POSIX shell.
+                let argv = run.argv.iter().map(String::as_str);
+                let command = shlex::try_join(argv).unwrap_or_else(|_| run.argv.join(" "));
+                buck2_client_ctx::println!("{}", command)?;
+                Rendered::Ok
+            } else {
+                Rendered::Run(run.clone())
+            }
         }
     };
     if style.interactive && style.durations {

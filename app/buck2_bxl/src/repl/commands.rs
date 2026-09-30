@@ -21,9 +21,12 @@ use buck2_repl_syntax::commands::Handler;
 use buck2_repl_syntax::commands::ParsedCommand;
 use buck2_repl_syntax::commands::QueryDialect;
 use buck2_repl_syntax::commands::parse_load_args;
+use buck2_repl_syntax::commands::parse_run_args;
 use buck2_repl_syntax::commands::split_args;
 use buck2_repl_syntax::text::starlark_string_literal;
 
+use crate::repl::build::BuildSpec;
+use crate::repl::build::RunSpec;
 use crate::repl::render::RenderMode;
 use crate::repl::render::ReplFailure;
 use crate::repl::thread::EvalKind;
@@ -34,6 +37,8 @@ pub(crate) enum CommandWork {
     Eval { kind: EvalKind, code: String },
     /// `:reset`: start a new session.
     Reset,
+    /// `:build`, `:run`: a native build.
+    Build(BuildSpec),
 }
 
 /// The work of a meta-command, or why it cannot be done.
@@ -76,6 +81,29 @@ pub(crate) fn command_work(command: &ParsedCommand<'_>) -> Result<CommandWork, R
                 Err(e) => return Err(usage_error(command, &e)),
             };
             eval(EvalKind::Sugar, providers_code(&target))
+        }
+        CommandId::Build => {
+            let patterns = split_args(arg).map_err(|e| usage_error(command, &e))?;
+            if let Some(flag) = patterns.iter().find(|p| p.starts_with('-')) {
+                return Err(usage_error(command, &ArgError::UnknownFlag(flag.clone())));
+            }
+            if patterns.is_empty() {
+                return Err(usage_error(command, &ArgError::MissingTarget));
+            }
+            Ok(CommandWork::Build(BuildSpec {
+                patterns,
+                run: None,
+            }))
+        }
+        CommandId::Run => {
+            let args = parse_run_args(arg).map_err(|e| usage_error(command, &e))?;
+            Ok(CommandWork::Build(BuildSpec {
+                patterns: vec![args.target],
+                run: Some(RunSpec {
+                    args: args.args,
+                    print: args.print,
+                }),
+            }))
         }
         _ => {
             let name = command.spec.display_name();

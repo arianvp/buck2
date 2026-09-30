@@ -32,6 +32,7 @@ use buck2_client_ctx::subscribers::subscriber::EventSubscriber;
 mod editor;
 mod help;
 mod render;
+mod run;
 mod script;
 mod session;
 

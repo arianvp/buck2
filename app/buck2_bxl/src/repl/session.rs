@@ -69,6 +69,7 @@ use crate::repl::thread::EvalKind;
 use crate::repl::thread::EvalReply;
 use crate::repl::thread::EvalWork;
 use crate::repl::thread::SessionConfig;
+use crate::repl::thread::heap_bytes;
 
 /// The synthetic `.bxl` file of the session, in its working directory. It is never read; loads
 /// resolve relative to it.
@@ -200,7 +201,7 @@ impl Session {
                 EvalReply {
                     result,
                     drained,
-                    heap_bytes: u64::try_from(env.heap().allocated_bytes()).unwrap_or(u64::MAX),
+                    heap_bytes: heap_bytes(env),
                     prelude_loaded: self.prelude_loaded,
                 }
             })

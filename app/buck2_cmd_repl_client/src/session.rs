@@ -19,6 +19,7 @@
 
 use std::io::IsTerminal;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -58,6 +59,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::ReplCommand;
 use crate::editor::EditorMode;
 use crate::editor::history_path;
+use crate::run::RunEnv;
 use crate::script::ScriptInputs;
 use crate::script::ScriptMode;
 
@@ -170,6 +172,9 @@ pub(crate) enum UiState {
     Editor,
     /// Request `id` is running. SIGINT interrupts it, warns, then ends the client.
     Busy { id: u64, presses: u32 },
+    /// The program of `:run` is running in the foreground. SIGINT is for it (the terminal sends
+    /// it to the whole process group): the session ignores it.
+    Child,
 }
 
 /// The state of the terminal, shared by the input thread, the SIGINT handler and the session.
@@ -344,7 +349,7 @@ async fn sigint_loop(
         let mut inner = ui.lock();
         let presses = match &mut inner.state {
             UiState::Idle => return,
-            UiState::Editor => continue,
+            UiState::Editor | UiState::Child => continue,
             UiState::Busy { id, presses } => {
                 *presses = presses.saturating_add(1);
                 if *presses == 1
@@ -396,6 +401,11 @@ pub(crate) async fn run(
     };
 
     let build_opts = cmd.build_opts.to_proto();
+    let run_env = RunEnv {
+        trace_id: context.trace_id.clone(),
+        cwd: PathBuf::from(&context.working_dir),
+        interactive,
+    };
     let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<ReplRequest>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let (compl_tx, compl_rx) = std::sync::mpsc::channel::<(u64, ReplCompletions)>();
@@ -427,6 +437,7 @@ pub(crate) async fn run(
             history,
             outcome_tx,
             shutdown: shutdown.dupe(),
+            run_env,
         };
         thread_spawn("repl-editor", move || editor.run())
     } else {
@@ -444,6 +455,7 @@ pub(crate) async fn run(
             ui: ui.dupe(),
             outcome_tx,
             shutdown: shutdown.dupe(),
+            run_env,
         };
         thread_spawn("repl-editor", move || script.run())
     };

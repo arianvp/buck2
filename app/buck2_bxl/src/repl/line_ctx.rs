@@ -52,9 +52,9 @@ pub(crate) struct ReplCtx<'a> {
 }
 
 impl<'a> ReplCtx<'a> {
-    /// For an evaluation: it runs to completion (it is only ever cancelled from the inside,
-    /// never dropped, INV-8), waiting for other commands if needed. Other commands that wait for
-    /// it see the first line of the input.
+    /// For an evaluation or a build: it runs to completion (it is only ever cancelled from the
+    /// inside, never dropped, INV-8), waiting for other commands if needed. Other commands that
+    /// wait for it see the first line of the input.
     pub(crate) fn eval(inner: &'a dyn ServerCommandContextTrait, input: &str) -> Self {
         let first_line = input.trim_start().lines().next().unwrap_or("");
         let mut sanitized_argv = vec!["buck2".to_owned(), "repl".to_owned()];

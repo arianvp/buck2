@@ -18,6 +18,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -70,6 +71,9 @@ use tokio::runtime::Handle;
 
 use crate::bxl::starlark_defs::context::output::OutputStreamOutcome;
 use crate::command::materialize_ensured_artifacts;
+use crate::repl::build::BuildSpec;
+use crate::repl::build::Built;
+use crate::repl::build::build;
 use crate::repl::cancel::EvalCancel;
 use crate::repl::commands::CommandWork;
 use crate::repl::commands::command_work;
@@ -99,6 +103,8 @@ enum Work {
         id: u64,
     },
     Eval(EvalRequest),
+    /// `:build`, `:run`.
+    Build(BuildRequest),
     /// `:reset`: a new session, started like the first one.
     Reset {
         id: u64,
@@ -136,6 +142,13 @@ impl EvalRequest {
     }
 }
 
+struct BuildRequest {
+    id: u64,
+    spec: BuildSpec,
+    /// The input as typed, shown to other commands that wait for this one.
+    title: String,
+}
+
 /// The first line of `input`, cut to [`MAX_TITLE_BYTES`].
 fn title(input: &str) -> String {
     let first_line = input.trim_start().lines().next().unwrap_or("");
@@ -153,6 +166,14 @@ enum Outcome {
         materialized: Materialized,
         cwd: CellPath,
         target_platform: Option<TargetLabel>,
+        equality: DiceEquality,
+        t0: Instant,
+        t1: Instant,
+        t2: Instant,
+    },
+    /// `:build` or `:run`.
+    Built {
+        result: Result<Built, ReplFailure>,
         equality: DiceEquality,
         t0: Instant,
         t1: Instant,
@@ -186,6 +207,8 @@ pub(crate) struct Driver<'a> {
     client_open: bool,
     /// The DICE version of the previous request, to notice source changes.
     last_equality: Option<DiceEquality>,
+    /// Bytes allocated on the session's heap, as of the last job of the session thread.
+    heap_bytes: u64,
 }
 
 impl<'a> Driver<'a> {
@@ -202,6 +225,7 @@ impl<'a> Driver<'a> {
             emitter,
             client_open: true,
             last_equality: None,
+            heap_bytes: 0,
         }
     }
 
@@ -245,21 +269,23 @@ impl<'a> Driver<'a> {
                 Work::Interrupt => {}
                 Work::Reply { id, message } => self.emitter.emit(id, message),
                 Work::Init { id } => {
-                    let outcome = self
-                        .in_flight(&thread, &target_cfg, EvalRequest::init(id))
-                        .await;
+                    let outcome = self.eval(&thread, &target_cfg, EvalRequest::init(id)).await;
                     self.answer_init(id, outcome);
                 }
                 Work::Eval(request) => {
                     let id = request.id;
-                    let outcome = self.in_flight(&thread, &target_cfg, request).await;
+                    let outcome = self.eval(&thread, &target_cfg, request).await;
+                    self.answer_eval(id, outcome);
+                }
+                Work::Build(request) => {
+                    let id = request.id;
+                    let outcome = self.build(&thread, &target_cfg, request).await;
                     self.answer_eval(id, outcome);
                 }
                 Work::Reset { id } => {
                     // The thread is idle: it drops the module at once.
                     let outcome = if thread.reset().await {
-                        self.in_flight(&thread, &target_cfg, EvalRequest::init(id))
-                            .await
+                        self.eval(&thread, &target_cfg, EvalRequest::init(id)).await
                     } else {
                         Ok(Outcome::ThreadExited)
                     };
@@ -294,8 +320,8 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// Runs an evaluation to its end while answering the requests that arrive meanwhile.
-    async fn in_flight(
+    /// Evaluates an input.
+    async fn eval(
         &mut self,
         thread: &ReplThread,
         target_cfg: &TargetCfg,
@@ -311,6 +337,45 @@ impl<'a> Driver<'a> {
             cancel.dupe(),
             self.emitter.dupe(),
         );
+        let outcome = self.in_flight(id, &cancel, fut).await;
+        if let Ok(Outcome::Eval { reply, .. }) = &outcome {
+            self.heap_bytes = reply.heap_bytes;
+        }
+        outcome
+    }
+
+    /// Runs `:build` or `:run`. The outputs of `:build` become `_` once the build is over.
+    async fn build(
+        &mut self,
+        thread: &ReplThread,
+        target_cfg: &TargetCfg,
+        request: BuildRequest,
+    ) -> buck2_error::Result<Outcome> {
+        let id = request.id;
+        let cancel = Arc::new(EvalCancel::new());
+        let fut = run_build(self.sctx, target_cfg.clone(), request, cancel.dupe());
+        let mut outcome = self.in_flight(id, &cancel, fut).await;
+        if let Ok(Outcome::Built {
+            result: Ok(Built::Outputs { value, .. }),
+            ..
+        }) = &mut outcome
+        {
+            // The transaction is over and the thread is idle.
+            match thread.bind("_", std::mem::take(value)).await {
+                Some(heap_bytes) => self.heap_bytes = heap_bytes,
+                None => return Ok(Outcome::ThreadExited),
+            }
+        }
+        outcome
+    }
+
+    /// Runs the request `id` to its end while answering the requests that arrive meanwhile.
+    async fn in_flight(
+        &mut self,
+        id: u64,
+        cancel: &EvalCancel,
+        fut: impl Future<Output = buck2_error::Result<Outcome>>,
+    ) -> buck2_error::Result<Outcome> {
         tokio::pin!(fut);
         loop {
             // `fut` is polled until it completes, never dropped (INV-8).
@@ -419,8 +484,38 @@ impl<'a> Driver<'a> {
                     ReplFailure::interrupted(),
                 ))),
                 wait_ms: millis(t1 - t0),
+                heap_bytes: self.heap_bytes,
                 ..ReplDone::default()
             },
+            Ok(Outcome::Built {
+                result,
+                equality,
+                t0,
+                t1,
+                t2,
+            }) => {
+                let sources_changed = self.last_equality.is_some_and(|last| last != equality);
+                self.last_equality = Some(equality);
+                let outcome = match result {
+                    Ok(Built::Outputs {
+                        listing, truncated, ..
+                    }) => repl_done::Outcome::Value(ReplValue {
+                        r#type: "dict".to_owned(),
+                        text: listing,
+                        truncated,
+                        json: None,
+                    }),
+                    Ok(Built::Run(run)) => repl_done::Outcome::Run(run),
+                    Err(failure) => repl_done::Outcome::Error(failure_proto(failure)),
+                };
+                ReplDone {
+                    outcome: Some(outcome),
+                    wait_ms: millis(t1 - t0),
+                    eval_ms: millis(t2 - t1),
+                    sources_changed,
+                    heap_bytes: self.heap_bytes,
+                }
+            }
             Ok(Outcome::Eval {
                 reply,
                 materialized,
@@ -529,6 +624,11 @@ fn classify(request: ReplRequest) -> Work {
                     title: title(&eval.input),
                 }),
                 Ok(CommandWork::Reset) => Work::Reset { id },
+                Ok(CommandWork::Build(spec)) => Work::Build(BuildRequest {
+                    id,
+                    spec,
+                    title: title(&eval.input),
+                }),
                 Err(failure) => Work::Reply {
                     id,
                     message: repl_message::Message::Done(ReplDone {
@@ -686,6 +786,41 @@ async fn run_eval(
                 materialized,
                 cwd,
                 target_platform,
+                equality: txn.equality_token(),
+                t0,
+                t1,
+                t2: Instant::now(),
+            })
+        })
+        .await
+}
+
+/// Runs `:build` or `:run` in a transaction of its own. The build races the cancellation of the
+/// request: it is DICE work, which is safe to drop.
+async fn run_build(
+    sctx: &dyn ServerCommandContextTrait,
+    target_cfg: TargetCfg,
+    request: BuildRequest,
+    cancel: Arc<EvalCancel>,
+) -> buck2_error::Result<Outcome> {
+    let BuildRequest { id: _, spec, title } = request;
+    let t0 = Instant::now();
+    let repl_ctx = ReplCtx::eval(sctx, &title);
+    (&repl_ctx as &dyn ServerCommandContextTrait)
+        .with_dice_ctx(|sctx, txn| async move {
+            let t1 = Instant::now();
+            if cancel.is_triggered() {
+                // Cancelled while waiting for other commands.
+                return Ok(Outcome::Interrupted { t0, t1 });
+            }
+            let mut dc = txn.ctx();
+            let result = tokio::select! {
+                result = build(sctx, &mut dc, &target_cfg, &spec) => result,
+                () = cancel.cancelled() => Err(ReplFailure::interrupted()),
+            };
+            drop(dc);
+            Ok(Outcome::Built {
+                result,
                 equality: txn.equality_token(),
                 t0,
                 t1,

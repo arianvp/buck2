@@ -45,6 +45,7 @@ pub(crate) enum Job {
     /// Drops the session's module and starts a new session (`:reset`). Acknowledged once the
     /// old module is gone.
     Reset(tokio::sync::oneshot::Sender<()>),
+    Bind(BindJob),
     /// Ends the thread.
     Shutdown,
 }
@@ -89,6 +90,14 @@ pub(crate) struct EvalWork {
     pub(crate) global_cfg_options: GlobalCfgOptions,
     /// The span of the request, as the parent of the thread's spans.
     pub(crate) span: Option<SpanId>,
+}
+
+/// Binds a name of the session's module to a value made from JSON (`_` after `:build`).
+/// Acknowledged with the bytes allocated on the session's heap.
+pub(crate) struct BindJob {
+    pub(crate) name: &'static str,
+    pub(crate) value: serde_json::Value,
+    pub(crate) ack: tokio::sync::oneshot::Sender<u64>,
 }
 
 /// How an input went. Only `Send` data.
@@ -147,6 +156,22 @@ impl ReplThread {
         ack_rx.await.is_ok()
     }
 
+    /// Binds `name` to `value` (made into a Starlark value) in the session's module. Returns the
+    /// bytes allocated on the session's heap, or `None` if the thread has exited. The driver
+    /// calls it when no job is in flight.
+    pub(crate) async fn bind(&self, name: &'static str, value: serde_json::Value) -> Option<u64> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let job = Job::Bind(BindJob {
+            name,
+            value,
+            ack: ack_tx,
+        });
+        if self.jobs.send(job).is_err() {
+            return None;
+        }
+        ack_rx.await.ok()
+    }
+
     /// Asks the thread to exit and waits until it has (INV-16). The driver calls it when no job
     /// is in flight.
     pub(crate) async fn shutdown(self) {
@@ -188,6 +213,12 @@ fn thread_main(
                         let result = session.eval_job(&env, work);
                         let _ignored = reply.send(result);
                     }
+                    Ok(Job::Bind(BindJob { name, value, ack })) => {
+                        // No evaluator runs, so nothing can collect the session's heap (INV-1).
+                        // The value is only as deep as JSON made by the driver.
+                        env.set(name, env.heap().alloc(value));
+                        let _ignored = ack.send(heap_bytes(&env));
+                    }
                 }
             }
             let token = match session.take_token() {
@@ -204,6 +235,11 @@ fn thread_main(
             None => break,
         }
     }
+}
+
+/// Bytes allocated on the session's heap.
+pub(crate) fn heap_bytes(env: &BuckStarlarkModule<'_>) -> u64 {
+    u64::try_from(env.heap().allocated_bytes()).unwrap_or(u64::MAX)
 }
 
 /// A profiling token for a module that no evaluation has finished with. It runs no code.

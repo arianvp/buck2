@@ -32,6 +32,8 @@ use crate::help;
 use crate::render;
 use crate::render::Rendered;
 use crate::render::Style;
+use crate::run;
+use crate::run::RunEnv;
 use crate::session::InputOutcome;
 use crate::session::OPEN_ID;
 use crate::session::SharedUi;
@@ -61,6 +63,7 @@ pub(crate) struct ScriptMode {
     pub(crate) ui: SharedUi,
     pub(crate) outcome_tx: tokio::sync::oneshot::Sender<InputOutcome>,
     pub(crate) shutdown: ShutdownHangup,
+    pub(crate) run_env: RunEnv,
 }
 
 impl ScriptMode {
@@ -75,6 +78,7 @@ impl ScriptMode {
             ui,
             outcome_tx,
             shutdown,
+            run_env,
         } = self;
         let mut session = Session {
             continue_on_error,
@@ -83,6 +87,7 @@ impl ScriptMode {
             next_id,
             ui,
             shutdown,
+            run_env,
             number: 0,
             outcome: InputOutcome::default(),
         };
@@ -104,6 +109,7 @@ struct Session {
     next_id: Arc<AtomicU64>,
     ui: SharedUi,
     shutdown: ShutdownHangup,
+    run_env: RunEnv,
     /// Number of inputs sent so far; the daemon names input N `<repl:N>`.
     number: u32,
     outcome: InputOutcome,
@@ -280,6 +286,16 @@ impl Session {
             return Next::Stop;
         }
         let rendered = render::render_done(done, Style::script()).and_then(|r| {
+            let r = match r {
+                Rendered::Run(run) => run::run_program(
+                    &run,
+                    &self.run_env,
+                    &self.ui,
+                    UiState::Idle,
+                    Style::script(),
+                )?,
+                r => r,
+            };
             if let Some(total) = timing {
                 render::print_timing(Style::script(), total, done)?;
             }
@@ -298,7 +314,7 @@ impl Session {
             return Next::Stop;
         }
         match rendered {
-            Rendered::Ok => Next::Continue,
+            Rendered::Ok | Rendered::Run(_) => Next::Continue,
             Rendered::Failed => self.failed(),
             Rendered::Interrupted => {
                 self.outcome.interrupted = true;

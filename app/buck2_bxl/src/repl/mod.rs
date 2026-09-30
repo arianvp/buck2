@@ -27,6 +27,7 @@ use dupe::Dupe;
 use crate::repl::driver::Driver;
 use crate::repl::output::ReplEmitter;
 
+mod build;
 mod cancel;
 mod commands;
 mod complete;

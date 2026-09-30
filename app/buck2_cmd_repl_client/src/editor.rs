@@ -64,6 +64,8 @@ use rustyline::validate::ValidationResult;
 use crate::help;
 use crate::render;
 use crate::render::Style;
+use crate::run;
+use crate::run::RunEnv;
 use crate::session::InputOutcome;
 use crate::session::OPEN_ID;
 use crate::session::SharedUi;
@@ -172,6 +174,7 @@ pub(crate) struct EditorMode {
     pub(crate) history: Option<PathBuf>,
     pub(crate) outcome_tx: tokio::sync::oneshot::Sender<InputOutcome>,
     pub(crate) shutdown: ShutdownHangup,
+    pub(crate) run_env: RunEnv,
 }
 
 impl EditorMode {
@@ -185,6 +188,7 @@ impl EditorMode {
             history,
             outcome_tx,
             shutdown,
+            run_env,
         } = self;
         let mut session = Session {
             req_tx,
@@ -194,6 +198,7 @@ impl EditorMode {
             history,
             history_failed: false,
             shutdown,
+            run_env,
             style: Style::interactive(),
             number: 0,
             outcome: InputOutcome::default(),
@@ -216,6 +221,7 @@ struct Session {
     /// The history file could not be written: it is not tried again.
     history_failed: bool,
     shutdown: ShutdownHangup,
+    run_env: RunEnv,
     style: Style,
     /// Number of inputs sent so far; the daemon names input N `<repl:N>`.
     number: u32,
@@ -476,13 +482,19 @@ impl Session {
             return Next::Stop;
         }
         let rendered = render::render_done(done, style).and_then(|r| {
+            let r = match r {
+                render::Rendered::Run(run) => {
+                    run::run_program(&run, &self.run_env, &self.ui, UiState::Editor, style)?
+                }
+                r => r,
+            };
             if let Some(total) = timing {
                 render::print_timing(style, total, done)?;
             }
             render::flush().map(|()| r)
         });
         match rendered {
-            Ok(render::Rendered::Ok) => Next::Continue,
+            Ok(render::Rendered::Ok | render::Rendered::Run(_)) => Next::Continue,
             Ok(render::Rendered::Failed | render::Rendered::Interrupted) => {
                 if self.shutdown.is_shutting_down() {
                     // The daemon cancels the input in flight when it shuts down.
