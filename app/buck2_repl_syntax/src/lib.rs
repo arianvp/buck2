@@ -14,6 +14,7 @@
 //! input, because the daemon runs these functions on user input with `panic = "abort"`.
 //!
 //! - [`lexer`]: a tolerant Starlark tokenizer.
+//! - [`highlight`]: what to colour in the line editor.
 //! - [`completeness`]: whether an input buffer is ready to be submitted (the line editor's
 //!   validator).
 //! - [`chunker`]: splits piped input into inputs, line by line.
@@ -23,14 +24,17 @@
 //! - [`query`]: where the cursor is in a query, for completion.
 //! - [`matching`]: how well a completion candidate matches the word typed.
 //! - [`candidates`]: text helpers for completion candidates.
+//! - [`signature`]: signatures of functions, for the hint shown in a call.
 
 pub mod candidates;
 pub mod chunker;
 pub mod commands;
 pub mod completeness;
+pub mod highlight;
 pub mod lexer;
 pub mod matching;
 mod nesting;
 pub mod query;
+pub mod signature;
 pub mod site;
 pub mod text;

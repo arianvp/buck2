@@ -75,6 +75,7 @@ use buck2_repl_syntax::query::decode_query_args;
 use buck2_repl_syntax::query::is_pattern_word;
 use buck2_repl_syntax::site::SiteKind;
 use buck2_repl_syntax::site::Step;
+use buck2_repl_syntax::site::chain_key;
 use buck2_repl_syntax::site::classify;
 use buck2_repl_syntax::site::looks_like_pattern;
 use rustyline::completion::Pair;
@@ -100,6 +101,9 @@ const MAX_PENDING: usize = 64;
 
 /// Most candidates completed here.
 const MAX_LOCAL_CANDIDATES: usize = 500;
+
+/// Most signatures of functions kept for the hint.
+const MAX_SIGNATURES: usize = 4096;
 
 /// The extensions of the modules `load` and `:load` load.
 const LOAD_EXTENSIONS: &[&str] = &[".bzl", ".bxl"];
@@ -262,6 +266,9 @@ pub(crate) struct Completer {
     /// The wait for every completion from `:set completion_timeout_ms`, if set.
     timeout_override: Mutex<Option<Duration>>,
     cache: Mutex<ListingCache>,
+    /// The signatures of the functions the daemon offered as candidates since the last input,
+    /// by the chain that names them (`ctx.cquery().deps`), for the hint shown in their calls.
+    signatures: Mutex<HashMap<String, String>>,
 }
 
 impl Completer {
@@ -282,6 +289,7 @@ impl Completer {
             env_timeout,
             timeout_override: Mutex::new(None),
             cache: Mutex::new(ListingCache::default()),
+            signatures: Mutex::new(HashMap::new()),
         })
     }
 
@@ -318,12 +326,53 @@ impl Completer {
         self.timeout_override().unwrap_or(self.timeouts().1)
     }
 
-    /// Forgets the listings: an input may have changed what they list.
+    /// Forgets the listings and the signatures: an input may have changed what they list, or
+    /// what a name is bound to.
     pub(crate) fn clear_listings(&self) {
         self.cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.signatures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// The signature of the function named by the chain `key` (see [`chain_key`]), if the
+    /// daemon offered it as a candidate since the last input: `(x: int, *, y = ...) -> str`.
+    pub(crate) fn signature(&self, key: &str) -> Option<String> {
+        self.signatures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    /// Keeps the signatures of the functions among `candidates`, the answer for a name or an
+    /// attribute of the chain `chain` (the empty string for a name).
+    fn remember_signatures(&self, chain: &str, candidates: &[ReplCandidate]) {
+        let mut signatures = self
+            .signatures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for c in candidates {
+            let Some(name) = c.replacement.strip_suffix('(') else {
+                continue;
+            };
+            if c.kind() != repl_candidate::Kind::Function || !c.detail.starts_with('(') {
+                continue;
+            }
+            if signatures.len() >= MAX_SIGNATURES {
+                signatures.clear();
+            }
+            let key = if chain.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{chain}.{name}")
+            };
+            signatures.insert(key, c.detail.clone());
+        }
     }
 
     /// The candidates for the cursor at byte `pos` of `buf`.
@@ -513,6 +562,15 @@ impl Completer {
                 with_keywords(completion, ARGUMENT_KEYWORDS)
             }
         };
+        match &site.kind {
+            SiteKind::Name { .. } | SiteKind::CallArg { .. } => {
+                self.remember_signatures("", &completion.candidates)
+            }
+            SiteKind::Attr { root, steps, .. } => {
+                self.remember_signatures(&chain_key(root, steps), &completion.candidates)
+            }
+            _ => {}
+        }
         completion.candidates = rank(std::mem::take(&mut completion.candidates), word);
         if let Some(quote) = closing_quote(&site.kind, buf, start, pos) {
             for c in &mut completion.candidates {

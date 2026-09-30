@@ -568,8 +568,14 @@ pub(crate) async fn run(
                 }
                 None => "daemon connection lost; press Enter to exit".to_owned(),
             };
-            // The terminal is in raw mode: end the lines explicitly.
-            let _ignored = buck2_client_ctx::eprint!("\r\n{}\r\n", message);
+            // The terminal is in raw mode: end the lines explicitly. What the editor shows
+            // under the input (a signature hint) is erased.
+            let erase = if std::io::stderr().is_terminal() {
+                "\x1b[J"
+            } else {
+                ""
+            };
+            let _ignored = buck2_client_ctx::eprint!("\r\n{}{}\r\n", erase, message);
         }
         let _ignored = thread.join();
         outcome = outcome_rx.try_recv().ok();

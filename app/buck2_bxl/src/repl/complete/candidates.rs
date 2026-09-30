@@ -33,8 +33,15 @@ const MAX_ANSWER_BYTES: usize = 60 << 10;
 /// Longest message of an answer.
 const MAX_MESSAGE_BYTES: usize = 2 << 10;
 
-/// Longest detail (a type name) of a candidate.
+/// Longest detail (a type name) of a candidate other than a function.
 const MAX_DETAIL_BYTES: usize = 128;
+
+/// Longest detail (its signature) of a function.
+const MAX_FUNCTION_DETAIL_BYTES: usize = 512;
+
+/// Most signatures of functions made for an answer: they are for the line editor's hint, which
+/// matters when there are few candidates.
+const MAX_SIGNATURES: usize = 64;
 
 /// The candidates of a completion, by replacement: each replacement once, in order.
 #[derive(Default)]
@@ -44,6 +51,8 @@ pub(crate) struct Candidates {
     tier: Option<MatchTier>,
     /// Some candidates were left out.
     truncated: bool,
+    /// The signatures of functions made so far ([`wants_signature`](Self::wants_signature)).
+    signatures: usize,
 }
 
 impl Candidates {
@@ -74,11 +83,23 @@ impl Candidates {
             Some(best) if tier < best => {
                 self.by_replacement.clear();
                 self.truncated = false;
+                self.signatures = 0;
             }
             _ => {}
         }
         self.tier = Some(tier);
         self.add(replacement, kind, detail);
+    }
+
+    /// Whether a function candidate about to be offered should get its signature as detail:
+    /// only the first [`MAX_SIGNATURES`] do (the others get their type).
+    pub(crate) fn wants_signature(&mut self) -> bool {
+        if self.signatures < MAX_SIGNATURES {
+            self.signatures += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Records that some candidates were left out.
@@ -96,9 +117,14 @@ impl Candidates {
             return;
         }
         if !self.by_replacement.contains_key(&replacement) {
+            let max_detail = if kind == repl_candidate::Kind::Function {
+                MAX_FUNCTION_DETAIL_BYTES
+            } else {
+                MAX_DETAIL_BYTES
+            };
             self.by_replacement.insert(
                 replacement,
-                (kind, truncate_to_bytes(detail, MAX_DETAIL_BYTES).to_owned()),
+                (kind, truncate_to_bytes(detail, max_detail).to_owned()),
             );
             if self.by_replacement.len() > MAX_CANDIDATES {
                 let last_other = self
@@ -129,7 +155,20 @@ impl Candidates {
             .by_replacement
             .into_iter()
             .partition(|(_, (kind, _))| *kind == repl_candidate::Kind::Kwarg);
-        for (replacement, (kind, detail)) in kwargs.into_iter().chain(others) {
+        // The signatures of functions go only if every candidate fits with them: they must
+        // never cost a candidate.
+        let with_details =
+            kwargs
+                .iter()
+                .chain(&others)
+                .fold(0usize, |bytes, (replacement, (_, detail))| {
+                    bytes.saturating_add(replacement.len() + detail.len() + 16)
+                });
+        let signatures = with_details <= MAX_ANSWER_BYTES;
+        for (replacement, (kind, mut detail)) in kwargs.into_iter().chain(others) {
+            if !signatures && kind == repl_candidate::Kind::Function {
+                detail.clear();
+            }
             // Replacement, detail, and a few bytes of framing for each.
             bytes = bytes.saturating_add(replacement.len() + detail.len() + 16);
             if bytes > MAX_ANSWER_BYTES {

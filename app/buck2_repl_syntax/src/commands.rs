@@ -875,8 +875,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         side: SettingSide::Client,
         values: "auto|on|off",
         choices: &["auto", "on", "off"],
-        summary: "colour errors and notes (auto: interactively, on a terminal, unless NO_COLOR \
-                  is set)",
+        summary: "colour errors, notes and the input being typed (auto: interactively, on a \
+                  terminal, unless NO_COLOR is set)",
     },
     SettingSpec {
         name: "timing",

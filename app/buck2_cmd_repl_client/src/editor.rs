@@ -13,20 +13,39 @@
 //! Enter submits a complete input and adds a line to an incomplete one (the rules of
 //! [`completeness`]); Alt-Enter always adds a line; Tab indents at the start of a line. Ctrl-C
 //! clears the line, Ctrl-D on an empty line ends the session. The history is kept in a file.
+//!
+//! The input is highlighted as it is typed ([`highlight`]: keywords, strings, numbers, comments,
+//! the command, the bracket matching the one at the cursor), unless colour is off (`NO_COLOR`,
+//! stdout not a terminal, `:set color off`). In the parentheses of a call, the signature of the
+//! function is shown under the input when completion has offered that function since the last
+//! input (the daemon sends the signatures with the candidates: no request is made per key).
 
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use buck2_core::buck2_env;
 use buck2_repl_syntax::completeness::Completeness;
 use buck2_repl_syntax::completeness::completeness;
+use buck2_repl_syntax::highlight;
+use buck2_repl_syntax::highlight::Class;
+use buck2_repl_syntax::highlight::Span;
+use buck2_repl_syntax::signature::active_parameter;
+use buck2_repl_syntax::site::Step;
+use buck2_repl_syntax::site::chain_key;
+use buck2_repl_syntax::site::enclosing_call;
 use dupe::Dupe;
 use rustyline::Cmd;
+use rustyline::ColorMode;
 use rustyline::Completer;
 use rustyline::CompletionType;
 use rustyline::ConditionalEventHandler;
 use rustyline::Config;
+use rustyline::Context;
 use rustyline::Editor;
 use rustyline::Event;
 use rustyline::EventContext;
@@ -38,15 +57,17 @@ use rustyline::KeyEvent;
 use rustyline::Modifiers;
 use rustyline::RepeatCount;
 use rustyline::Validator;
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::CmdKind;
 use rustyline::highlight::Highlighter;
-use rustyline::highlight::MatchingBracketHighlighter;
+use rustyline::hint::Hint;
 use rustyline::hint::HistoryHinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::ValidationContext;
 use rustyline::validate::ValidationResult;
 
+use crate::complete::Completer as DaemonCompleter;
 use crate::complete::ReplCompleter;
 use crate::inputs::FirstInputs;
 use crate::inputs::Inputs;
@@ -54,6 +75,7 @@ use crate::inputs::Next;
 use crate::render;
 use crate::session::InputOutcome;
 use crate::session::SharedUi;
+use crate::settings::Switch;
 
 /// Most entries kept in the history file.
 const MAX_HISTORY: usize = 10_000;
@@ -90,20 +112,135 @@ impl rustyline::validate::Validator for ReplValidator {
     }
 }
 
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+
+/// What is shown after the input.
+enum ReplHint {
+    /// The rest of an earlier input that the input starts (fish-style): → or End inserts it.
+    History(String),
+    /// The signature of the function whose call the cursor is in, on a line of its own under
+    /// the input (`\n` + `name(params) -> type`): nothing to insert.
+    Signature(String),
+}
+
+impl Hint for ReplHint {
+    fn display(&self) -> &str {
+        match self {
+            ReplHint::History(text) | ReplHint::Signature(text) => text,
+        }
+    }
+
+    fn completion(&self) -> Option<&str> {
+        match self {
+            ReplHint::History(text) => Some(text),
+            ReplHint::Signature(_) => None,
+        }
+    }
+}
+
+/// History hints, else signature hints.
+struct ReplHinter {
+    history: HistoryHinter,
+    completer: Arc<DaemonCompleter>,
+    /// The last signature hint, and the range of its parameter that the argument at the cursor
+    /// fills, which is shown in bold (the rest is faint).
+    last_signature: RefCell<Option<(String, Option<Range<usize>>)>>,
+}
+
+impl rustyline::hint::Hinter for ReplHinter {
+    type Hint = ReplHint;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<ReplHint> {
+        if let Some(rest) = self.history.hint(line, pos, ctx) {
+            return Some(ReplHint::History(rest));
+        }
+        let call = enclosing_call(line, pos)?;
+        let name = match call.steps.last() {
+            None => call.root,
+            Some(Step::Attr(name)) => *name,
+            // `f()(`: completion offers no such function.
+            Some(Step::Call) => return None,
+        };
+        let signature = self
+            .completer
+            .signature(&chain_key(call.root, &call.steps))?;
+        let display = format!("\n{name}{signature}");
+        // The signature starts after the newline and the name.
+        let shift = 1 + name.len();
+        let active = active_parameter(&signature, call.positional, call.keyword)
+            .map(|r| r.start + shift..r.end + shift);
+        *self.last_signature.borrow_mut() = Some((display.clone(), active));
+        Some(ReplHint::Signature(display))
+    }
+}
+
+impl ReplHinter {
+    /// `hint` styled for the terminal: faint, with the parameter at the cursor in bold if it is
+    /// the last signature hint.
+    fn styled(&self, hint: &str) -> String {
+        let last = self.last_signature.borrow();
+        let active = match &*last {
+            Some((display, active)) if display == hint => active.clone(),
+            _ => None,
+        };
+        let (newline, text, active) = match hint.strip_prefix('\n') {
+            Some(text) => (
+                "\n",
+                text,
+                active.and_then(|r| Some(r.start.checked_sub(1)?..r.end.checked_sub(1)?)),
+            ),
+            None => ("", hint, active),
+        };
+        let parts = active.and_then(|r| {
+            Some((
+                text.get(..r.start)?,
+                text.get(r.clone())?,
+                text.get(r.end..)?,
+            ))
+        });
+        match parts {
+            Some((before, active, after)) => format!(
+                "{newline}{DIM}{before}{RESET}{BOLD}{active}{RESET}{DIM}{after}{RESET}",
+                RESET = highlight::RESET
+            ),
+            None => format!("{newline}{DIM}{text}{RESET}", RESET = highlight::RESET),
+        }
+    }
+}
+
+/// What the syntax highlighter has shown.
+#[derive(Default)]
+struct SyntaxState {
+    /// Whether the bracket matching the one at the cursor is shown: not when the input is
+    /// shown for the last time (it stays on the screen).
+    brackets: Cell<bool>,
+    /// The highlighted parts of the input as last shown.
+    shown: RefCell<Vec<Span>>,
+}
+
 #[derive(Helper, Completer, Hinter, Validator)]
 struct ReplHelper {
     #[rustyline(Completer)]
     completer: ReplCompleter,
     #[rustyline(Hinter)]
-    hinter: HistoryHinter,
+    hinter: ReplHinter,
     #[rustyline(Validator)]
     validator: ReplValidator,
-    brackets: MatchingBracketHighlighter,
+    syntax: SyntaxState,
 }
 
+/// rustyline calls the highlighter only when colour is on (see [`color_mode`]).
 impl Highlighter for ReplHelper {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
-        self.brackets.highlight(line, pos)
+        let spans = highlight::spans(line, self.syntax.brackets.get().then_some(pos));
+        let painted = if spans.is_empty() {
+            Cow::Borrowed(line)
+        } else {
+            Cow::Owned(highlight::paint(line, &spans, highlight::ansi_style))
+        };
+        *self.syntax.shown.borrow_mut() = spans;
+        painted
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
@@ -112,18 +249,37 @@ impl Highlighter for ReplHelper {
         default: bool,
     ) -> Cow<'b, str> {
         if default {
-            Cow::Owned(format!("\x1b[1m{prompt}\x1b[0m"))
+            Cow::Owned(format!("{BOLD}{prompt}{}", highlight::RESET))
         } else {
             Cow::Borrowed(prompt)
         }
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+        Cow::Owned(self.hinter.styled(hint))
     }
 
+    /// Whether the input must be shown again after an edit or a move of the cursor (the input
+    /// is `line` now, the cursor at `pos`): when what is highlighted changes, or a matching
+    /// bracket is shown (so that it is taken away when the input is shown for the last time).
+    /// Otherwise rustyline writes a character typed (or erases one) at the end as it is, which
+    /// is right only if it is not highlighted and nothing else changes.
     fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
-        self.brackets.highlight_char(line, pos, kind)
+        let brackets = kind != CmdKind::ForcedRefresh;
+        self.syntax.brackets.set(brackets);
+        let spans = highlight::spans(line, brackets.then_some(pos));
+        spans.iter().any(|s| s.class == Class::MatchingBracket)
+            || *self.syntax.shown.borrow() != spans
+    }
+}
+
+/// The colour mode of the line editor for `:set color`: by default, colour when stdout is a
+/// terminal and `NO_COLOR` is not set (rustyline's `Enabled`).
+fn color_mode(color: Switch) -> ColorMode {
+    match color {
+        Switch::Auto => ColorMode::Enabled,
+        Switch::On => ColorMode::Forced,
+        Switch::Off => ColorMode::Disabled,
     }
 }
 
@@ -221,6 +377,7 @@ impl Session {
                 self.inputs.outcome.lost = true;
                 return;
             }
+            editor.set_color_mode(color_mode(self.inputs.color_setting()));
             let line = editor.readline(&prompt);
             self.inputs.ui.stop_reading();
             if self.inputs.ui.session_ended() {
@@ -276,9 +433,13 @@ impl Session {
         let mut editor = Editor::with_config(config)?;
         editor.set_helper(Some(ReplHelper {
             completer: ReplCompleter::new(self.inputs.completer.dupe()),
-            hinter: HistoryHinter::new(),
+            hinter: ReplHinter {
+                history: HistoryHinter::new(),
+                completer: self.inputs.completer.dupe(),
+                last_signature: RefCell::new(None),
+            },
             validator: ReplValidator(self.inputs.ui.dupe()),
-            brackets: MatchingBracketHighlighter::new(),
+            syntax: SyntaxState::default(),
         }));
         // Alt-Enter (or Esc then Enter) adds a line even to a complete input.
         editor.bind_sequence(

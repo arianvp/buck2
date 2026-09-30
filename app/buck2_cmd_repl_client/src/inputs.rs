@@ -220,6 +220,11 @@ impl Inputs {
         )
     }
 
+    /// `:set color`.
+    pub(crate) fn color_setting(&self) -> Switch {
+        self.settings.color
+    }
+
     /// The state of the terminal between inputs.
     fn idle_state(&self) -> UiState {
         match self.mode {

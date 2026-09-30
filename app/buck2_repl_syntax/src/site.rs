@@ -176,6 +176,87 @@ pub fn classify(buf: &str, pos: usize) -> Option<Site<'_>> {
     }
 }
 
+/// A call that the cursor is in the parentheses of (for the signature hint).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallSite<'a> {
+    /// The function called: `root.step.step`.
+    pub root: &'a str,
+    pub steps: Vec<Step<'a>>,
+    /// The positional arguments before the argument at the cursor (not counting `*args`).
+    pub positional: usize,
+    /// The keyword of the argument at the cursor, if it has one (`name = ...`).
+    pub keyword: Option<&'a str>,
+}
+
+/// The innermost call of a chain of attributes and calls (`f(`, `ctx.cquery().deps(`) that the
+/// cursor at byte `pos` of `buf` is in the arguments of, if any: in the Starlark code of an
+/// input or of a meta-command that takes it (`:p f(`). Brackets that are not calls around the
+/// cursor (`f([1, `) are looked through; the parameters of a `def` are not a call.
+pub fn enclosing_call(buf: &str, pos: usize) -> Option<CallSite<'_>> {
+    let mut text = buf.get(..pos)?;
+    while let Some(token) = split_command_token(text) {
+        let rest = text.get(token.arg_start..)?;
+        match resolve_command(token.token).ok()?.arg {
+            ArgKind::Input | ArgKind::Expr => text = rest,
+            _ => return None,
+        }
+    }
+    let tokens = lex(text);
+    let mut end = tokens.len();
+    loop {
+        let open = innermost_open(&tokens, end)?;
+        if tokens.get(open)?.kind == TokenKind::Open(Bracket::Paren)
+            && let Some((root, steps)) = chain(text, &tokens, open)
+        {
+            let after_def = steps.is_empty()
+                && open
+                    .checked_sub(2)
+                    .and_then(|i| tokens.get(i))
+                    .is_some_and(|t| t.is_keyword(text, "def"));
+            if after_def {
+                return None;
+            }
+            let arguments = call_arguments(&tokens, open, end);
+            let (current, before) = arguments.split_last()?;
+            let positional = before
+                .iter()
+                .filter(|argument| {
+                    let starred = argument
+                        .first()
+                        .and_then(|&i| tokens.get(i))
+                        .is_some_and(|t| t.is_op(text, "*") || t.is_op(text, "**"));
+                    !argument.is_empty()
+                        && !starred
+                        && keyword_of(text, &tokens, argument).is_none()
+                })
+                .count();
+            return Some(CallSite {
+                root,
+                steps,
+                positional,
+                keyword: keyword_of(text, &tokens, current),
+            });
+        }
+        end = open;
+    }
+}
+
+/// The text of the chain `root` + `steps`, with the arguments of its calls left out:
+/// `ctx.cquery().deps`. The client keys the signatures of functions by it.
+pub fn chain_key(root: &str, steps: &[Step<'_>]) -> String {
+    let mut key = root.to_owned();
+    for step in steps {
+        match step {
+            Step::Attr(name) => {
+                key.push('.');
+                key.push_str(name);
+            }
+            Step::Call => key.push_str("()"),
+        }
+    }
+    key
+}
+
 /// The site in the argument `arg_text` of a command; the argument starts at byte `offset`.
 fn command_arg_site(
     command: CommandId,
@@ -1551,5 +1632,59 @@ mod tests {
                 let _ignored = classify(s, pos);
             }
         }
+    }
+
+    /// The call around the cursor `▮` in `input`: its chain key, the positional arguments
+    /// before the cursor, and the keyword of the argument at it.
+    fn call(input: &str) -> Option<(String, usize, Option<String>)> {
+        let pos = input.find('▮').expect("no cursor");
+        let buf = input.replacen('▮', "", 1);
+        let call = enclosing_call(&buf, pos)?;
+        Some((
+            chain_key(call.root, &call.steps),
+            call.positional,
+            call.keyword.map(str::to_owned),
+        ))
+    }
+
+    #[test]
+    fn test_enclosing_call() {
+        let c = |key: &str, positional, keyword: Option<&str>| {
+            Some((key.to_owned(), positional, keyword.map(str::to_owned)))
+        };
+        assert_eq!(call("f(▮"), c("f", 0, None));
+        assert_eq!(call("f(a, ▮"), c("f", 1, None));
+        assert_eq!(call("f(a, b▮"), c("f", 1, None));
+        assert_eq!(call("f(a, *x, k=1, y=▮"), c("f", 1, Some("y")));
+        assert_eq!(
+            call("ctx.cquery().deps(x, 1, ▮"),
+            c("ctx.cquery().deps", 2, None)
+        );
+        assert_eq!(call("f(a)(x▮"), c("f()", 0, None));
+        // Inside a list, a dict, a string or a comment that is an argument.
+        assert_eq!(call("f(a, [1, 2▮"), c("f", 1, None));
+        assert_eq!(call("f(k = {1: (2, ▮"), c("f", 0, Some("k")));
+        assert_eq!(call("f(\"a, b▮"), c("f", 0, None));
+        assert_eq!(call("f(a,  # c, d▮"), c("f", 1, None));
+        // The innermost call.
+        assert_eq!(call("f(g(1, ▮"), c("g", 1, None));
+        assert_eq!(call("f(g(1), ▮"), c("f", 1, None));
+        assert_eq!(call("f(\n  a,\n  ▮"), c("f", 1, None));
+        // In commands that take Starlark.
+        assert_eq!(call(":p f(1, ▮"), c("f", 1, None));
+        assert_eq!(call(":time :t f(▮"), c("f", 0, None));
+        // Not in a call.
+        assert_eq!(call("f(a)▮"), None);
+        assert_eq!(call("(1, ▮"), None);
+        assert_eq!(call("[f, ▮"), None);
+        assert_eq!(call("x = 1▮"), None);
+        assert_eq!(call("def f(a, ▮"), None);
+        assert_eq!(call("load(\"x\", ▮"), None);
+        assert_eq!(call("\"a\"(▮"), None);
+        assert_eq!(call(":b f(▮"), None);
+        assert_eq!(call(":zz f(▮"), None);
+        assert_eq!(call("▮"), None);
+        assert_eq!(enclosing_call("f(", 9), None);
+        assert_eq!(enclosing_call("é(", 1), None);
     }
 }

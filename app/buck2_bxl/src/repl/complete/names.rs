@@ -33,6 +33,7 @@ use buck2_repl_syntax::matching::match_tier;
 use buck2_repl_syntax::text::CappedString;
 use buck2_repl_syntax::text::after_top_level;
 use buck2_repl_syntax::text::split_top_level;
+use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
 use starlark::docs::DocParams;
@@ -45,6 +46,7 @@ use starlark::values::Value;
 use crate::repl::complete::candidates::Candidates;
 use crate::repl::complete::candidates::completions_status;
 use crate::repl::complete::private::PrivateBindings;
+use crate::repl::complete::signature;
 use crate::repl::complete::types::TypeIndex;
 
 /// Longest rendering of the type of a `def` or a `lambda` that is read for its return type.
@@ -109,6 +111,28 @@ pub(crate) fn kind_of(v: Value) -> repl_candidate::Kind {
     }
 }
 
+/// The detail of the candidate for the value `v`: its signature if it is a function (and the
+/// answer takes more signatures), else its type.
+fn detail_of(candidates: &mut Candidates, v: Value) -> String {
+    if kind_of(v) == repl_candidate::Kind::Function
+        && candidates.wants_signature()
+        && let Some(signature) = signature::of_function(v)
+    {
+        return signature;
+    }
+    v.get_type().to_owned()
+}
+
+/// The detail of the candidate for a function documented by `f`: its signature, if the answer
+/// takes more signatures.
+fn doc_detail(candidates: &mut Candidates, f: &DocFunction) -> String {
+    if candidates.wants_signature() {
+        signature::of_doc(f)
+    } else {
+        String::new()
+    }
+}
+
 /// Offers `name` for `prefix`, completed as a call (`name(`) if it is a function.
 fn add(
     candidates: &mut Candidates,
@@ -139,7 +163,10 @@ fn names(
             continue;
         }
         match binding(env, private, visibility, name) {
-            Some(value) => add(candidates, prefix, name, kind_of(value), value.get_type()),
+            Some(value) => {
+                let detail = detail_of(candidates, value);
+                add(candidates, prefix, name, kind_of(value), &detail)
+            }
             // Defined in the session with a private name (`_x = 1`): the module does not give
             // out its value.
             None if visibility == Visibility::Private && name.starts_with('_') => {
@@ -158,7 +185,8 @@ fn names(
                 match globals.get_ref(name) {
                     Some(value) => {
                         let value = value.value();
-                        add(candidates, prefix, name, kind_of(value), value.get_type());
+                        let detail = detail_of(candidates, value);
+                        add(candidates, prefix, name, kind_of(value), &detail);
                     }
                     None => add(candidates, prefix, name, repl_candidate::Kind::Value, ""),
                 }
@@ -238,13 +266,16 @@ fn attributes<'v>(
                     break;
                 }
                 match types.and_then(|t| t.member(type_name, &name)) {
-                    Some(DocMember::Function(_)) => add(
-                        candidates,
-                        prefix,
-                        &name,
-                        repl_candidate::Kind::Function,
-                        "",
-                    ),
+                    Some(DocMember::Function(f)) => {
+                        let detail = doc_detail(candidates, f);
+                        add(
+                            candidates,
+                            prefix,
+                            &name,
+                            repl_candidate::Kind::Function,
+                            &detail,
+                        )
+                    }
                     Some(DocMember::Property(p)) => {
                         let detail = p.typ.as_name().unwrap_or("");
                         add(
@@ -259,7 +290,8 @@ fn attributes<'v>(
                     // that matters (they are not given an evaluator).
                     None => match v.get_attr(&name, heap) {
                         Ok(Some(field)) => {
-                            add(candidates, prefix, &name, kind_of(field), field.get_type())
+                            let detail = detail_of(candidates, field);
+                            add(candidates, prefix, &name, kind_of(field), &detail)
                         }
                         _ => add(candidates, prefix, &name, repl_candidate::Kind::Value, ""),
                     },
@@ -275,12 +307,19 @@ fn attributes<'v>(
                     continue;
                 };
                 for (name, member) in ty.members.iter() {
-                    if !visible(prefix, name) {
+                    if !visible(prefix, name) || match_tier(prefix, name).is_none() {
                         continue;
                     }
                     match member {
-                        DocMember::Function(_) => {
-                            add(candidates, prefix, name, repl_candidate::Kind::Function, "")
+                        DocMember::Function(f) => {
+                            let detail = doc_detail(candidates, f);
+                            add(
+                                candidates,
+                                prefix,
+                                name,
+                                repl_candidate::Kind::Function,
+                                &detail,
+                            )
                         }
                         DocMember::Property(p) => add(
                             candidates,

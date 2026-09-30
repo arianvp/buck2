@@ -21,5 +21,6 @@ pub(crate) mod loads;
 pub(crate) mod names;
 pub(crate) mod private;
 pub(crate) mod query;
+pub(crate) mod signature;
 pub(crate) mod targets;
 pub(crate) mod types;

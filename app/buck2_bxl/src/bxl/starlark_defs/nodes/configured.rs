@@ -466,7 +466,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     ///     ctx.output.print(attrs.get("some_attribute").label)
     /// ```
     fn attrs_lazy<'v>(
-        this: &'v StarlarkConfiguredTargetNode,
+        this: ValueTyped<'v, StarlarkConfiguredTargetNode>,
     ) -> starlark::Result<StarlarkLazyAttrs<'v>> {
         Ok(StarlarkLazyAttrs::new(this))
     }
@@ -918,10 +918,10 @@ fn configured_attr_methods(builder: &mut MethodsBuilder) {
 #[derivative(Debug)]
 #[display("{:?}", self)]
 pub(crate) struct StarlarkLazyAttrs<'v> {
-    #[trace(unsafe_ignore)]
+    /// The node, a value of the heap: traced, so that it lives as long as this does (a garbage
+    /// collection would otherwise free or move it).
     #[derivative(Debug = "ignore")]
-    #[allocative(skip)]
-    configured_target_node: &'v StarlarkConfiguredTargetNode,
+    configured_target_node: ValueTyped<'v, StarlarkConfiguredTargetNode>,
 }
 
 starlark::methods_static!(LAZY_ATTRS_METHODS = lazy_attrs_methods);
@@ -941,7 +941,7 @@ impl<'v> AllocValue<'v> for StarlarkLazyAttrs<'v> {
 
 impl<'v> StarlarkLazyAttrs<'v> {
     pub(crate) fn new(
-        configured_target_node: &'v StarlarkConfiguredTargetNode,
+        configured_target_node: ValueTyped<'v, StarlarkConfiguredTargetNode>,
     ) -> StarlarkLazyAttrs<'v> {
         Self {
             configured_target_node,
@@ -965,34 +965,25 @@ fn lazy_attrs_methods(builder: &mut MethodsBuilder) {
         this: &StarlarkLazyAttrs<'v>,
         attr: &str,
     ) -> starlark::Result<NoneOr<StarlarkConfiguredAttr>> {
-        Ok(
-            match this
-                .configured_target_node
-                .0
-                .get(attr, AttrInspectOptions::All)
-            {
-                Some(attr) => NoneOr::Other(StarlarkConfiguredAttr(
-                    attr.value,
-                    this.configured_target_node.0.label().pkg().dupe(),
-                )),
-                None => {
-                    // Check special attrs
-                    let special_attrs = this
-                        .configured_target_node
-                        .0
-                        .special_attrs()
-                        .collect::<BuckMutMap<_, _>>();
-                    let attr = special_attrs.get(attr);
-                    match attr {
-                        None => NoneOr::None,
-                        Some(attr) => NoneOr::Other(StarlarkConfiguredAttr(
-                            attr.clone(),
-                            this.configured_target_node.0.label().pkg().dupe(),
-                        )),
-                    }
+        let node = &this.configured_target_node.as_ref().0;
+        Ok(match node.get(attr, AttrInspectOptions::All) {
+            Some(attr) => NoneOr::Other(StarlarkConfiguredAttr(
+                attr.value,
+                node.label().pkg().dupe(),
+            )),
+            None => {
+                // Check special attrs
+                let special_attrs = node.special_attrs().collect::<BuckMutMap<_, _>>();
+                let attr = special_attrs.get(attr);
+                match attr {
+                    None => NoneOr::None,
+                    Some(attr) => NoneOr::Other(StarlarkConfiguredAttr(
+                        attr.clone(),
+                        node.label().pkg().dupe(),
+                    )),
                 }
-            },
-        )
+            }
+        })
     }
 }
 

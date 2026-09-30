@@ -317,7 +317,12 @@ Key bindings:
 
 An input is complete unless a bracket or a triple-quoted string is open, a line ends with
 `\\` or `:`, or it is a block (`def`, `for`, `if`, ...) whose last line is not empty: as in
-Python, an empty line ends a block. A command (`:...`) is always one line.";
+Python, an empty line ends a block. A command (`:...`) is always one line.
+
+The input is highlighted as it is typed (keywords, strings, numbers, comments, the command,
+and the bracket matching the one at the cursor), unless colour is off (`NO_COLOR`, `:set
+color off`). In the parentheses of a call of a function that Tab offered since the last
+input, its signature is shown under the input, the parameter at the cursor in bold.";
 
 const PATTERNS: &str = "\
 Target patterns are relative to the session's directory (shown in the prompt), as on the
