@@ -7,6 +7,7 @@
 # above-listed licenses.
 
 load("@prelude//android:android_toolchain.bzl", "AndroidPlatformInfo", "AndroidToolchainInfo")
+load("@prelude//container:toolchain.bzl", "ContainerRunToolchainInfo")
 load("@prelude//csharp:toolchain.bzl", "CSharpToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
 load("@prelude//go_bootstrap:go_bootstrap.bzl", "GoBootstrapToolchainInfo")
@@ -38,6 +39,9 @@ def _toolchain(lang: str, providers: list[typing.Any], *, default: typing.Any = 
 
 def _android_toolchain():
     return _toolchain("android", [AndroidToolchainInfo, AndroidPlatformInfo, TestListingInfo])
+
+def _container_run_toolchain():
+    return _toolchain("container_run", [ContainerRunToolchainInfo])
 
 def _csharp_toolchain():
     return _toolchain("csharp", [CSharpToolchainInfo])
@@ -117,6 +121,7 @@ def _test_toolchain():
 
 toolchains_common = struct(
     android = _android_toolchain,
+    container_run = _container_run_toolchain,
     csharp = _csharp_toolchain,
     cxx = _cxx_toolchain,
     cython = _cython_toolchain,
