@@ -237,19 +237,19 @@ impl Session {
         let prompt = format!("{}> ", ready.cwd);
 
         // Consecutive Ctrl-Cs at the prompt.
-        let mut interrupts = 0;
+        let mut interrupts: u32 = 0;
         loop {
-            if !self.ui.enter_prompt() {
+            if !self.ui.start_reading() {
                 // The session is over; the caller reports why.
                 self.outcome.lost = true;
                 return;
             }
             let line = editor.readline(&prompt);
-            self.ui.set(UiState::Idle);
+            self.ui.stop_reading();
             let line = match line {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => {
-                    interrupts += 1;
+                    interrupts = interrupts.saturating_add(1);
                     if interrupts >= 2
                         && !self
                             .output(render::print_note(self.style, "(use :q or Ctrl-D to exit)"))
@@ -408,7 +408,7 @@ impl Session {
             return Next::Stop;
         }
         let done = self.wait_for_done(id);
-        self.ui.set(UiState::Idle);
+        self.ui.set(UiState::Editor);
         let Some(done) = done else {
             self.outcome.lost = true;
             return Next::Stop;

@@ -161,12 +161,13 @@ pub(crate) enum UiEvent {
 /// What the terminal is doing, which decides what SIGINT (Ctrl-C) does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiState {
-    /// No input is running and the line editor is not reading: the session is starting, or a
-    /// script is waiting for its next input. SIGINT ends the client.
+    /// No input is running and the line editor does not own the terminal: the session is
+    /// starting, or a script is waiting for its next input. SIGINT ends the client.
     Idle,
-    /// The line editor is reading. Its raw mode turns Ctrl-C into a key, so SIGINT only comes
-    /// from elsewhere (e.g. `kill -INT`) and is ignored.
-    Prompt,
+    /// The line editor owns the terminal and no input is running: it is reading (its raw mode
+    /// turns Ctrl-C into a key, so SIGINT only comes from elsewhere, e.g. `kill -INT`) or
+    /// showing a result. SIGINT is ignored.
+    Editor,
     /// Request `id` is running. SIGINT interrupts it, warns, then ends the client.
     Busy { id: u64, presses: u32 },
 }
@@ -177,6 +178,8 @@ pub(crate) struct SharedUi(Arc<Mutex<UiInner>>);
 
 struct UiInner {
     state: UiState,
+    /// The line editor is reading a line, and only notices the end of the session after it.
+    reading: bool,
     /// The daemon call is over: the input thread must not wait for input any more.
     session_ended: bool,
 }
@@ -185,6 +188,7 @@ impl SharedUi {
     fn new() -> Self {
         SharedUi(Arc::new(Mutex::new(UiInner {
             state: UiState::Idle,
+            reading: false,
             session_ended: false,
         })))
     }
@@ -197,23 +201,29 @@ impl SharedUi {
         self.lock().state = state;
     }
 
-    /// Enters [`UiState::Prompt`], unless the session is over. Returns whether it is not (so
-    /// that the editor may read the next input).
-    pub(crate) fn enter_prompt(&self) -> bool {
+    /// The line editor starts reading a line, unless the session is over. Returns whether it
+    /// is not (so that the editor may read).
+    pub(crate) fn start_reading(&self) -> bool {
         let mut inner = self.lock();
         if inner.session_ended {
             return false;
         }
-        inner.state = UiState::Prompt;
+        inner.state = UiState::Editor;
+        inner.reading = true;
         true
     }
 
+    /// The line editor has read a line.
+    pub(crate) fn stop_reading(&self) {
+        self.lock().reading = false;
+    }
+
     /// Marks the session as over. Returns whether the line editor is reading, in which case it
-    /// only notices after its next line.
+    /// only notices after its current line.
     fn end_session(&self) -> bool {
         let mut inner = self.lock();
         inner.session_ended = true;
-        inner.state == UiState::Prompt
+        inner.reading
     }
 }
 
@@ -334,7 +344,7 @@ async fn sigint_loop(
         let mut inner = ui.lock();
         let presses = match &mut inner.state {
             UiState::Idle => return,
-            UiState::Prompt => continue,
+            UiState::Editor => continue,
             UiState::Busy { id, presses } => {
                 *presses = presses.saturating_add(1);
                 if *presses == 1
@@ -459,7 +469,7 @@ pub(crate) async fn run(
             () = sigint => None,
         }
     };
-    let at_prompt = ui.end_session();
+    let reading = ui.end_session();
     // Wakes the input thread if it is waiting for a result.
     let _ignored = handler.ui_tx.send(UiEvent::SessionEnded);
     drop(compl_rx);
@@ -482,7 +492,7 @@ pub(crate) async fn run(
         // The editor restores the terminal before it exits, which it can only do once its
         // current line is read. (Not through rustyline's `ExternalPrinter`: while one exists,
         // rustyline 18 waits on the terminal even when typed-ahead keys are buffered.)
-        if at_prompt {
+        if reading {
             let message = match shutdown.reason() {
                 Some(reason) => {
                     format!("the buck2 daemon was shut down ({reason}); press Enter to exit")
