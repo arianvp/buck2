@@ -23,10 +23,15 @@ use buck2_cli_proto::repl_notice;
 use buck2_cli_proto::repl_output;
 use buck2_repl_syntax::markdown;
 use buck2_repl_syntax::markdown::Styling;
-use buck2_repl_syntax::text::truncate_lines;
+use buck2_repl_syntax::terminal::RowCut;
+use buck2_repl_syntax::terminal::cut_to_rows;
 
-/// Most lines of a value the interactive editor shows.
-const MAX_VALUE_LINES: usize = 40;
+/// Most rows of the terminal that the echo of a value takes in the interactive editor (a long
+/// line takes the rows it wraps to).
+const MAX_VALUE_ROWS: usize = 40;
+
+/// The width of a terminal whose size is not known.
+const DEFAULT_COLUMNS: usize = 80;
 
 /// Documentation (`:doc`, `:qdoc`) is wrapped at the width of `:help`'s text.
 pub(crate) const DOC_COLUMNS: usize = crate::help::WRAP_COLUMNS;
@@ -45,8 +50,8 @@ const RESET: &str = "\x1b[0m";
 /// How results are shown.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Style {
-    /// For the interactive editor: long values are cut to [`MAX_VALUE_LINES`] lines, and slow
-    /// inputs show their duration.
+    /// For the interactive editor: long values are cut to the first [`MAX_VALUE_ROWS`] rows
+    /// that they take on the terminal, and slow inputs show their duration.
     interactive: bool,
     /// Errors and notes on stderr are coloured.
     color: bool,
@@ -193,18 +198,54 @@ fn println_stdout(line: &str) -> buck2_error::Result<()> {
 
 fn print_value(value: &ReplValue, style: Style) -> buck2_error::Result<()> {
     let text = value.text.trim_end_matches('\n');
-    let (shown, omitted) = if style.interactive {
-        truncate_lines(text, MAX_VALUE_LINES)
-    } else {
-        (text, 0)
-    };
-    println_stdout(shown.trim_end_matches('\n'))?;
-    if omitted > 0 {
-        println_stdout(&format!("… {omitted} more lines (:p _ to show all)"))?;
+    if !style.interactive {
+        println_stdout(text)?;
+        if value.truncated {
+            println_stdout(CUT_AT_64_KIB)?;
+        }
+        return Ok(());
+    }
+    let columns = terminal_columns().unwrap_or(DEFAULT_COLUMNS);
+    let cut = cut_to_rows(text, MAX_VALUE_ROWS, columns);
+    println_stdout(cut.shown.trim_end_matches('\n'))?;
+    if cut.is_cut() {
+        println_stdout(&omitted_note(&cut, value.truncated))?;
     } else if value.truncated {
-        println_stdout("… (cut at 64 KiB; :p _ to show all)")?;
+        println_stdout(CUT_AT_64_KIB)?;
     }
     Ok(())
+}
+
+/// The note after a value that the daemon cut (every echoed value is at most 64 KiB).
+const CUT_AT_64_KIB: &str = "… (cut at 64 KiB; :p _ to show all)";
+
+/// The note after the echo of a value that was cut to the rows of the terminal: what was left
+/// out, in characters of the line that was cut in the middle and in lines after it
+/// (`… 62 more lines (:p _ to show all)`). "at least" when the daemon cut the value too.
+fn omitted_note(cut: &RowCut<'_>, cut_by_daemon: bool) -> String {
+    fn count(n: usize, unit: &str) -> String {
+        if n == 1 {
+            format!("1 more {unit}")
+        } else {
+            format!("{n} more {unit}s")
+        }
+    }
+    let what = match (cut.hidden_chars, cut.hidden_lines) {
+        (0, lines) => count(lines, "line"),
+        (chars, 0) => count(chars, "character"),
+        (chars, lines) => format!("{} and {}", count(chars, "character"), count(lines, "line")),
+    };
+    let at_least = if cut_by_daemon { "at least " } else { "" };
+    format!("… {at_least}{what} (:p _ to show all)")
+}
+
+/// The width of the terminal (the controlling terminal, which the line editor and the output
+/// are on), if it is known.
+pub(crate) fn terminal_columns() -> Option<usize> {
+    match crossterm::terminal::window_size() {
+        Ok(size) if size.columns > 0 => Some(usize::from(size.columns)),
+        _ => None,
+    }
 }
 
 /// `(1.24s)` for a slow input, or `(1.24s, 0.80s waiting for the daemon)` if it waited long.
@@ -263,7 +304,35 @@ pub(crate) fn flush() -> buck2_error::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_repl_syntax::terminal::cut_to_rows;
+
     use super::*;
+
+    #[test]
+    fn test_omitted_note() {
+        let lines: String = (0..100).map(|i| format!("{i}\n")).collect();
+        let cut = cut_to_rows(&lines, MAX_VALUE_ROWS, 80);
+        assert_eq!(
+            omitted_note(&cut, false),
+            "… 60 more lines (:p _ to show all)"
+        );
+        let long = "x".repeat(10_000);
+        let cut = cut_to_rows(&long, MAX_VALUE_ROWS, 100);
+        assert_eq!(
+            omitted_note(&cut, false),
+            "… 6000 more characters (:p _ to show all)"
+        );
+        assert_eq!(
+            omitted_note(&cut, true),
+            "… at least 6000 more characters (:p _ to show all)"
+        );
+        let mixed = format!("{}\nb\nc", "y".repeat(81));
+        let cut = cut_to_rows(&mixed, 1, 80);
+        assert_eq!(
+            omitted_note(&cut, false),
+            "… 1 more character and 2 more lines (:p _ to show all)"
+        );
+    }
 
     #[test]
     fn test_doc_columns() {

@@ -187,29 +187,6 @@ pub fn starlark_string_literal(s: &str) -> String {
     out
 }
 
-/// Splits `text` after its first `max_lines` lines: returns that prefix (including the newline
-/// that ends its last line) and the number of lines left out. A final newline does not start
-/// another line.
-pub fn truncate_lines(text: &str, max_lines: usize) -> (&str, usize) {
-    let mut kept = 0;
-    for (i, _) in text.match_indices('\n') {
-        kept += 1;
-        if kept == max_lines {
-            let end = i + 1;
-            let rest = text.get(end..).unwrap_or("");
-            if rest.is_empty() {
-                return (text, 0);
-            }
-            let omitted = rest.split_terminator('\n').count();
-            return (text.get(..end).unwrap_or(text), omitted);
-        }
-    }
-    if max_lines == 0 && !text.is_empty() {
-        return ("", text.split_terminator('\n').count());
-    }
-    (text, 0)
-}
-
 /// The longest prefix of `s` that is at most `max_bytes` long and ends on a character boundary.
 pub fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -608,18 +585,6 @@ def f(ctx, targets = [], *, deps = False):
         let tokens = lex(&lit);
         assert_eq!(tokens.len(), 1);
         assert!(matches!(tokens[0].kind, TokenKind::Str(info) if info.closed));
-    }
-
-    #[test]
-    fn test_truncate_lines() {
-        assert_eq!(truncate_lines("a\nb\nc", 2), ("a\nb\n", 1));
-        assert_eq!(truncate_lines("a\nb\nc\n", 2), ("a\nb\n", 1));
-        assert_eq!(truncate_lines("a\nb\n", 2), ("a\nb\n", 0));
-        assert_eq!(truncate_lines("a\nb", 2), ("a\nb", 0));
-        assert_eq!(truncate_lines("a\nb\nc\nd", 1), ("a\n", 3));
-        assert_eq!(truncate_lines("abc", 5), ("abc", 0));
-        assert_eq!(truncate_lines("", 5), ("", 0));
-        assert_eq!(truncate_lines("a\nb", 0), ("", 2));
     }
 
     #[test]

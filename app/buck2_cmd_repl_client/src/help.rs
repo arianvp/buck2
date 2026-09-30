@@ -175,8 +175,8 @@ fn details(id: CommandId) -> &'static str {
         }
         CommandId::Print => {
             "Evaluates the expression and prints all of its value (up to 16 MiB), where the \
-             echo of an input stops after 40 lines. The value becomes `_`: `:p _` shows all of \
-             the last value."
+             echo of an input stops after the first 40 rows it takes on the terminal. The value \
+             becomes `_`: `:p _` shows all of the last value."
         }
         CommandId::Json => {
             "Evaluates the expression and prints it as pretty JSON, or an error if it (or a \

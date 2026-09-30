@@ -1624,6 +1624,7 @@ dependencies = [
  "buck2_util",
  "buck2_wrapper_common",
  "clap",
+ "crossterm",
  "dirs",
  "dupe",
  "futures 0.3.34",

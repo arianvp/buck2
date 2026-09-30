@@ -119,8 +119,10 @@ unless a line ends with `\` (the lines are joined).
 
 ### Long values, errors and interrupting
 
-- At the prompt, a value is cut after 40 lines (`… N more lines (:p _ to show all)`);
-  `:print _` prints all of it (up to 16 MiB). Every echoed value is cut at 64 KiB, a
+- At the prompt, a value is cut after the first 40 rows it takes on the terminal
+  (a long line takes the rows it wraps to): `… N more lines (:p _ to show all)`, or
+  `… N more characters (:p _ to show all)` (and lines) when a line was cut in the
+  middle; `:print _` prints all of it (up to 16 MiB). Every echoed value is cut at 64 KiB, a
   value nested too deeply to format safely is shown as
   `<value nested too deeply to display>`, and an int of more than 262144 bits (about
   79000 digits) as `<int of N bits: too large to display>` (`str(x)` still converts
