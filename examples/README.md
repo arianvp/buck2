@@ -25,3 +25,9 @@ Examples testing the various toolchains included in the prelude.
 ## bootstrap
 
 A sample project that demonstrates configuration of a bootstrap toolchain.
+
+## claude_code_hooks
+
+Claude Code hooks written as ordinary Buck2 targets and installed with
+`buck2 run`, using content-based paths so a running hook never blocks on the
+daemon or sees a half-rebuilt binary.
