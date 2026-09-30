@@ -1821,6 +1821,48 @@ mod tests {
         Ok(())
     }
 
+    /// A position past the end of its line, by any amount (the client chooses it), is the end
+    /// of the line: no overflow of the position in the file (which panics with overflow checks
+    /// on, and in the buck2 daemon aborts it).
+    #[test]
+    fn positions_past_the_end_of_a_line() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let uri = temp_file_uri("file.star");
+        let mut server = TestServer::new()?;
+        server.open_file(
+            uri.clone(),
+            "y = 1\ndef f(a):\n    return a\nprint(f(y))\n".to_owned(),
+        )?;
+        for line in 0..5 {
+            for character in [u32::MAX, u32::MAX - 3, 1 << 31, 1000] {
+                let request = hover_request(&mut server, uri.clone(), line, character);
+                let id = server.send_request(request)?;
+                server.get_response::<Hover>(id)?;
+
+                let request = goto_definition_request(&mut server, uri.clone(), line, character);
+                let id = server.send_request(request)?;
+                server.get_response::<GotoDefinitionResponse>(id)?;
+
+                let request = server.new_request::<lsp_types::request::Completion>(
+                    lsp_types::CompletionParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: Position { line, character },
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                        context: None,
+                    },
+                );
+                let id = server.send_request(request)?;
+                server.get_response::<lsp_types::CompletionResponse>(id)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn sends_empty_goto_definition_on_nonexistent_file() -> anyhow::Result<()> {
         if is_wasm() {
