@@ -97,6 +97,9 @@ const MAX_LOCAL_CANDIDATES: usize = 500;
 /// The extensions of the modules `load` and `:load` load.
 const LOAD_EXTENSIONS: &[&str] = &[".bzl", ".bxl"];
 
+/// buck2's output directory, not completed as a path.
+const BUCK_OUT: &str = "buck-out";
+
 /// The extension of the files `:bxl` runs functions of.
 const BXL_EXTENSIONS: &[&str] = &[".bxl"];
 
@@ -788,7 +791,8 @@ fn paths(cwd: &Path, word: &str, extensions: &[&str]) -> Vec<ReplCandidate> {
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if name.starts_with('.') && !fragment.starts_with('.') {
+        // Hidden entries, and buck2's output directory (which buck2 ignores).
+        if (name.starts_with('.') && !fragment.starts_with('.')) || name == BUCK_OUT {
             continue;
         }
         let Some(tier) = match_tier(fragment, &name) else {

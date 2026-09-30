@@ -198,7 +198,8 @@ impl Session {
         self.last_token.take()
     }
 
-    /// Completes a name or an attribute. Runs no code (INV-1) and uses no DICE.
+    /// Completes a name, an attribute or a keyword argument. Runs no code (INV-1) and uses no
+    /// DICE.
     pub(crate) fn complete(
         &mut self,
         env: &BuckStarlarkModule<'_>,

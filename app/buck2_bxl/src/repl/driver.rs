@@ -106,8 +106,9 @@ const DEFAULT_HEAP_LIMIT: u64 = 4 << 30;
 /// Longest excerpt of an input kept to describe its request to other commands.
 const MAX_TITLE_BYTES: usize = 256;
 
-/// Longest a completion from DICE (of a target pattern or a BXL function) may take. The client stops waiting sooner; the work goes on
-/// meanwhile (unless an input cancels it), so that the next completion is fast.
+/// Longest a completion from DICE (of a target pattern, a module to load or its symbols, or a
+/// BXL function) may take. The client stops waiting sooner; the work goes on meanwhile (unless
+/// an input cancels it), so that the next completion is fast.
 const DICE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A request, classified.
@@ -125,7 +126,8 @@ enum Work {
     Reset {
         id: u64,
     },
-    /// Completion of a name or an attribute, by the session thread (no DICE).
+    /// Completion of a name, an attribute or a keyword argument, by the session thread (no
+    /// DICE).
     CompleteStarlark {
         id: u64,
         req: ReplComplete,
@@ -255,10 +257,10 @@ enum Event {
     Completed(u64, Option<ReplCompletions>),
 }
 
-/// A completion of a name or an attribute that the session thread is answering. The driver
-/// does not wait for it: it goes on reading requests and running the request in flight (a
-/// completion from DICE, whose transaction must give way to other commands), and sends the
-/// answer when it comes.
+/// A completion of a name, an attribute or a keyword argument that the session thread is
+/// answering. The driver does not wait for it: it goes on reading requests and running the
+/// request in flight (a completion from DICE, whose transaction must give way to other
+/// commands), and sends the answer when it comes.
 struct ThreadCompletion {
     id: u64,
     answer: tokio::sync::oneshot::Receiver<ReplCompletions>,
@@ -290,8 +292,8 @@ pub(crate) struct Driver<'a> {
     /// An input that arrived while a completion was in flight, which it cancelled: it runs
     /// next (Enter beats Tab).
     queued: Option<ReplRequest>,
-    /// The completion of a name or an attribute the session thread is answering, if any: at
-    /// most one at a time.
+    /// The completion of a name, an attribute or a keyword argument the session thread is
+    /// answering, if any: at most one at a time.
     completing: Option<ThreadCompletion>,
 }
 
@@ -440,9 +442,9 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// Sends the completion `id` of a name or an attribute to the session thread, unless it is
-    /// answering one already (then the answer is `BUSY`). The driver does not wait for the
-    /// answer.
+    /// Sends the completion `id` of a name, an attribute or a keyword argument to the session
+    /// thread, unless it is answering one already (then the answer is `BUSY`). The driver does
+    /// not wait for the answer.
     fn start_thread_completion(&mut self, thread: &ReplThread, id: u64, req: ReplComplete) {
         if self.completing.is_some() {
             self.emitter.emit(

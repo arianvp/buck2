@@ -281,11 +281,15 @@ async fn complete_subtargets(
     let Some((base, name_prefix)) = prefix.rsplit_once('[') else {
         return Ok(candidates);
     };
-    // `//x:y[a][` names the subtarget `a`: every `[` before the last one is closed.
+    // `//x:y[a][` names the subtarget `a`: every `[` before the last one is closed. The base
+    // names one target, not a package (`//x:`) or a recursive pattern.
+    let target = base.split('[').next().unwrap_or(base);
     if name_prefix.contains(']')
         || base.contains(char::is_whitespace)
         || base.matches('[').count() != base.matches(']').count()
-        || !base.contains(':')
+        || !target.contains(':')
+        || target.ends_with(':')
+        || target.ends_with("...")
     {
         return Ok(candidates);
     }
@@ -295,10 +299,10 @@ async fn complete_subtargets(
         sctx.working_dir(),
     )
     .await?;
-    let config = TargetResolutionConfig::from_args(dc, target_cfg, sctx, &[]).await?;
-    let Some(label) = labels.first() else {
+    let [label] = labels.as_slice() else {
         return Ok(candidates);
     };
+    let config = TargetResolutionConfig::from_args(dc, target_cfg, sctx, &[]).await?;
     let configured = config
         .get_configured_provider_label_with_modifiers(dc, label)
         .await?;

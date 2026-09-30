@@ -49,8 +49,9 @@ pub enum Step<'a> {
 pub enum SiteKind<'a> {
     /// A meta-command name. The prefix includes the colon (`:bu`).
     Command { prefix: &'a str },
-    /// A word of a meta-command's argument: a target pattern (`:build`, `:run`, `:providers`,
-    /// or a pattern in a query), a path (`:load`), a BXL function (`:bxl`) or a help topic.
+    /// A word of a meta-command's argument: a target pattern (`:build`, `:run`, `:providers`),
+    /// a module to load (`:load`), a BXL function (`:bxl`) or a help topic. (The words of a
+    /// query are [`SiteKind::Query`], the symbols of `:load` [`SiteKind::LoadSymbol`].)
     CommandArg {
         command: CommandId,
         arg: ArgKind,

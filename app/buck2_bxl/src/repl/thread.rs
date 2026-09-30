@@ -44,7 +44,7 @@ pub(crate) struct SessionConfig {
 
 pub(crate) enum Job {
     Eval(EvalJob),
-    /// Complete a name or an attribute. Runs no code and uses no DICE.
+    /// Complete a name, an attribute or a keyword argument. Runs no code and uses no DICE.
     Complete(CompleteJob),
     /// Drops the session's module and starts a new session (`:reset`). Acknowledged once the
     /// old module is gone.
@@ -96,7 +96,7 @@ pub(crate) struct EvalWork {
     pub(crate) span: Option<SpanId>,
 }
 
-/// Complete a name or an attribute from the session's module.
+/// Complete a name, an attribute or a keyword argument from the session's module.
 pub(crate) struct CompleteJob {
     pub(crate) req: ReplComplete,
     pub(crate) reply: tokio::sync::oneshot::Sender<ReplCompletions>,
@@ -183,9 +183,10 @@ impl ReplThread {
         ack_rx.await.ok()
     }
 
-    /// Starts the completion of a name or an attribute, and returns where its answer comes; the
-    /// receiver fails if the thread exits first. `None` if the thread has exited. Jobs run in
-    /// the order they are sent, so a job sent after this one starts once it is answered.
+    /// Starts the completion of a name, an attribute or a keyword argument, and returns where
+    /// its answer comes; the receiver fails if the thread exits first. `None` if the thread has
+    /// exited. Jobs run in the order they are sent, so a job sent after this one starts once it
+    /// is answered.
     pub(crate) fn start_complete(
         &self,
         req: ReplComplete,
