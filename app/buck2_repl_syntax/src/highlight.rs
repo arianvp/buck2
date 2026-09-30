@@ -343,6 +343,21 @@ fn matching_bracket(brackets: &[BracketAt], cursor: usize) -> Option<usize> {
     (partner.bracket == at.bracket).then_some(partner.pos)
 }
 
+/// Whether `new` differs from `old` only in that the last span (of the same class, from the same
+/// start) got longer, up to `end`: what typing at the end of a string or a comment does.
+pub fn only_last_span_grew(old: &[Span], new: &[Span], end: usize) -> bool {
+    match (old.split_last(), new.split_last()) {
+        (Some((old_last, old_rest)), Some((new_last, new_rest))) => {
+            old_rest == new_rest
+                && old_last.start == new_last.start
+                && old_last.class == new_last.class
+                && old_last.end < new_last.end
+                && new_last.end == end
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +647,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_only_last_span_grew() {
+        let before = spans("x = \"ab", None);
+        let after = spans("x = \"abc", None);
+        assert!(only_last_span_grew(&before, &after, 8));
+        // Nothing grew, or not to the end.
+        assert!(!only_last_span_grew(&after, &after, 8));
+        assert!(!only_last_span_grew(&before, &after, 9));
+        // A new span.
+        let closed = spans("x = \"abc\" + 1", None);
+        assert!(!only_last_span_grew(&after, &closed, 14));
+        // A comment that grows.
+        assert!(only_last_span_grew(
+            &spans("x # a", None),
+            &spans("x # ab", None),
+            6
+        ));
+        assert!(!only_last_span_grew(&[], &[], 0));
     }
 }

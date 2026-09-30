@@ -18,6 +18,7 @@
 //! it.
 
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -112,8 +113,22 @@ pub(crate) fn run_program(
         }
     };
     let (how, rendered) = describe(status);
-    render::print_note(style, &format!("[{how} in {:.2}s]", elapsed.as_secs_f64()))?;
+    let newline = after_echoed_interrupt(&rendered);
+    render::print_note(
+        style,
+        &format!("{newline}[{how} in {:.2}s]", elapsed.as_secs_f64()),
+    )?;
     Ok(rendered)
+}
+
+/// A newline to end the line of the `^C` that the terminal echoed when Ctrl-C interrupted a
+/// program that has it (which a note would be written after).
+fn after_echoed_interrupt(rendered: &Rendered) -> &'static str {
+    if matches!(rendered, Rendered::Interrupted) && std::io::stderr().is_terminal() {
+        "\n"
+    } else {
+        ""
+    }
 }
 
 /// `:!<command>`: runs the command with the user's shell (`$SHELL -c`, or `/bin/sh`; `cmd /C`
@@ -144,7 +159,8 @@ pub(crate) fn run_shell(
         return Ok(Rendered::Ok);
     }
     let (how, rendered) = describe(status);
-    render::print_note(style, &format!("[{how}]"))?;
+    let newline = after_echoed_interrupt(&rendered);
+    render::print_note(style, &format!("{newline}[{how}]"))?;
     Ok(rendered)
 }
 

@@ -117,7 +117,7 @@ pub(crate) fn render_done(done: &ReplDone, style: Style) -> buck2_error::Result<
         }
         Some(repl_done::Outcome::Run(run)) => {
             if run.print_only {
-                buck2_client_ctx::println!("{}", command_line(run))?;
+                println_stdout(&command_line(run))?;
                 Rendered::Ok
             } else {
                 Rendered::Run(run.clone())
@@ -147,9 +147,10 @@ pub(crate) fn outcome(done: &ReplDone) -> Rendered {
     }
 }
 
-/// The note shown when sources changed since the previous request.
-pub(crate) const SOURCES_CHANGED: &str =
-    "note: sources changed since the previous input; values computed earlier may be stale";
+/// The note shown when the daemon's state changed since the previous request: files changed,
+/// or another command ran with other settings (`-c`, ...), which the daemon does not tell apart.
+pub(crate) const SOURCES_CHANGED: &str = "note: files or settings changed since the previous \
+     input (here or for another buck2 command); values computed earlier may be stale";
 
 /// The note that sources changed since the previous request, if they did.
 fn print_sources_changed(done: &ReplDone, style: Style) -> buck2_error::Result<()> {
@@ -171,7 +172,17 @@ pub(crate) fn timing(total: Duration, done: &ReplDone) -> String {
 
 /// Prints `text` on stdout, on its own lines.
 pub(crate) fn print_text(text: &str) -> buck2_error::Result<()> {
-    buck2_client_ctx::println!("{}", text.trim_end_matches('\n'))
+    println_stdout(text.trim_end_matches('\n'))
+}
+
+/// Writes `line` and a newline on stdout in one write, so that a failed write (stdout is a
+/// closed pipe) leaves nothing in the buffer of stdout, whose last flush would fail again (and
+/// change the exit code).
+fn println_stdout(line: &str) -> buck2_error::Result<()> {
+    let mut text = String::with_capacity(line.len() + 1);
+    text.push_str(line);
+    text.push('\n');
+    buck2_client_ctx::stdio::print_bytes(text.as_bytes())
 }
 
 fn print_value(value: &ReplValue, style: Style) -> buck2_error::Result<()> {
@@ -181,11 +192,11 @@ fn print_value(value: &ReplValue, style: Style) -> buck2_error::Result<()> {
     } else {
         (text, 0)
     };
-    buck2_client_ctx::println!("{}", shown.trim_end_matches('\n'))?;
+    println_stdout(shown.trim_end_matches('\n'))?;
     if omitted > 0 {
-        buck2_client_ctx::println!("… {} more lines (:p _ to show all)", omitted)?;
+        println_stdout(&format!("… {omitted} more lines (:p _ to show all)"))?;
     } else if value.truncated {
-        buck2_client_ctx::println!("... (value truncated; `:print _` shows all of it)")?;
+        println_stdout("… (cut at 64 KiB; :p _ to show all)")?;
     }
     Ok(())
 }

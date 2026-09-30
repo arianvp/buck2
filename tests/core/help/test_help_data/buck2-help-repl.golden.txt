@@ -34,38 +34,11 @@ Options:
 
           [default: 4096]
 
-      --build-report <PATH>
-          Print a build report
-
-          `--build-report=-` will print the build report to stdout `--build-report=<filepath>` will
-          write the build report to the file
-
       --enable-optional-validations <VALIDATION_NAMES>
           Comma separated list of validation names to run that are marked optional.
 
           By default, validations marked as optional are skipped. This option overrides the
           behaviour and executes those validations.
-
-      --build-report-options <BUILD_REPORT_OPTIONS>
-          Comma separated list of build report options.
-
-          The following options are supported:
-
-          `fill-out-failures`: fill out failures the same way Buck1 would.
-
-          `package-project-relative-paths`: emit the project-relative path of packages for the
-          targets that were built.
-
-          `exclude-action-error-diagnostics`: exclude error_diagnostics field from action errors in
-          the build report.
-
-          `truncate-error-content`: truncate error content in the build report to reduce size.
-
-      --streaming-build-report <PATH>
-          Stream intermediary build reports to a file in json lines format.
-
-          Each output materialization will trigger a new build report which will be written to the
-          file as a single line json.
 
   -j, --num-threads <THREADS>
           Number of threads to use during execution (default is # cores)

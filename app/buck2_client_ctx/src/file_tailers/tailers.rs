@@ -49,6 +49,18 @@ impl FileTailers {
         }
     }
 
+    /// Copies what the daemon wrote to its stdout and stderr so far into the stream now (rather
+    /// than at the tailers' next check), and waits for it, at most `timeout`.
+    pub async fn sync(&self, timeout: std::time::Duration) {
+        let acks: Vec<_> = [&self._stdout_tailer, &self._stderr_tailer]
+            .into_iter()
+            .flatten()
+            .map(|tailer| tailer.sync())
+            .collect();
+        // An answer that does not come in time (or at all) is not waited for.
+        let _ignored = tokio::time::timeout(timeout, futures::future::join_all(acks)).await;
+    }
+
     pub async fn recv(&mut self) -> Option<FileTailerEvent> {
         if let Some(stream) = self.stream.as_mut() {
             stream.recv().await

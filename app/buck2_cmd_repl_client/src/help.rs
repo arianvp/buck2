@@ -69,18 +69,26 @@ fn commands() -> String {
          the value of an input is printed and becomes `_`.\n\n\
          Commands (a unique prefix of a name works too, e.g. `:prov` for `:providers`):\n",
     );
+    // The summaries are wrapped with a hanging indent.
+    let indent = 2 + usage_width + 2 + alias_width + 2;
+    let summary_width = WRAP_COLUMNS.saturating_sub(indent).max(MIN_SUMMARY_COLUMNS);
     for c in &listed {
+        let summary = wrap_at(c.summary, summary_width);
+        let mut lines = summary.lines();
         // Writing to a `String` cannot fail.
         let _ignored = writeln!(
             out,
             "  {:<usage_width$}  {:<alias_width$}  {}",
             c.usage,
             aliases(c),
-            c.summary
+            lines.next().unwrap_or("")
         );
+        for line in lines {
+            let _ignored = writeln!(out, "{:indent$}{line}", "");
+        }
     }
     out.push_str(
-        "\n`:help <command>` for details, `:help keys` for the key bindings, \
+        "\n`:help <command>` for details, `:help keys` for the key bindings,\n\
          `:help patterns` for target patterns.",
     );
     out
@@ -107,8 +115,11 @@ fn command(spec: &CommandSpec) -> String {
     out
 }
 
-/// Width of the paragraphs of help on a command.
+/// Width of the paragraphs of help on a command, and of the table of commands.
 const WRAP_COLUMNS: usize = 88;
+
+/// The summaries in the table of commands are at least this wide.
+const MIN_SUMMARY_COLUMNS: usize = 36;
 
 /// Wraps the lines of `text` at [`WRAP_COLUMNS`], at spaces.
 fn wrap(text: &str) -> String {
@@ -149,9 +160,11 @@ fn details(id: CommandId) -> &'static str {
         }
         CommandId::Quit => "Ends the session, like Ctrl-D on an empty line.",
         CommandId::Time => {
-            "Runs the input (Starlark or a command), then prints how long it took: in total, \
-             waiting for the daemon (for example while another buck2 command holds it), and \
-             evaluating.\n\nExample: :time :cq deps(//...)"
+            "Runs the input (Starlark or a command), then prints how long it took. For an input \
+             the daemon runs: in total, waiting for the daemon (for example while another buck2 \
+             command holds it), and evaluating (for `:run`, the build, not the program). For a \
+             command the client runs alone (`:!`, `:edit`, `:help`, ...): in total.\n\n\
+             Example: :time :cq deps(//...)"
         }
         CommandId::Type => {
             "Evaluates the expression and prints its type as the type checker sees it (for \
@@ -175,9 +188,9 @@ fn details(id: CommandId) -> &'static str {
         CommandId::Load => {
             "With symbols, loads them from the module: `:load //pkg:defs.bzl f g` is \
              `load(\"//pkg:defs.bzl\", \"f\", \"g\")`. Without, imports every public symbol of \
-             the module.\n\nThe module is a label (`//pkg:defs.bzl`, `cell//pkg:x.bxl`, \
+             the module.\n\nThe module is a label (`//pkg:defs.bzl`, `@cell//pkg:x.bxl`, \
              `:defs.bzl`) or a path relative to the session's directory (`defs.bzl`, \
-             `sub/x.bxl`). `:reload` loads the modules again."
+             `sub/x.bxl`, `../x.bzl`). `:reload` loads the modules again."
         }
         CommandId::Reload => {
             "Loads every module loaded so far (by `load()` or `:load`) again, in a new \
@@ -237,7 +250,7 @@ fn details(id: CommandId) -> &'static str {
             "Shows what the target graph says about a target (relative to the session's \
              directory, like `:lib`): its label, its rule (the `.bzl` file and name of the \
              rule), its build file and the line that defines it (as recorded with \
-             `--target-call-stacks`, else the line with its `name = \"...\"`), the attributes \
+             `--stack`, else the line with its `name = \"...\"`), the attributes \
              set in the build file, and its deps. No analysis runs."
         }
         CommandId::Set => {
@@ -304,20 +317,23 @@ Key bindings:
                         targets (after :cquery, ... and in `ctx.cquery().eval(\"`),
                         modules and symbols to load (`load(\"//pkg:`, :load), the
                         files of :bxl and the functions of a file (`:bxl x.bxl:`).
-                        Words that start the same are offered first, then words that
-                        start the same ignoring case, then words with the letters typed
-                        in order (`ctx.cfgt` completes `configured_targets(`)
+                        Words that start with what is typed are offered; if there are
+                        none, words that do ignoring case; if there are still none,
+                        words with its letters in order (`ctx.cfgt` completes
+                        `configured_targets(`)
   Ctrl-C                Clear the input; while an input runs, interrupt it (a third
                         press ends the session)
   Ctrl-D                End the session (on an empty line)
   Up, Down              Previous and next input in the history
   Ctrl-R                Search the history
-  Right, End            Accept the suggestion from the history (shown dimmed)
+  Right, End, Ctrl-E    Accept the suggestion from the history (shown dimmed after the
+                        input)
   Ctrl-L                Clear the screen
 
 An input is complete unless a bracket or a triple-quoted string is open, a line ends with
 `\\` or `:`, or it is a block (`def`, `for`, `if`, ...) whose last line is not empty: as in
-Python, an empty line ends a block. A command (`:...`) is always one line.
+Python, an empty line ends a block. A command (`:...`) is one line, unless a line ends with
+`\\` (the lines are joined).
 
 The input is highlighted as it is typed (keywords, strings, numbers, comments, the command,
 and the bracket matching the one at the cursor), unless colour is off (`NO_COLOR`, `:set
@@ -335,11 +351,13 @@ buck2 command line:
   //pkg/...        every target in `pkg` and the packages below it
   ...              every target at or below the session's directory
 
-This holds for the commands that take targets or queries (:providers, :cquery, :uquery,
-:aquery) and for everything `ctx` resolves: `ctx.configured_targets(\":lib\")`, patterns
-and file names in `ctx.cquery().eval(...)`, and so on (`buck2 bxl` resolves these
-against the cell root). A relative `load()` is relative to the session's directory, as
-if the session were a .bxl file there.";
+This holds for every command that takes targets, packages, queries or modules (:build,
+:run, :info, :ls, :providers, :cquery, :uquery, :aquery, :edit, :load, :bxl) and for
+everything `ctx` resolves: `ctx.configured_targets(\":lib\")`, patterns and file names in
+`ctx.cquery().eval(...)`, `ctx.uquery().owner(\"main.cpp\")`, and so on (`buck2 bxl`
+resolves these against the cell root). A relative `load()` is relative to the session's
+directory, as if the session were a .bxl file there. `ctx.fs` takes paths relative to the
+project root, as in `buck2 bxl`.";
 
 #[cfg(test)]
 mod tests {

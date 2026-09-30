@@ -209,6 +209,11 @@ pub struct CommonBuildOptions {
 }
 
 impl CommonBuildOptions {
+    /// Whether a build report is asked for (`--build-report`, `--streaming-build-report`).
+    pub fn build_report_requested(&self) -> bool {
+        self.build_report.is_some() || self.streaming_build_report.is_some()
+    }
+
     fn build_report(&self) -> (bool, String) {
         match &self.build_report {
             None => (false, "".to_owned()),

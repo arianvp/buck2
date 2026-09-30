@@ -23,6 +23,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
@@ -82,6 +83,10 @@ const MAX_HISTORY: usize = 10_000;
 
 /// What Tab inserts at the start of a line.
 const INDENT: &str = "    ";
+
+/// An input longer than this (in bytes) is not shown again when typing at its end only makes
+/// its last highlighted part longer (see `ReplHelper::highlight_char`).
+const LONG_INPUT: usize = 512;
 
 /// Where the history is kept: `BUCK2_REPL_HISTORY` (empty for none), otherwise
 /// `~/.buck/repl_history`. `None` with `--no-history`.
@@ -264,12 +269,27 @@ impl Highlighter for ReplHelper {
     /// bracket is shown (so that it is taken away when the input is shown for the last time).
     /// Otherwise rustyline writes a character typed (or erases one) at the end as it is, which
     /// is right only if it is not highlighted and nothing else changes.
+    ///
+    /// Typing at the end of a long input inside a string or a comment only makes its last part
+    /// longer: that is not shown again (the characters show unstyled until the next repaint), as
+    /// repainting the whole input for each character would write output that grows with the
+    /// square of its length (a paste into a terminal without bracketed paste).
     fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
         let brackets = kind != CmdKind::ForcedRefresh;
         self.syntax.brackets.set(brackets);
         let spans = highlight::spans(line, brackets.then_some(pos));
-        spans.iter().any(|s| s.class == Class::MatchingBracket)
-            || *self.syntax.shown.borrow() != spans
+        if spans.iter().any(|s| s.class == Class::MatchingBracket) {
+            return true;
+        }
+        let shown = self.syntax.shown.borrow();
+        if *shown == spans {
+            return false;
+        }
+        let growing = kind == CmdKind::Other
+            && line.len() > LONG_INPUT
+            && pos == line.len()
+            && highlight::only_last_span_grew(&shown, &spans, pos);
+        !growing
     }
 }
 
@@ -299,8 +319,47 @@ impl ConditionalEventHandler for TabIndent {
         if before.get(line_start..)?.chars().all(char::is_whitespace) {
             Some(Cmd::Insert(n, INDENT.to_owned()))
         } else {
+            erase_signature_hint(ctx);
             None
         }
+    }
+}
+
+/// Erases the signature hint shown under the input before Tab completes: rustyline lists the
+/// candidates (or asks whether to) on the rows under the input without erasing them, so the text
+/// of the hint would be left between the candidates. Only when the cursor is at the end of the
+/// input, so that it is on the input's last row and the hint is on the rows below it. The next
+/// refresh of the input shows the hint again.
+fn erase_signature_hint(ctx: &EventContext<'_>) {
+    // A signature hint inserts nothing: rustyline gives out only the text a hint inserts.
+    let signature = ctx.has_hint() && ctx.hint_text().is_none();
+    if !signature || ctx.pos() != ctx.line().len() {
+        return;
+    }
+    // Save the cursor, erase from the start of the next row to the end of the screen, put the
+    // cursor back. (The terminal is in raw mode: `\n` alone does not return the carriage.)
+    let mut stdout = std::io::stdout().lock();
+    let _ignored = stdout
+        .write_all(b"\x1b7\r\n\x1b[J\x1b8")
+        .and_then(|()| stdout.flush());
+}
+
+/// End and Ctrl-E insert the history hint shown after the input (fish-style), as → does
+/// (rustyline binds only →), when the cursor is at the end of the input; otherwise they move
+/// the cursor as usual.
+struct AcceptHistoryHint;
+
+impl ConditionalEventHandler for AcceptHistoryHint {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        // Only a history hint inserts text (rustyline gives out only that text).
+        let history = ctx.hint_text().is_some_and(|hint| !hint.is_empty());
+        (history && ctx.pos() == ctx.line().len()).then_some(Cmd::CompleteHint)
     }
 }
 
@@ -347,7 +406,7 @@ impl Session {
             "buck2 repl · {} · ctx is a bxl.Context · :help for commands · Ctrl-D to exit",
             ready.cwd
         );
-        let printed = buck2_client_ctx::println!("{}", banner).and_then(|()| render::flush());
+        let printed = render::print_text(&banner).and_then(|()| render::flush());
         if !self.inputs.output(printed) {
             return;
         }
@@ -371,6 +430,8 @@ impl Session {
 
         // Consecutive Ctrl-Cs at the prompt.
         let mut interrupts: u32 = 0;
+        // Input that is not UTF-8 was ignored since the last line read.
+        let mut not_utf8 = false;
         loop {
             if !self.inputs.ui.start_reading() {
                 // The session is over; the caller reports why.
@@ -399,6 +460,22 @@ impl Session {
                     continue;
                 }
                 Err(ReadlineError::Eof) => return,
+                // A byte that is not UTF-8 (an 8-bit Meta key, a paste of Latin-1 text): the
+                // line so far is lost, the session is not (the error needs a byte of input, so
+                // this cannot spin).
+                Err(ReadlineError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    if !not_utf8 {
+                        not_utf8 = true;
+                        let printed = render::print_note(
+                            self.inputs.style(),
+                            "warning: ignored input that is not UTF-8 (and the line typed)",
+                        );
+                        if !self.inputs.output(printed) {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let printed = render::print_error(
                         self.inputs.style(),
@@ -410,6 +487,7 @@ impl Session {
                 }
             };
             interrupts = 0;
+            not_utf8 = false;
             self.save_history(&mut editor);
             if line.trim().is_empty() {
                 continue;
@@ -427,7 +505,6 @@ impl Session {
             .completion_show_all_if_ambiguous(true)
             .bracketed_paste(true)
             .auto_add_history(true)
-            .history_ignore_space(true)
             .max_history_size(MAX_HISTORY)?
             .build();
         let mut editor = Editor::with_config(config)?;
@@ -450,6 +527,9 @@ impl Session {
             KeyEvent(KeyCode::Tab, Modifiers::NONE),
             EventHandler::Conditional(Box::new(TabIndent)),
         );
+        for key in [KeyEvent(KeyCode::End, Modifiers::NONE), KeyEvent::ctrl('E')] {
+            editor.bind_sequence(key, EventHandler::Conditional(Box::new(AcceptHistoryHint)));
+        }
         if let Some(path) = &self.history {
             match editor.load_history(path) {
                 Ok(()) => {}

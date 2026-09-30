@@ -378,10 +378,21 @@ impl State {
         let Some((console, _)) = self.console() else {
             return Ok(());
         };
+        // The messages of the session's inputs come before their results: held ones were logged
+        // between inputs, by the daemon for any of its commands.
+        let mut labelled = false;
         for item in items {
             match item {
                 HeldItem::Events(events) => console.handle_events(&events).await?,
-                HeldItem::Stderr(text) => console.handle_tailer_stderr(&text).await?,
+                HeldItem::Stderr(text) => {
+                    if !labelled {
+                        labelled = true;
+                        buck2_client_ctx::eprintln!(
+                            "note: logged by the daemon (for any command) since the previous input:"
+                        )?;
+                    }
+                    console.handle_tailer_stderr(&text).await?
+                }
             }
         }
         Ok(())

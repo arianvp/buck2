@@ -539,12 +539,17 @@ impl Inputs {
                     let timed = command.arg.into_owned();
                     input = timed;
                 }
-                // Nothing to time: handled here (`:set` of the client's settings too).
+                // Handled here (`:set` of the client's settings too): timed here, as a whole.
                 Ok(Some(command))
                     if command.spec.handler == Handler::Client
                         || command.spec.id == CommandId::Set =>
                 {
-                    return self.eval_input(input);
+                    let start = Instant::now();
+                    if let Next::Stop = self.eval_input(input) {
+                        return Next::Stop;
+                    }
+                    let total = Instant::now() - start;
+                    return self.note(&format!("time: {:.3}s total", total.as_secs_f64()));
                 }
                 Err(_) => return self.eval_input(input),
                 Ok(_) => break,
@@ -729,12 +734,26 @@ impl Inputs {
         };
         match args.key {
             None => {
-                // The daemon's settings, then the client's.
-                if let Next::Stop = self.send(input.to_owned(), input) {
+                // The daemon's settings, then the client's, then how long it took (with
+                // `:set timing on`).
+                let Some((done, total)) = self.request(input.to_owned(), Some(input)) else {
+                    return Next::Stop;
+                };
+                let timing = std::mem::replace(&mut self.settings.timing, Switch::Off);
+                let next = self.finish(&done, total, false);
+                self.settings.timing = timing;
+                if let Next::Stop = next {
                     return Next::Stop;
                 }
                 let text = self.settings.show(None, &self.completer);
-                self.print(&text)
+                if let Next::Stop = self.print(&text) {
+                    return Next::Stop;
+                }
+                if self.settings.timing == Switch::On {
+                    self.note(&render::timing(total, &done))
+                } else {
+                    Next::Continue
+                }
             }
             Some(spec) if spec.side == SettingSide::Server => self.send(input.to_owned(), input),
             Some(spec) => match args.value {
@@ -950,7 +969,8 @@ fn is_module(path: &Path) -> bool {
 }
 
 /// A new file for the scratch buffer of `:edit`, in the temporary directory (never an existing
-/// one, so it is not a link planted there).
+/// one, so it is not a link planted there), that only the user can read (the directory is
+/// shared).
 fn scratch_file() -> std::io::Result<(PathBuf, std::fs::File)> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -961,11 +981,11 @@ fn scratch_file() -> std::io::Result<(PathBuf, std::fs::File)> {
             "buck2-repl-{}-{nanos}-{attempt}.bxl",
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(e) => last_error = Some(e),
         }

@@ -360,6 +360,12 @@ struct ReplHandler {
 impl PartialResultHandler for ReplHandler {
     type PartialResult = ReplMessage;
 
+    /// What the daemon logged while an input ran (e.g. the warning of a query that found
+    /// nothing) is shown before its result, not with a later input.
+    fn sync_daemon_stderr_before(&self, message: &ReplMessage) -> bool {
+        matches!(message.message, Some(repl_message::Message::Done(_)))
+    }
+
     async fn handle_partial_result(
         &mut self,
         _ctx: PartialResultCtx<'_>,
@@ -442,12 +448,21 @@ async fn sigint_loop(
             2 => {
                 let _ignored = console
                     .message(&format!(
-                        "{prefix}^C still cancelling — the daemon may be waiting for another \
-                         buck2 command; ^C again to quit"
+                        "{prefix}^C still cancelling — the input may be waiting for another buck2 \
+                         command, or running an operation that cannot be interrupted (`buck2 \
+                         kill` stops it); ^C again to quit"
                     ))
                     .await;
             }
-            _ => return,
+            _ => {
+                let _ignored = console
+                    .message(&format!(
+                        "{prefix}^C quitting — an input that was not cancelled goes on in the \
+                         daemon until it ends; `buck2 kill` stops it"
+                    ))
+                    .await;
+                return;
+            }
         }
     }
 }

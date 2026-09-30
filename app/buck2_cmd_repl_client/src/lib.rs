@@ -48,6 +48,10 @@ mod settings;
 /// builds and binaries.
 #[derive(Debug, clap::Parser)]
 #[clap(name = "repl")]
+// The session writes no build report: its builds are the inputs'.
+#[clap(mut_arg("build_report", |arg| arg.hide(true)))]
+#[clap(mut_arg("build_report_options", |arg| arg.hide(true)))]
+#[clap(mut_arg("streaming_build_report", |arg| arg.hide(true)))]
 pub struct ReplCommand {
     /// Files to evaluate before the first input: `.bzl` and `.bxl` files are loaded as `:load`
     /// loads them (their public symbols become bindings), other files are evaluated as one
@@ -163,6 +167,13 @@ impl StreamingCommand for ReplCommand {
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
+        if self.build_opts.build_report_requested() {
+            return ExitResult::err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "`buck2 repl` writes no build report (`--build-report`, \
+                 `--streaming-build-report`): `:build` lists what it built"
+            ));
+        }
         if self.json && self.is_interactive() {
             // The records are for programs, which do not type at a terminal.
             return ExitResult::err(buck2_error::buck2_error!(
