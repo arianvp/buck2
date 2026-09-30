@@ -251,7 +251,10 @@ async def test_repl_type_of_callables(buck: Buck) -> None:
     for expr in ["ctx.configured_targets", "ctx.cquery().deps", "len"]:
         result = await buck.repl("-e", f":t {expr}")
         assert result.stdout.startswith("def("), (expr, result.stdout)
-        assert result.stdout.endswith('  # type() is "function"\n'), (expr, result.stdout)
+        assert result.stdout.endswith('  # type() is "function"\n'), (
+            expr,
+            result.stdout,
+        )
     result = await buck.repl("-e", ":t ctx.configured_targets")
     assert "target_platform: None | TargetLabel | str = ..." in result.stdout
     # A def: its default values are never shown.
@@ -274,7 +277,9 @@ async def test_repl_doc_rendered(buck: Buck) -> None:
     assert not any(line.startswith("#") for line in lines)
 
     result = await buck.repl("-e", ":qdoc rdeps")
-    assert result.stdout.startswith("rdeps(universe: target expression, "), result.stdout
+    assert result.stdout.startswith(
+        "rdeps(universe: target expression, "
+    ), result.stdout
 
     # With `--json`, the record holds the text as shown.
     result = await buck.repl("--json", "-e", ":doc len")

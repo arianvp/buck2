@@ -165,10 +165,20 @@ impl rustyline::hint::Hinter for ReplHinter {
     type Hint = ReplHint;
 
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<ReplHint> {
+        let hint = self.hint_for(line, pos, ctx);
+        self.listing
+            .signature_shown
+            .set(matches!(hint, Some(ReplHint::Signature(_))));
+        hint
+    }
+}
+
+impl ReplHinter {
+    fn hint_for(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<ReplHint> {
         if self.listing.hides_hint(line, pos) {
             return None;
         }
-        if let Some(rest) = self.history.hint(line, pos, ctx) {
+        if let Some(rest) = rustyline::hint::Hinter::hint(&self.history, line, pos, ctx) {
             return Some(ReplHint::History(rest));
         }
         let call = enclosing_call(line, pos)?;
@@ -189,9 +199,7 @@ impl rustyline::hint::Hinter for ReplHinter {
         *self.last_signature.borrow_mut() = Some((display.clone(), active));
         Some(ReplHint::Signature(display))
     }
-}
 
-impl ReplHinter {
     /// `hint` styled for the terminal: faint, with the parameter at the cursor in bold if it is
     /// the last signature hint.
     fn styled(&self, hint: &str) -> String {
@@ -347,6 +355,8 @@ impl ConditionalEventHandler for TabIndent {
 struct Listing {
     /// The input and the cursor for which the hint is hidden.
     hide_hint_at: RefCell<Option<(String, usize)>>,
+    /// The hint last given to the editor, which it shows under the input, is a signature.
+    signature_shown: Cell<bool>,
 }
 
 impl Listing {
@@ -417,11 +427,18 @@ impl ListingCompleter {
     /// Erases the rows under the end of the line of the cursor (of the input `line`, the cursor
     /// at `pos`), to the end of the screen, and puts the cursor back. Where the input is drawn is
     /// computed as the editor computes it: after the prompt, wrapped at the terminal's width.
+    ///
+    /// Only when something is drawn there (a signature hint, or lines of the input after the
+    /// cursor's): so there is a row under the end of the line, and moving to it does not scroll
+    /// the screen (the input may be on its last row).
     fn erase_under_line(&self, line: &str, pos: usize) {
-        let Some(columns) = render::terminal_columns() else {
+        let (Some(before), Some(after)) = (line.get(..pos), line.get(pos..)) else {
             return;
         };
-        let (Some(before), Some(after)) = (line.get(..pos), line.get(pos..)) else {
+        if !self.listing.signature_shown.get() && !after.contains('\n') {
+            return;
+        }
+        let Some(columns) = render::terminal_columns() else {
             return;
         };
         let line_end = pos + after.find('\n').unwrap_or(after.len());
@@ -438,8 +455,7 @@ impl ListingCompleter {
         let end = at(to_line_end, input_start);
         // Save the cursor, go down to the row of the end of the line and to the start of the
         // next row (the terminal is in raw mode: `\n` alone does not return the carriage), erase
-        // from there to the end of the screen, put the cursor back. The input is drawn above
-        // the hint, so there is always a row under the end of its line: `\n` does not scroll.
+        // from there to the end of the screen, put the cursor back.
         let down = end.row.saturating_sub(cursor.row);
         let mut seq = String::from("\x1b7");
         if down > 0 {
