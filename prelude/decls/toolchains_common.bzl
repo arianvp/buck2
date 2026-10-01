@@ -23,6 +23,7 @@ load(
     "@prelude//kotlin:kotlin_toolchain.bzl",
     "KotlinToolchainInfo",
 )
+load("@prelude//js/npm:toolchain.bzl", "NodeToolchainInfo")
 load("@prelude//python:python_wheel_toolchain.bzl", "PythonWheelToolchainInfo")
 load("@prelude//python:toolchain.bzl", "PythonPlatformInfo", "PythonToolchainInfo")
 load("@prelude//python/cython:cython_toolchain.bzl", "CythonToolchainInfo")
@@ -94,6 +95,9 @@ def _prebuilt_jar_toolchain():
     # Override is allowed for bootstrapping prebuilt jar toolchains
     return _toolchain("prebuilt_jar", [PrebuiltJarToolchainInfo])
 
+def _node_toolchain():
+    return _toolchain("node", [NodeToolchainInfo])
+
 def _python_toolchain():
     return _toolchain("python", [PythonToolchainInfo, PythonPlatformInfo])
 
@@ -131,6 +135,7 @@ toolchains_common = struct(
     java_test = _java_test_toolchain,
     kotlin = _kotlin_toolchain,
     kotlin_for_android = _kotlin_for_android_toolchain,
+    node = _node_toolchain,
     prebuilt_jar = _prebuilt_jar_toolchain,
     python = _python_toolchain,
     python_bootstrap = _python_bootstrap_toolchain,

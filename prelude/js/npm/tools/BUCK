@@ -1,0 +1,25 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+oncall("build_infra")
+
+source_listing()
+
+prelude = native
+
+prelude.export_file(
+    name = "npm_extract.cjs",
+    src = "npm_extract.cjs",
+    visibility = ["PUBLIC"],
+)
+
+prelude.export_file(
+    name = "npm_fetch.cjs",
+    src = "npm_fetch.cjs",
+    visibility = ["PUBLIC"],
+)
+
+prelude.export_file(
+    name = "npm_tool.cjs",
+    src = "npm_tool.cjs",
+    visibility = ["PUBLIC"],
+)
