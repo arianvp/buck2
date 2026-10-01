@@ -74,3 +74,34 @@ npm_build(
     out = "bundle",
     script = "bundle:server",
 )
+
+# A container image of the bundled server: distroless/cc (glibc and
+# libstdc++, which the official Node.js binary needs; no shell) pinned by
+# digest, the toolchain's own `node`, and the app. Each layer is its own
+# action, so a code change only rebuilds the app layer.
+oci_pull(
+    name = "distroless_cc",
+    image = "gcr.io/distroless/cc-debian12",
+    digest = "sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa",
+)
+
+oci_image(
+    name = "image",
+    base = ":distroless_cc",
+    layers = [
+        {"/usr/local/bin/node": "toolchains//:node_bin"},
+        {
+            "/app": ":server_bundle",
+            "/app/client": ":client",
+        },
+    ],
+    entrypoint = ["/usr/local/bin/node", "/app/server.cjs"],
+    env = {
+        "NODE_ENV": "production",
+        "STATIC_DIR": "/app/client",
+    },
+    exposed_ports = ["3000"],
+    user = "nonroot",
+    workdir = "/app",
+    tags = ["buck2-typescript-server:latest"],
+)

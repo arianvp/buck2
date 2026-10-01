@@ -70,6 +70,49 @@ sandboxed: the download, the verification and `go list` clear their
 environment, but the compile and link actions run in buck2's environment,
 as the prelude's other Go actions do.
 
+## Container image
+
+`//app:image` is an OCI image: `gcr.io/distroless/static-debian12` (CA
+certificates, tzdata, a `nonroot` user; no shell), pinned by digest with
+`oci_pull`, plus the server binary as one layer.
+
+```sh
+buck2 build //app:image             # OCI image layout directory
+buck2 build //app:image[digest]     # the image manifest's digest
+docker load -i $(buck2 build //app:image[tarball] --show-output | cut -d' ' -f2)
+docker run --rm -p 8080:8080 buck2-go-mod-server   # /hello/{name}
+```
+
+`buck2 run //app:push` pushes it (`oci_push`) to a local test registry at
+`localhost:5000` over plain HTTP; `buck2 run //app:push -- --repository
+<registry>/<repo> --tag <tag>` pushes it elsewhere, over HTTPS, with
+credentials from the Docker config.
+
+`oci_image` and `oci_pull` configure themselves for Linux (keeping the
+target platform's CPU), so on macOS the server is cross compiled for Linux.
+This example's Go toolchain only targets linux/amd64 (`go_os_arch` in
+`toolchains/BUCK`): on an Apple Silicon Mac the image would be linux/arm64,
+which fails to configure (as `--target-platforms //platforms:macos_arm64`
+does here), so build it there with `--target-platforms
+//platforms:linux_x86_64`.
+
+Verified on the local NativeLink harness:
+
+- The digest (`sha256:b0b936c1...`) is the same on RE, in a fully local
+  build after `buck2 clean` (502 local actions, remote cache off), and from a
+  second checkout at another path (502 of 502 actions from the cache,
+  `oci_pull` included); `[tarball]` is byte-identical in all three.
+- `[tarball]` loads in Docker 29 (containerd image store) and Docker 28.5.2
+  (classic store, which reads Docker's `manifest.json`), and the container
+  serves `/hello/{name}` as `nonroot`. Pushing to a local registry skips the
+  blobs it already has, and the pushed image pulls back and runs.
+- Under a macOS (x86_64) target platform the image's `/server` is a Linux
+  x86-64 ELF binary. Its digest differs from the Linux platform's, because
+  Go binaries embed buck-out paths that contain the configuration's hash
+  (the toolchain's GOROOT, the module cache). For the same reason the digest
+  also changes with `--isolation-dir`. Same platform and buck-out: the same
+  digest everywhere.
+
 ## Remote execution
 
 With remote execution on (see `examples/remote_execution/local`), only

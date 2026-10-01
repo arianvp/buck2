@@ -20,3 +20,33 @@ go_mod_binary(
     mod_cache = ":modcache",
     package = "./cmd/server",
 )
+
+# A container image: distroless/static (CA certificates, tzdata, a nonroot
+# user, no shell) pinned by digest, plus the server. `oci_pull` is the only
+# network step; every layer is reproducible.
+oci_pull(
+    name = "distroless_static",
+    image = "gcr.io/distroless/static-debian12",
+    digest = "sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2",
+)
+
+oci_image(
+    name = "image",
+    base = ":distroless_static",
+    layers = [{"/server": ":server"}],
+    entrypoint = ["/server"],
+    exposed_ports = ["8080"],
+    user = "nonroot",
+    tags = ["buck2-go-mod-server:latest"],
+)
+
+# `buck2 run //app:push` pushes to a local test registry (plain HTTP, so
+# `insecure`); `buck2 run //app:push -- --repository <registry>/<repo> --tag
+# <tag>` pushes elsewhere, over HTTPS.
+oci_push(
+    name = "push",
+    image = ":image",
+    repository = "localhost:5000/buck2/go-mod-server",
+    insecure = True,
+    tags = ["latest"],
+)

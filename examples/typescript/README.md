@@ -40,6 +40,35 @@ containing `{"type": "module"}`. Then run
 `STATIC_DIR=client node server/main.js`. The bundled server only needs
 `server.cjs` and `client/`: `STATIC_DIR=client node server.cjs`.
 
+## Container image
+
+`//app:image` is an OCI image of the bundled server:
+`gcr.io/distroless/cc-debian12` (glibc and libstdc++, which the official
+Node.js binary needs; no shell), pinned by digest with `oci_pull`, then the
+toolchain's own `node` (`toolchains//:node_bin`) as one layer and the app
+(`server.cjs` and the client) as the last one.
+
+```sh
+docker load -i $(buck2 build //app:image[tarball] --show-output | cut -d' ' -f2)
+docker run --rm -p 3000:3000 buck2-typescript-server
+```
+
+Verified on the local NativeLink harness: the container serves the client
+and `/api/hello/:name` as `nonroot`, from Docker 29 (containerd image store)
+and Docker 28.5.2 (classic store); the image digest is the same on RE, in a
+fully local build after `buck2 clean` (109 local actions, remote cache off;
+local Python 3.11 with zlib 1.3, the workers' Python 3.12 with zlib 1.2.13),
+and from a second checkout (109 of 109 actions from the cache). A change to
+`greet()` in `src/shared/` re-runs the type checks, the bundles, the app
+layer and the manifest, not the `node` layer; adding a layer in front only
+runs that layer and the manifest.
+
+The image doesn't build on macOS yet: `oci_image` configures its
+dependencies for Linux, and the npm rules use one `node` (the target
+platform's) both to run the type checks and bundlers and to choose
+platform-specific packages, so a Mac would have to run the Linux `node`
+(inferred from the configuration, not tried on a Mac).
+
 ## How `tsc_build` works
 
 Each `tsc_build` target is one action that runs the project's own
