@@ -1,0 +1,89 @@
+// NativeLink for the local RE harness: CAS, action cache, scheduler and a
+// worker in one process. run.sh starts it inside a container that has only
+// what the image provides (by default python:3.12-slim-bookworm: /bin/sh,
+// coreutils and python3; no Go or Node.js), so actions that depend on
+// undeclared host tools fail instead of silently working.
+//
+// The worker hardlinks inputs from the CAS store into each action's work
+// directory, so both live under /nl (one filesystem), which run.sh mounts
+// from the host so the cache survives restarts.
+{
+  stores: [
+    {
+      name: "CAS",
+      fast_slow: {
+        fast: {
+          filesystem: {
+            content_path: "/nl/cas",
+            temp_path: "/nl/cas-tmp",
+            eviction_policy: {max_bytes: 20000000000},
+          },
+        },
+        // Everything lives in the fast store; nothing behind it.
+        slow: {noop: {}},
+      },
+    },
+    {
+      name: "AC",
+      filesystem: {
+        content_path: "/nl/ac",
+        temp_path: "/nl/ac-tmp",
+        eviction_policy: {max_bytes: 1000000000},
+      },
+    },
+  ],
+  schedulers: [
+    {
+      name: "MAIN_SCHEDULER",
+      simple: {
+        // Default 5 s; a busy worker can be slower to answer.
+        worker_timeout_s: 30,
+        supported_platform_properties: {
+          cpu_count: "minimum",
+          OSFamily: "exact",
+          "container-image": "exact",
+        },
+      },
+    },
+  ],
+  workers: [
+    {
+      local: {
+        name: "worker",
+        worker_api_endpoint: {uri: "grpc://127.0.0.1:50061"},
+        cas_fast_slow_store: "CAS",
+        upload_action_result: {ac_store: "AC"},
+        work_directory: "/nl/work",
+        // Run at most this many actions at once (run.sh: NL_MAX_INFLIGHT,
+        // default nproc). Without a limit, hundreds of small actions (one per
+        // npm package) start together, and the overloaded worker misses its
+        // keepalives and is dropped from the pool.
+        max_inflight_tasks: "${NL_MAX_INFLIGHT}",
+        platform_properties: {
+          cpu_count: {query_cmd: "nproc"},
+          OSFamily: {values: ["linux"]},
+          "container-image": {values: ["${NL_IMAGE}"]},
+        },
+      },
+    },
+  ],
+  servers: [
+    {
+      name: "public",
+      listener: {http: {socket_address: "0.0.0.0:50051"}},
+      services: {
+        cas: [{instance_name: "main", cas_store: "CAS"}],
+        ac: [{instance_name: "main", ac_store: "AC"}],
+        execution: [{instance_name: "main", cas_store: "CAS", scheduler: "MAIN_SCHEDULER"}],
+        capabilities: [{instance_name: "main", remote_execution: {scheduler: "MAIN_SCHEDULER"}}],
+        bytestream: [{instance_name: "main", cas_store: "CAS"}],
+      },
+    },
+    {
+      name: "workers",
+      listener: {http: {socket_address: "127.0.0.1:50061"}},
+      services: {worker_api: {scheduler: "MAIN_SCHEDULER"}, health: {}},
+    },
+  ],
+  global: {max_open_files: 20000},
+}

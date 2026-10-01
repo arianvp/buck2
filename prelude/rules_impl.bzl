@@ -48,6 +48,7 @@ load("@prelude//decls:js_rules.bzl", "js_rules")
 load("@prelude//decls:kotlin_rules.bzl", "kotlin_rules")
 load("@prelude//decls:lua_rules.bzl", "lua_rules")
 load("@prelude//decls:ocaml_rules.bzl", "ocaml_rules")
+load("@prelude//decls:oci_rules.bzl", "oci_rules")
 load("@prelude//decls:python_rules.bzl", "python_rules")
 load("@prelude//decls:re_test_common.bzl", "re_test_common")
 load("@prelude//decls:rust_rules.bzl", "rust_rules")
@@ -61,6 +62,7 @@ load("@prelude//go:coverage.bzl", "GoCoverageMode")
 load("@prelude//go:go_binary.bzl", "go_binary_impl")
 load("@prelude//go:go_exported_library.bzl", "go_exported_library_impl")
 load("@prelude//go:go_library.bzl", "go_library_impl")
+load("@prelude//go:go_mod.bzl", "go_mod_binary_impl", "go_mod_download_impl")
 load("@prelude//go:go_stdlib.bzl", "go_stdlib_impl")
 load("@prelude//go:go_test.bzl", "go_test_impl")
 load("@prelude//go/transitions:defs.bzl", "build_tags_attr", "cgo_enabled_attr", "coverage_mode_attr")
@@ -76,6 +78,7 @@ load("@prelude//js:js.bzl", _js_extra_attributes = "extra_attributes", _js_imple
 load("@prelude//js:worker_tool.bzl", "worker_tool")
 load("@prelude//julia:julia.bzl", _julia_extra_attributes = "extra_attributes", _julia_implemented_rules = "implemented_rules")
 load("@prelude//kotlin:kotlin.bzl", _kotlin_implemented_rules = "implemented_rules")
+load("@prelude//oci:oci.bzl", _oci_extra_attributes = "extra_attributes", _oci_implemented_rules = "implemented_rules")
 load("@prelude//linking:execution_preference.bzl", "link_execution_preference_attr")
 load("@prelude//linking:link_info.bzl", "LinkOrdering")
 load("@prelude//linking:types.bzl", "Linkage")
@@ -115,6 +118,7 @@ _JS_RULES_KEY = "js"
 _KOTLIN_RULES_KEY = "kotlin"
 _LUA_RULES_KEY = "lua"
 _OCAML_RULES_KEY = "ocaml"
+_OCI_RULES_KEY = "oci"
 _PYTHON_RULES_KEY = "python"
 _RUST_RULES_KEY = "rust"
 _SHELL_RULES_KEY = "shell"
@@ -139,6 +143,7 @@ categorized_rule_decl_records = {
     _KOTLIN_RULES_KEY: kotlin_rules,
     _LUA_RULES_KEY: lua_rules,
     _OCAML_RULES_KEY: ocaml_rules,
+    _OCI_RULES_KEY: oci_rules,
     _PYTHON_RULES_KEY: python_rules,
     _RUST_RULES_KEY: rust_rules,
     _SHELL_RULES_KEY: shell_rules,
@@ -200,6 +205,8 @@ extra_implemented_rules = struct(
     go_bootstrap_binary = go_bootstrap_binary_impl,
     go_exported_library = go_exported_library_impl,
     go_library = go_library_impl,
+    go_mod_binary = go_mod_binary_impl,
+    go_mod_download = go_mod_download_impl,
     go_test = go_test_impl,
     go_stdlib = go_stdlib_impl,
     # haskell
@@ -240,6 +247,7 @@ extra_implemented_rules = struct(
         _julia_implemented_rules,
         _kotlin_implemented_rules,
         _matlab_implemented_rules,
+        _oci_implemented_rules,
         _zip_file_implemented_rules,
     ]),
 )
@@ -418,6 +426,15 @@ _go_extra_attributes = {
         "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
         "_go_toolchain": toolchains_common.go(),
     },
+    "go_mod_binary": {
+        "_build_tags": build_tags_attr,
+        "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
+        "_go_toolchain": toolchains_common.go(),
+    },
+    "go_mod_download": {
+        "_go_toolchain": toolchains_common.go(),
+    },
     "go_stdlib": {
         "_build_tags": build_tags_attr,
         "_cgo_enabled": cgo_enabled_attr,
@@ -564,6 +581,7 @@ categorized_extra_attributes = {
     _KOTLIN_RULES_KEY: {},
     _MATLAB_RULES_KEY: _matlab_extra_attributes,
     _OCAML_RULES_KEY: _ocaml_extra_attributes,
+    _OCI_RULES_KEY: _oci_extra_attributes,
     _PYTHON_RULES_KEY: _python_extra_attributes,
     _RUST_RULES_KEY: _rust_extra_attributes,
     _SHELL_RULES_KEY: _shell_extra_attributes,

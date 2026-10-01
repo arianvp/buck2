@@ -1,0 +1,51 @@
+# The only network step: download every tarball in package-lock.json,
+# verified against its integrity hash.
+npm_download(
+    name = "tarballs",
+    lockfile = "package-lock.json",
+)
+
+# node_modules exactly as laid out in package-lock.json. The default output
+# includes dev dependencies (for building); `:node_modules[prod]` omits them
+# (for running the server).
+npm_node_modules(
+    name = "node_modules",
+    tarballs = ":tarballs",
+)
+
+# `npm run build` (vite build), offline.
+npm_build(
+    name = "dist",
+    srcs = glob([
+        "package.json",
+        "index.html",
+        "src/**",
+    ]),
+    node_modules = ":node_modules",
+    out = "dist",
+    script = "build",
+)
+
+# The same rules also accept bun's text lockfile (bun.lock), generated from the
+# same package.json with `bun install`.
+npm_download(
+    name = "bun_tarballs",
+    lockfile = "bun.lock",
+)
+
+npm_node_modules(
+    name = "bun_node_modules",
+    tarballs = ":bun_tarballs",
+)
+
+npm_build(
+    name = "bun_dist",
+    srcs = glob([
+        "package.json",
+        "index.html",
+        "src/**",
+    ]),
+    node_modules = ":bun_node_modules",
+    out = "dist",
+    script = "build",
+)

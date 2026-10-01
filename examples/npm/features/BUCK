@@ -1,0 +1,52 @@
+# A small project for features the main app doesn't use. `npm run check`
+# (check.js) fails if one of them is broken:
+# - a scoped package's bins (`ni` from @antfu/ni) are linked into
+#   node_modules/.bin;
+# - bundled dependencies (jsonschema and semver in
+#   @aws-cdk/cloud-assembly-schema) come from their parent's tarball;
+# - npm_build's `env` reaches the script.
+
+npm_download(
+    name = "tarballs",
+    lockfile = "package-lock.json",
+)
+
+npm_node_modules(
+    name = "node_modules",
+    tarballs = ":tarballs",
+)
+
+npm_build(
+    name = "check",
+    srcs = [
+        "check.js",
+        "package.json",
+    ],
+    env = {"GREETING": "hello"},
+    node_modules = ":node_modules",
+    out = "out",
+    script = "check",
+)
+
+# The same from bun.lock (generated from the same package.json).
+npm_download(
+    name = "bun_tarballs",
+    lockfile = "bun.lock",
+)
+
+npm_node_modules(
+    name = "bun_node_modules",
+    tarballs = ":bun_tarballs",
+)
+
+npm_build(
+    name = "bun_check",
+    srcs = [
+        "check.js",
+        "package.json",
+    ],
+    env = {"GREETING": "hello"},
+    node_modules = ":bun_node_modules",
+    out = "out",
+    script = "check",
+)

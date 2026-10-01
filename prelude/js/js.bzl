@@ -12,6 +12,7 @@ load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//js:js_bundle.bzl", "js_bundle_impl")
 load("@prelude//js:js_bundle_genrule.bzl", "js_bundle_genrule_impl")
 load("@prelude//js:js_library.bzl", "js_library_impl")
+load("@prelude//js/npm:npm.bzl", "npm_build_impl", "npm_download_impl", "npm_node_modules_impl", "tsc_build_impl")
 
 def _select_platform():
     return select({
@@ -56,9 +57,29 @@ implemented_rules = {
     "js_bundle": js_bundle_impl,
     "js_bundle_genrule": js_bundle_genrule_impl,
     "js_library": js_library_impl,
+    "npm_build": npm_build_impl,
+    "npm_download": npm_download_impl,
+    "npm_node_modules": npm_node_modules_impl,
+    "tsc_build": tsc_build_impl,
+}
+
+_npm_attrs = {
+    "_node_toolchain": toolchains_common.node(),
+    "_npm_tool": attrs.default_only(attrs.dep(default = "prelude//js/npm/tools:npm_tool.cjs")),
 }
 
 extra_attributes = {
+    "npm_build": _npm_attrs,
+    "npm_download": _npm_attrs | {
+        "_npm_fetch": attrs.default_only(attrs.dep(default = "prelude//js/npm/tools:npm_fetch.cjs")),
+    },
+    "npm_node_modules": _npm_attrs | {
+        "_npm_extract": attrs.default_only(attrs.dep(default = "prelude//js/npm/tools:npm_extract.cjs")),
+    },
+    "tsc_build": {
+        "_node_toolchain": toolchains_common.node(),
+        "_ts_tool": attrs.default_only(attrs.dep(default = "prelude//js/npm/tools:ts_tool.cjs")),
+    },
     "js_bundle": {
         "worker": attrs.exec_dep(),
         "_android_toolchain": toolchains_common.android(),

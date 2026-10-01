@@ -1,0 +1,19 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+oncall("build_infra")
+
+source_listing()
+
+prelude = native
+
+# Referenced in place (not copied to a configuration-specific path), so the
+# actions using them have the same key in every configuration.
+[
+    prelude.export_file(
+        name = tool,
+        src = tool,
+        mode = "reference",
+        visibility = ["PUBLIC"],
+    )
+    for tool in ["oci_image.py", "oci_layer.py", "oci_pull.py", "oci_push.py"]
+]

@@ -1,0 +1,5 @@
+/prelude
+/buck-out
+/app/node_modules
+/app/dist
+/.buckconfig.local

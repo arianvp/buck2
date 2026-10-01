@@ -9,3 +9,6 @@ buck-out
 /examples/with_prelude/third-party/ocaml/opam
 /examples/with_prelude/third-party/haskell/ghc
 /examples/with_prelude/third-party/ocaml/standard_library
+
+# Python bytecode
+__pycache__/

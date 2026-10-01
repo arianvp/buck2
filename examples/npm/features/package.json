@@ -1,0 +1,14 @@
+{
+  "name": "npm-features",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "node check.js"
+  },
+  "dependencies": {
+    "@aws-cdk/cloud-assembly-schema": "38.0.1"
+  },
+  "devDependencies": {
+    "@antfu/ni": "0.21.12"
+  }
+}

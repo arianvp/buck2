@@ -17,6 +17,8 @@ load(
     "go_binary_transition",
     "go_exported_library_transition",
     "go_library_transition",
+    "go_mod_binary_transition",
+    "go_mod_download_transition",
     "go_stdlib_transition",
     "go_test_transition",
 )
@@ -463,11 +465,158 @@ go_stdlib = prelude_rule(
     cfg = go_stdlib_transition,
 )
 
+go_mod_download = prelude_rule(
+    name = "go_mod_download",
+    docs = """
+        A `go_mod_download()` rule runs `go mod download` for a `go.mod` /
+         `go.sum` pair and outputs the resulting module cache (`GOMODCACHE`).
+
+        This is the only network-dependent step of a `go_mod_binary()` build.
+         It runs locally, and `go` verifies every module against `go.sum`,
+         the only source of checksums (`GOSUMDB=off`): the download fails
+         unless `go.sum` holds the checksum of every module and `go.mod`
+         file it fetched, which `go mod tidy` ensures for a `go.mod` that
+         says `go 1.17` or later.
+
+        Its output is uploaded to the action cache when the execution
+         platform allows it (`[execution_platform] allow_cache_uploads`,
+         which defaults to `remote_enabled`), so it must not depend on the
+         machine it ran on: `go` runs with
+         a cleared environment (only proxy, CA certificate and `NETRC`
+         variables are kept from buck2's), its own `HOME` and `GOPATH`, and
+         explicit settings (`GOFLAGS`, `GOSUMDB`, `GOTOOLCHAIN`, ...), so
+         `GOPRIVATE`, `GONOPROXY`, `GOFLAGS`, `GOPATH`, `~/.netrc` and the
+         like from the user's shell do not apply. VCS checkouts and checksum
+         database records are removed from the output, as are the module
+         zips, which loading packages does not need. The target is
+         configured without Go build settings (cgo, build tags, coverage),
+         so the `go_mod_binary()` targets that use it share one download
+         whatever their build tags.
+
+        A separate action, which can run remotely, checks the module cache
+         against `go.sum` (`go mod verify`, which hashes the extracted
+         modules, and the checksums of the `go.mod` and `.ziphash` files),
+         so a module cache whose module sources or `go.mod` files were
+         modified before it was uploaded to the action cache fails every
+         build that uses it. It doesn't cover the `.info` metadata files, or
+         a client that can write arbitrary action cache entries (which could
+         forge this check's result too).
+         `go_mod_binary()` runs `go list` only after that check passed.
+    """,
+    examples = """
+        ```
+        go_mod_download(
+            name = "modcache",
+            go_mod = "go.mod",
+            go_sum = "go.sum",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "go_mod": attrs.source(doc = "The module's `go.mod` file."),
+            "go_sum": attrs.source(doc = "The module's `go.sum` file."),
+            "nested_go_mods": attrs.list(
+                attrs.source(),
+                default = [],
+                doc = """
+                The `go.mod` files of the modules that `go.mod` replaces with
+                 a directory inside the module root (`replace example.com/sub
+                 => ./sub` needs `"sub/go.mod"`): `go mod download` reads them.
+                 `replace` directives that point outside the module root are
+                 not supported.
+            """,
+            ),
+            "goproxy": attrs.string(
+                default = "https://proxy.golang.org",
+                doc = """
+                Value of `GOPROXY` used while downloading modules. `direct`
+                 (fetching from version control) is not allowed: it would run
+                 the host's git with the user's configuration. Modules that
+                 the default proxy cannot serve (private ones) need a module
+                 proxy that can; credentials for it are read from the netrc
+                 file named by `NETRC` in buck2's environment (not from
+                 `~/.netrc`).
+            """,
+            ),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+    cfg = go_mod_download_transition,
+)
+
+go_mod_binary = prelude_rule(
+    name = "go_mod_binary",
+    docs = """
+        A `go_mod_binary()` rule builds a pure-Go executable from a Go module,
+         resolving third-party packages from `go.mod` / `go.sum` instead of
+         from BUCK targets.
+
+        The target must live in the directory containing `go.mod`. It runs
+         `go list -deps` offline against the module cache provided by
+         `mod_cache`, then declares one compile action per package (first- and
+         third-party), so changing a single module or source file only
+         recompiles the affected packages.
+
+        cgo is not supported: the target is always built with `CGO_ENABLED=0`.
+    """,
+    examples = """
+        ```
+        go_mod_download(
+            name = "modcache",
+            go_mod = "go.mod",
+            go_sum = "go.sum",
+        )
+
+        go_mod_binary(
+            name = "server",
+            srcs = glob(["**/*.go", "go.mod", "go.sum"]),
+            mod_cache = ":modcache",
+            package = "./cmd/server",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "srcs": attrs.list(
+                attrs.source(),
+                default = [],
+                doc = """
+                All first-party files of the module: `go.mod`, `go.sum`, Go
+                 sources and any embedded files.
+            """,
+            ),
+            "mod_cache": attrs.dep(
+                doc = "A `go_mod_download()` target providing the module cache.",
+            ),
+            "package": attrs.string(
+                default = ".",
+                doc = "The main package to build, relative to the module root (as passed to `go build`).",
+            ),
+        } |
+        go_common.compiler_flags_arg() |
+        go_common.linker_flags_arg() |
+        go_common.build_tags_arg() |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+    cfg = go_mod_binary_transition,
+)
+
 go_rules = struct(
     go_binary = go_binary,
     go_bootstrap_binary = go_bootstrap_binary,
     go_exported_library = go_exported_library,
     go_library = go_library,
+    go_mod_binary = go_mod_binary,
+    go_mod_download = go_mod_download,
     go_stdlib = go_stdlib,
     go_test = go_test,
 )

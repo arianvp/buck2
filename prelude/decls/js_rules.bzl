@@ -100,8 +100,204 @@ js_library = prelude_rule(
     ),
 )
 
+npm_download = prelude_rule(
+    name = "npm_download",
+    docs = """
+        An `npm_download()` rule downloads every package tarball listed in a
+         `package-lock.json` (v2 or v3) or `bun.lock` for the target platform.
+
+        This is the only network-dependent step of an npm build. It runs
+         locally and verifies each tarball against its lockfile `integrity`
+         hash, so the output is determined by the lockfile alone.
+    """,
+    examples = """
+        ```
+        npm_download(
+            name = "tarballs",
+            lockfile = "package-lock.json",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "lockfile": attrs.source(doc = "The project's `package-lock.json` (v2/v3) or `bun.lock`."),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+)
+
+npm_node_modules = prelude_rule(
+    name = "npm_node_modules",
+    docs = """
+        An `npm_node_modules()` rule assembles a `node_modules` directory from
+         the lockfile of an `npm_download()` target (`package-lock.json` or
+         `bun.lock`), laid out exactly as the lockfile describes
+         (including nested packages and `.bin` links). Optional packages for
+         other platforms are skipped. Install scripts are not run.
+
+        The default output includes dev dependencies (for building); the
+         `[prod]` sub-target omits them (for running).
+
+        Each package tarball is extracted by its own action, after checking
+         it against its `integrity` hash, so changing one package in the
+         lockfile only re-extracts that package. Bundled dependencies
+         (`bundleDependencies`) come from their parent's tarball.
+    """,
+    examples = """
+        ```
+        npm_node_modules(
+            name = "node_modules",
+            tarballs = ":tarballs",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "tarballs": attrs.dep(doc = "An `npm_download()` target; its lockfile determines the layout."),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+)
+
+npm_build = prelude_rule(
+    name = "npm_build",
+    docs = """
+        An `npm_build()` rule runs `npm run <script>` offline in a scratch
+         copy of `srcs` with the given `node_modules`, and outputs the
+         directory the script produces.
+
+        The script gets fresh environment variables, the same locally and
+         with remote execution: `HOME` and `TMPDIR` are scratch directories,
+         `TZ=UTC`, `LANG=C.UTF-8`, `CI=true`, `NODE_ENV=production`, no npmrc
+         outside `srcs` is read, and `env` is set over these. `PATH` holds
+         `node`, `npm`, `npx`, `node_modules/.bin`, `/usr/bin` and `/bin`.
+         The last two are the machine's own: locally the script can run any
+         tool the host has (and `git` sees the checkout around `buck-out`),
+         which is not an input of the action; remotely only what the worker
+         image has. npm runs scripts with `/bin/sh`, and package bins start
+         with `#!/usr/bin/env node`, so remote workers need `/bin/sh` and
+         `/usr/bin/env` (and glibc for the official Node.js binary).
+
+        npm, Node and build tools look for `node_modules`, `package.json`
+         and config files (postcss, babel, ...) in every directory above the
+         working directory. Remotely, those directories only hold the
+         action's declared inputs. Locally they are the buck2 project
+         (often a JS repo with its own `package.json`, `node_modules` and
+         configs), so a local run happens in a new directory under `/tmp`
+         instead, where nothing is above it (unless `/tmp` is mounted
+         `noexec`).
+
+        Absolute symlinks in the output that point into the scratch copy are
+         made relative; other absolute symlinks fail the build.
+    """,
+    examples = """
+        ```
+        npm_build(
+            name = "dist",
+            srcs = glob(["package.json", "index.html", "src/**"]),
+            node_modules = ":node_modules",
+            script = "build",
+            out = "dist",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "srcs": attrs.list(attrs.source(), default = [], doc = "Project files the script needs, including `package.json`."),
+            "node_modules": attrs.dep(doc = "An `npm_node_modules()` target."),
+            "script": attrs.string(default = "build", doc = "The `package.json` script to run."),
+            "out": attrs.string(default = "dist", doc = "The directory, relative to the project root, that the script produces."),
+            "env": attrs.dict(
+                key = attrs.string(),
+                value = attrs.string(),
+                sorted = False,
+                default = {},
+                doc = "Environment variables for the script (e.g. `NODE_OPTIONS`, `VITE_*`), set over the defaults. Part of the action key.",
+            ),
+            "checks": attrs.list(
+                attrs.dep(),
+                default = [],
+                doc = "Targets that must build successfully first, e.g. `tsc_build()` type checks.",
+            ),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+)
+
+tsc_build = prelude_rule(
+    name = "tsc_build",
+    docs = """
+        A `tsc_build()` rule runs the project's own TypeScript compiler
+         (`tsc -p <tsconfig>`, from `node_modules`, any version including the
+         native TypeScript 7) on `srcs`. Type errors fail the build with
+         `tsc`'s messages.
+
+        Each build is one hermetic action over a scratch copy of `srcs`, with
+         no state kept between builds, so its result is cached (and shared
+         through remote execution) by its inputs: any change to `srcs` or
+         `node_modules` re-runs the whole check. TypeScript 7's native binary
+         is run directly when its platform package is installed. tsc looks
+         for `node_modules` (and TypeScript 5 for `@types`) and for
+         `package.json` (which decides a file's module format) in every
+         directory above its working directory, so a local check runs in a
+         new directory under `/tmp` (unless `/tmp` is mounted noexec), like
+         `npm_build`, with `node_modules` hard-linked in (copied across
+         filesystems) as a real tree: tsc only sees the declared inputs, and
+         paths it records (e.g. in `.tsbuildinfo`) are the same locally and
+         remotely.
+
+        With `out`, the output is that directory as emitted by `tsc` (e.g. the
+         tsconfig's `outDir`); without it, a stamp file for type-check-only
+         configs.
+    """,
+    examples = """
+        ```
+        tsc_build(
+            name = "server",
+            srcs = glob(["src/**/*.ts", "package.json", "tsconfig*.json"]),
+            node_modules = ":node_modules",
+            tsconfig = "tsconfig.server.json",
+            out = "dist/server",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "srcs": attrs.list(attrs.source(), default = [], doc = "Sources, the tsconfig (and any it extends) and package.json."),
+            "tsconfig": attrs.string(doc = "Path of the tsconfig, relative to the package."),
+            "node_modules": attrs.dep(doc = "An `npm_node_modules()` target providing `typescript` and any type packages."),
+            "out": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = "Directory `tsc` emits into (relative to the package), returned as the output. Omit for type-check only.",
+            ),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+)
+
 js_rules = struct(
     js_bundle = js_bundle,
     js_bundle_genrule = js_bundle_genrule,
     js_library = js_library,
+    npm_build = npm_build,
+    npm_download = npm_download,
+    npm_node_modules = npm_node_modules,
+    tsc_build = tsc_build,
 )
