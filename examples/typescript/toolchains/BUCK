@@ -1,0 +1,42 @@
+load("@prelude//toolchains:node.bzl", "node_toolchain")
+
+http_archive(
+    name = "node-v22.22.2-linux-x64",
+    sha256 = "978978a635eef872fa68beae09f0aad0bbbae6757e444da80b570964a97e62a3",
+    strip_prefix = "node-v22.22.2-linux-x64",
+    urls = ["https://nodejs.org/dist/v22.22.2/node-v22.22.2-linux-x64.tar.gz"],
+)
+
+http_archive(
+    name = "node-v22.22.2-linux-arm64",
+    sha256 = "b2f3a96f31486bfc365192ad65ced14833ad2a3c2e1bcefec4846902f264fa28",
+    strip_prefix = "node-v22.22.2-linux-arm64",
+    urls = ["https://nodejs.org/dist/v22.22.2/node-v22.22.2-linux-arm64.tar.gz"],
+)
+
+http_archive(
+    name = "node-v22.22.2-darwin-arm64",
+    sha256 = "db4b275b83736df67533529a18cc55de2549a8329ace6c7bcc68f8d22d3c9000",
+    strip_prefix = "node-v22.22.2-darwin-arm64",
+    urls = ["https://nodejs.org/dist/v22.22.2/node-v22.22.2-darwin-arm64.tar.gz"],
+)
+
+node_toolchain(
+    name = "node",
+    distribution = select({
+        "config//os:linux": select({
+            "config//cpu:arm64": ":node-v22.22.2-linux-arm64",
+            "config//cpu:x86_64": ":node-v22.22.2-linux-x64",
+        }),
+        "config//os:macos": select({"config//cpu:arm64": ":node-v22.22.2-darwin-arm64"}),
+    }),
+    node_cpu = select({
+        "config//cpu:arm64": "arm64",
+        "config//cpu:x86_64": "x64",
+    }),
+    node_os = select({
+        "config//os:linux": "linux",
+        "config//os:macos": "darwin",
+    }),
+    visibility = ["PUBLIC"],
+)

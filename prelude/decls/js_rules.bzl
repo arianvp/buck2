@@ -227,7 +227,63 @@ npm_build = prelude_rule(
             "checks": attrs.list(
                 attrs.dep(),
                 default = [],
-                doc = "Targets that must build successfully first, e.g. linters or type checks.",
+                doc = "Targets that must build successfully first, e.g. `tsc_build()` type checks.",
+            ),
+        } |
+        buck.licenses_arg() |
+        buck.labels_arg() |
+        buck.contacts_arg()
+    ),
+)
+
+tsc_build = prelude_rule(
+    name = "tsc_build",
+    docs = """
+        A `tsc_build()` rule runs the project's own TypeScript compiler
+         (`tsc -p <tsconfig>`, from `node_modules`, any version including the
+         native TypeScript 7) on `srcs`. Type errors fail the build with
+         `tsc`'s messages.
+
+        Each build is one hermetic action over a scratch copy of `srcs`, with
+         no state kept between builds, so its result is cached (and shared
+         through remote execution) by its inputs: any change to `srcs` or
+         `node_modules` re-runs the whole check. TypeScript 7's native binary
+         is run directly when its platform package is installed. tsc looks
+         for `node_modules` (and TypeScript 5 for `@types`) and for
+         `package.json` (which decides a file's module format) in every
+         directory above its working directory, so a local check runs in a
+         new directory under `/tmp` (unless `/tmp` is mounted noexec), like
+         `npm_build`, with `node_modules` hard-linked in (copied across
+         filesystems) as a real tree: tsc only sees the declared inputs, and
+         paths it records (e.g. in `.tsbuildinfo`) are the same locally and
+         remotely.
+
+        With `out`, the output is that directory as emitted by `tsc` (e.g. the
+         tsconfig's `outDir`); without it, a stamp file for type-check-only
+         configs.
+    """,
+    examples = """
+        ```
+        tsc_build(
+            name = "server",
+            srcs = glob(["src/**/*.ts", "package.json", "tsconfig*.json"]),
+            node_modules = ":node_modules",
+            tsconfig = "tsconfig.server.json",
+            out = "dist/server",
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "srcs": attrs.list(attrs.source(), default = [], doc = "Sources, the tsconfig (and any it extends) and package.json."),
+            "tsconfig": attrs.string(doc = "Path of the tsconfig, relative to the package."),
+            "node_modules": attrs.dep(doc = "An `npm_node_modules()` target providing `typescript` and any type packages."),
+            "out": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = "Directory `tsc` emits into (relative to the package), returned as the output. Omit for type-check only.",
             ),
         } |
         buck.licenses_arg() |
@@ -243,4 +299,5 @@ js_rules = struct(
     npm_build = npm_build,
     npm_download = npm_download,
     npm_node_modules = npm_node_modules,
+    tsc_build = tsc_build,
 )

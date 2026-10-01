@@ -1,0 +1,76 @@
+# The only network step: every tarball in package-lock.json, verified against
+# its integrity hash.
+npm_download(
+    name = "tarballs",
+    lockfile = "package-lock.json",
+)
+
+# Default output: everything, for building. `:node_modules[prod]`: runtime
+# dependencies only (express), for running the compiled server.
+npm_node_modules(
+    name = "node_modules",
+    tarballs = ":tarballs",
+)
+
+# Each target only lists the sources it needs, so editing server code doesn't
+# rebuild the client and vice versa. Code in src/shared/ is used by both.
+_CLIENT_SRCS = glob([
+    "src/client/**",
+    "src/shared/**",
+]) + [
+    "index.html",
+    "package.json",
+    "tsconfig.base.json",
+    "tsconfig.client.json",
+    "vite.config.ts",
+]
+
+_SERVER_SRCS = glob([
+    "src/server/**",
+    "src/shared/**",
+]) + [
+    "package.json",
+    "tsconfig.base.json",
+    "tsconfig.server.json",
+]
+
+# Type-check the client (tsconfig.client.json has noEmit). Runs the project's
+# own tsc (TypeScript 7) in one hermetic action, cached by its inputs: any
+# change to these sources or node_modules re-runs the whole check.
+tsc_build(
+    name = "client_types",
+    srcs = _CLIENT_SRCS,
+    node_modules = ":node_modules",
+    tsconfig = "tsconfig.client.json",
+)
+
+# Server compiled by tsc -> dist/server (type errors fail the build). Runs
+# with `node server/main.js` next to `:node_modules[prod]`.
+tsc_build(
+    name = "server",
+    srcs = _SERVER_SRCS,
+    node_modules = ":node_modules",
+    out = "dist/server",
+    tsconfig = "tsconfig.server.json",
+)
+
+# Client bundle: `vite build` only; type errors are caught by :client_types.
+npm_build(
+    name = "client",
+    srcs = _CLIENT_SRCS,
+    checks = [":client_types"],
+    node_modules = ":node_modules",
+    out = "dist/client",
+    script = "bundle:client",
+)
+
+# Server bundled by esbuild into one file that needs no node_modules at
+# runtime; type errors are caught by :server.
+npm_build(
+    name = "server_bundle",
+    srcs = _SERVER_SRCS,
+    checks = [":server"],
+    node_modules = ":node_modules",
+    out = "bundle",
+    script = "bundle:server",
+)

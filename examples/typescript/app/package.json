@@ -1,0 +1,25 @@
+{
+  "name": "typescript-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:client": "tsc -p tsconfig.client.json",
+    "bundle:client": "vite build",
+    "build:client": "npm run check:client && npm run bundle:client",
+    "build:server": "tsc -p tsconfig.server.json",
+    "bundle:server": "esbuild src/server/main.ts --bundle --platform=node --target=node22 --format=cjs --outfile=bundle/server.cjs",
+    "build:server-bundle": "tsc -p tsconfig.server.json --noEmit && npm run bundle:server",
+    "start": "node dist/server/server/main.js"
+  },
+  "dependencies": {
+    "express": "4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "4.17.23",
+    "@types/node": "22.15.30",
+    "esbuild": "0.25.12",
+    "typescript": "7.0.2",
+    "vite": "6.3.5"
+  }
+}

@@ -315,3 +315,43 @@ def npm_build_impl(ctx: AnalysisContext) -> list[Provider]:
         identifier = ctx.attrs.script,
     )
     return [DefaultInfo(default_output = out)]
+
+# ---------------------------------------------------------------------------
+# tsc_build
+
+def tsc_build_impl(ctx: AnalysisContext) -> list[Provider]:
+    node = ctx.attrs._node_toolchain[NodeToolchainInfo]
+    tool = ctx.attrs._ts_tool[DefaultInfo].default_outputs[0]
+    node_modules = ctx.attrs.node_modules[NpmNodeModulesInfo].node_modules
+
+    srcs = {src.short_path: src for src in ctx.attrs.srcs}
+    if ctx.attrs.tsconfig not in srcs:
+        fail("tsc_build: `srcs` must include the tsconfig `{}`".format(ctx.attrs.tsconfig))
+    srcs_file = ctx.actions.write_json("srcs.json", srcs, with_inputs = True)
+
+    if ctx.attrs.out:
+        output = ctx.actions.declare_output(ctx.attrs.out, dir = True)
+    else:
+        output = ctx.actions.declare_output("tsc.ok")
+
+    ctx.actions.run(
+        [
+            node.node,
+            tool,
+            "tsc",
+            "--node",
+            node.node,
+            "--srcs",
+            srcs_file,
+            "--node-modules",
+            node_modules,
+            "--tsconfig",
+            ctx.attrs.tsconfig,
+            ["--out-dir", ctx.attrs.out] if ctx.attrs.out else [],
+            "--output",
+            output.as_output(),
+        ],
+        category = "tsc",
+        identifier = ctx.attrs.tsconfig,
+    )
+    return [DefaultInfo(default_output = output)]

@@ -23,3 +23,9 @@ prelude.export_file(
     src = "npm_tool.cjs",
     visibility = ["PUBLIC"],
 )
+
+prelude.export_file(
+    name = "ts_tool.cjs",
+    src = "ts_tool.cjs",
+    visibility = ["PUBLIC"],
+)
