@@ -1,0 +1,22 @@
+# The module cache is the only thing fetched from the network. It only
+# depends on go.mod, go.sum and the module proxy, and `go` verifies every
+# module against go.sum.
+go_mod_download(
+    name = "modcache",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+)
+
+# Third-party packages are resolved from go.mod/go.sum at build time: there are
+# no generated BUCK files for them.
+go_mod_binary(
+    name = "server",
+    srcs = glob([
+        "go.mod",
+        "go.sum",
+        "**/*.go",
+        "cmd/server/static/**",
+    ]),
+    mod_cache = ":modcache",
+    package = "./cmd/server",
+)

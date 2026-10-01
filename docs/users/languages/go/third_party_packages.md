@@ -74,3 +74,52 @@ The `gobuckify.json` file has the following structure:
   "default_tags": ["purego"] // List of tags always passed to `go list`
 }
 ```
+
+## Building from `go.mod` without generated BUCK files
+
+For pure-Go applications you can skip `gobuckify` and build a module directly
+from its `go.mod` / `go.sum` with `go_mod_download` and `go_mod_binary`:
+
+```python
+go_mod_download(
+    name = "modcache",
+    go_mod = "go.mod",
+    go_sum = "go.sum",
+)
+
+go_mod_binary(
+    name = "server",
+    srcs = glob(["go.mod", "go.sum", "**/*.go"]),
+    mod_cache = ":modcache",
+    package = "./cmd/server",
+)
+```
+
+- `go_mod_download` runs `go mod download` and outputs a module cache. It is
+  the only network-dependent step: it runs locally, and `go` verifies every
+  module against `go.sum`, the only source of checksums (`GOSUMDB=off`).
+  Modules come from a module proxy (`goproxy`, by default
+  `https://proxy.golang.org`), never from version control, in a cleared
+  environment. A separate action, which can run remotely, checks the cache
+  against `go.sum` (`go mod verify`) before `go list` uses it.
+- `go_mod_binary` runs `go list -deps` offline against that cache, then
+  declares one compile action per package, first- and third-party. Each
+  compile only sees that package's files and its direct imports' export data,
+  so bumping one module in `go.sum` only recompiles that module's packages and
+  the packages whose inputs actually change.
+
+Trade-offs compared to `gobuckify`:
+
+- Third-party packages are not addressable targets: you can't
+  `buck2 query` or depend on them individually.
+- cgo is not supported.
+- The target must live next to `go.mod`. A `replace` directive that points
+  inside the module root needs the replaced module's `go.mod` in
+  `go_mod_download`'s `nested_go_mods`; ones that point outside it are not
+  supported.
+- `go.sum` must hold the checksum of everything `go mod download` fetches,
+  as `go mod tidy` ensures for a `go.mod` that says `go 1.17` or later.
+- Private modules need a proxy that serves them; its credentials come from
+  the netrc file named by `NETRC` in buck2's environment.
+
+See `examples/go_mod` in this repository for a complete example.

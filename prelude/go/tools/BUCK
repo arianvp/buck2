@@ -91,3 +91,12 @@ prelude.go_test(
     name = "buildid_test",
     srcs = ["buildid.go", "buildid_test.go"],
 )
+
+prelude.go_test(
+    name = "go_wrapper_test",
+    srcs = [
+        "buildid.go",
+        "go_wrapper.go",
+        "go_wrapper_test.go",
+    ],
+)

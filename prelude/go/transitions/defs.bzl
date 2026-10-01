@@ -71,6 +71,14 @@ def _tags_transition(platform, refs, attrs):
         configuration = configuration,
     )
 
+def _force_cgo_disabled(platform, refs, _):
+    configuration = platform.configuration
+    configuration.insert(refs.cgo_enabled_false[ConstraintValueInfo])
+    return PlatformInfo(
+        label = platform.label,
+        configuration = configuration,
+    )
+
 def _force_mingw_on_windows(platform, refs, _):
     constraints = platform.configuration.constraints
 
@@ -145,6 +153,55 @@ go_exported_library_transition = transition(
     impl = _chain_transitions(_top_level_transitions),
     refs = _top_level_refs,
     attrs = _attrs,
+)
+
+# go_mod_binary only supports pure-Go builds (like `CGO_ENABLED=0 go build`).
+go_mod_binary_transition = transition(
+    impl = _chain_transitions([_force_cgo_disabled, _tags_transition] + _all_level_transitions),
+    refs = _top_level_refs,
+    attrs = ["build_tags"],
+)
+
+# Constraint values of every Go build setting that the prelude's transitions
+# set (cgo, coverage, build tags).
+_go_setting_refs = (
+    {
+        "cgo_enabled_false": "prelude//go/constraints:cgo_enabled[false]",
+    }
+    | _coverage_mode_refs
+    | {"tag_{}__set".format(tag): constraint_value for tag, constraint_value in tag_to_constraint_value().items()}
+)
+
+def _drop_go_settings(platform, refs, _):
+    go_settings = {
+        getattr(refs, name)[ConstraintValueInfo].setting.label: None
+        for name in _go_setting_refs
+    }
+    constraints = {
+        setting: value
+        for setting, value in platform.configuration.constraints.items()
+        if setting not in go_settings
+    }
+    if len(constraints) == len(platform.configuration.constraints):
+        return platform
+    return PlatformInfo(
+        label = platform.label,
+        configuration = ConfigurationInfo(
+            constraints = constraints,
+            values = platform.configuration.values,
+        ),
+    )
+
+# `go mod download` depends on none of the Go build settings, so
+# go_mod_download drops them: every go_mod_binary that uses a module cache
+# (whatever its build tags), and the go_mod_download target built on its own,
+# share one configuration and one download. It also gets the MinGW ABI on
+# Windows, which go_mod_binary's transition gives to its deps, so that the
+# target built on its own matches there too.
+go_mod_download_transition = transition(
+    impl = _chain_transitions([_drop_go_settings] + _all_level_transitions),
+    refs = _go_setting_refs | _all_level_refs,
+    attrs = [],
 )
 
 go_library_transition = transition(

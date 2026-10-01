@@ -61,6 +61,7 @@ load("@prelude//go:coverage.bzl", "GoCoverageMode")
 load("@prelude//go:go_binary.bzl", "go_binary_impl")
 load("@prelude//go:go_exported_library.bzl", "go_exported_library_impl")
 load("@prelude//go:go_library.bzl", "go_library_impl")
+load("@prelude//go:go_mod.bzl", "go_mod_binary_impl", "go_mod_download_impl")
 load("@prelude//go:go_stdlib.bzl", "go_stdlib_impl")
 load("@prelude//go:go_test.bzl", "go_test_impl")
 load("@prelude//go/transitions:defs.bzl", "build_tags_attr", "cgo_enabled_attr", "coverage_mode_attr")
@@ -200,6 +201,8 @@ extra_implemented_rules = struct(
     go_bootstrap_binary = go_bootstrap_binary_impl,
     go_exported_library = go_exported_library_impl,
     go_library = go_library_impl,
+    go_mod_binary = go_mod_binary_impl,
+    go_mod_download = go_mod_download_impl,
     go_test = go_test_impl,
     go_stdlib = go_stdlib_impl,
     # haskell
@@ -416,6 +419,15 @@ _go_extra_attributes = {
         "_cxx_toolchain": toolchains_common.cxx(),
         "_exec_os_type": buck.exec_os_type_arg(),
         "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
+        "_go_toolchain": toolchains_common.go(),
+    },
+    "go_mod_binary": {
+        "_build_tags": build_tags_attr,
+        "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
+        "_go_toolchain": toolchains_common.go(),
+    },
+    "go_mod_download": {
         "_go_toolchain": toolchains_common.go(),
     },
     "go_stdlib": {
