@@ -34,6 +34,7 @@ jobs:
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_rust_toolchain
     - uses: ./.github/actions/build_debug
+    - uses: ./.github/actions/build_example_nginx_goaway
     - uses: ./.github/actions/setup_reindeer
     - uses: ./.github/actions/build_bootstrap
       with:
