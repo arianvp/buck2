@@ -353,7 +353,7 @@ async fn create_tls_config(settings: &GrpcTlsSettings) -> anyhow::Result<ClientT
     Ok(config)
 }
 
-fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
+fn prepare_uri(uri: Uri, tls: Option<bool>) -> anyhow::Result<(Uri, bool)> {
     // Now do some awkward things with the protocol. Why do we do all this? The reason is
     // because we'd like our configuration to not be super confusing. We don't want to e.g.
     // allow setting the address to `https://foobar`; instead we infer TLS from the source
@@ -363,12 +363,10 @@ fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
     // Many people (including Bazel), use grpc:// and grpcs://, so we tolerate both.
     // We also accept http:// and https:// for convenience.
 
-    let tls = match uri.scheme_str() {
-        Some("grpc") => false,
-        Some("grpcs") => true,
-        Some("http") => false,
-        Some("https") => true,
-        Some("dns") | Some("ipv4") | Some("ipv6") | None => true,
+    let scheme_tls = match uri.scheme_str() {
+        Some("grpc") | Some("http") => Some(false),
+        Some("grpcs") | Some("https") => Some(true),
+        Some("dns") | Some("ipv4") | Some("ipv6") | None => None,
         Some(scheme) => {
             return Err(anyhow::anyhow!(
                 "Invalid URI scheme: `{}` for `{}` (expected one of grpc, grpcs, http, https, dns, ipv4, ipv6, or no scheme)",
@@ -376,6 +374,19 @@ fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
                 uri,
             ));
         }
+    };
+
+    // The `tls` option wins over the scheme, so that `grpc://` with `tls = true` uses TLS, as
+    // many configurations expect. It can't turn TLS off for a scheme that asks for it.
+    let tls = match (scheme_tls, tls) {
+        (Some(true), Some(false)) => {
+            return Err(anyhow::anyhow!(
+                "`tls = false` conflicts with the TLS scheme of `{}`",
+                uri
+            ));
+        }
+        (_, Some(tls)) => tls,
+        (scheme_tls, None) => scheme_tls.unwrap_or(true),
     };
 
     // And now, let's put back a proper scheme for Tonic to be happy with. First, because
@@ -737,6 +748,7 @@ struct GrpcTlsSettings {
 #[derive(Clone)]
 struct GrpcChannelSettings {
     tls: GrpcTlsSettings,
+    tls_enabled: Option<bool>,
     grpc_keepalive_time_secs: u64,
     grpc_keepalive_timeout_secs: u64,
     grpc_keepalive_while_idle: bool,
@@ -750,6 +762,7 @@ impl GrpcChannelSettings {
                 tls_ca_certs: opts.tls_ca_certs.clone(),
                 tls_client_cert: opts.tls_client_cert.clone(),
             },
+            tls_enabled: opts.tls,
             grpc_keepalive_time_secs: opts
                 .grpc_keepalive_time_secs
                 .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIME_SECS),
@@ -788,7 +801,7 @@ impl GrpcChannelConnector {
     async fn endpoint(&self) -> anyhow::Result<(Endpoint, String)> {
         let address = substitute_env_vars(&self.address).context("Invalid address")?;
         let uri = address.parse().context("Invalid address")?;
-        let (uri, tls) = prepare_uri(uri).context("Invalid URI")?;
+        let (uri, tls) = prepare_uri(uri, self.settings.tls_enabled).context("Invalid URI")?;
 
         let mut endpoint = Channel::builder(uri);
         if tls {
@@ -4580,17 +4593,36 @@ mod tests {
 
     #[test]
     fn prepare_uri_adds_root_path_to_bare_authority() -> anyhow::Result<()> {
-        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?)?;
+        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?, None)?;
         assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
         assert!(tls);
 
-        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?)?;
+        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?, None)?;
         assert_eq!(uri.to_string(), "http://localhost:8980/");
         assert!(!tls);
 
-        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?)?;
+        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?, None)?;
         assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/cache");
         assert!(tls);
+
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_uri_lets_the_tls_option_override_the_scheme() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("grpc://remote.buildbuddy.io".parse()?, Some(true))?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("localhost:8980".parse()?, Some(false))?;
+        assert_eq!(uri.to_string(), "http://localhost:8980/");
+        assert!(!tls);
+
+        let (_, tls) = prepare_uri("grpcs://remote.buildbuddy.io".parse()?, Some(true))?;
+        assert!(tls);
+
+        assert!(prepare_uri("grpcs://remote.buildbuddy.io".parse()?, Some(false)).is_err());
+        assert!(prepare_uri("https://remote.buildbuddy.io".parse()?, Some(false)).is_err());
 
         Ok(())
     }

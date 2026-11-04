@@ -27,6 +27,10 @@ Keys supported include:
   - Supported schemes: `grpc://`, `grpcs://`, `http://`, `https://`, and gRPC
     resolver schemes (`dns://`, `ipv4://`, `ipv6://`).
   - If no scheme is provided, Buck2 treats the endpoint as TLS-enabled.
+- `tls` - whether to use TLS, overriding the address schemes: `true` also
+  enables TLS for `grpc://` and `http://` addresses, and `false` disables it
+  for addresses without a scheme. It can't disable TLS for `grpcs://` or
+  `https://` addresses.
 - `tls_ca_certs` - path to a CA certificates bundle. This must be PEM-encoded.
   If set, this replaces the default trust roots. If none is set, a default
   bundle will be used. This path contains environment variables using shell

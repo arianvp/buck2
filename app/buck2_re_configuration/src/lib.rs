@@ -473,6 +473,9 @@ pub struct Buck2OssReConfiguration {
     /// Address for RBE Action Cache service. Accepted schemes: grpc, grpcs, http, https, dns,
     /// ipv4, ipv6. If no scheme is provided, TLS is enabled by default.
     pub action_cache_address: Option<String>,
+    /// Whether to use TLS, overriding what the address schemes imply: `true` also enables it for
+    /// grpc and http addresses, and `false` disables it for addresses without a scheme.
+    pub tls: Option<bool>,
     /// Path to a CA certificates bundle. This must be PEM-encoded. If set, this replaces the
     /// default trust roots. If none is set, a default bundle will be used when TLS is enabled by
     /// endpoint scheme.
@@ -588,6 +591,10 @@ impl Buck2OssReConfiguration {
                     property: "action_cache_address",
                 })?
                 .or(default_address),
+            tls: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "tls",
+            })?,
             tls_ca_certs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "tls_ca_certs",
