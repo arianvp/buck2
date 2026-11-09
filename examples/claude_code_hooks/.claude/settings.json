@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && buck2 run //:claude_hooks --preemptible=ondifferentstate --console=none </dev/null >/dev/null 2>&1",
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "test -x \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_context\" || exit 0; exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_context\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -x \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_paths\" || exit 0; exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_paths\""
+          }
+        ]
+      }
+    ]
+  }
+}

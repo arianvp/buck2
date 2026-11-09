@@ -1,0 +1,2 @@
+# Installed by `buck2 run //:claude_hooks`; symlinks into buck-out.
+/.claude/hooks/

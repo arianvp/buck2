@@ -1,0 +1,36 @@
+load(":claude_hooks.bzl", "claude_hooks")
+
+oncall("build_infra")
+
+# The hooks this project installs. `buck2 run //:claude_hooks` points
+# `.claude/hooks/<name>` at each one; `.claude/settings.json` wires the names
+# to Claude Code events.
+claude_hooks(
+    name = "claude_hooks",
+    hooks = {
+        "protect_paths": ":protect_paths",
+        "session_context": ":session_context",
+    },
+)
+
+# Any runnable can be a hook. For a hook to be immune to rebuilds while it
+# runs, its outputs must be content-based.
+
+# `sh_binary` is content-based by default, and it execs `main` directly, so the
+# script can be written in anything its shebang names.
+sh_binary(
+    name = "protect_paths",
+    main = "hooks/protect_paths.py",
+)
+
+rust_binary(
+    name = "session_context",
+    srcs = ["hooks/session_context.rs"],
+    crate_root = "hooks/session_context.rs",
+    has_content_based_path = True,
+)
+
+sh_binary(
+    name = "install_claude_hooks",
+    main = "install_claude_hooks.py",
+)
