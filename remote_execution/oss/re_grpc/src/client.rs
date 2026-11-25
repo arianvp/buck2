@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
+use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,6 +84,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio_stream::wrappers::ReceiverStream;
@@ -111,6 +113,7 @@ const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
 const GRPC_RETRY_JITTER: f64 = 0.1;
 const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 
 fn tdigest_to(tdigest: &TDigest) -> Digest {
     Digest {
@@ -523,6 +526,8 @@ pub struct RERuntimeOpts {
     retry_max_delay_ms: u64,
     /// Per-attempt timeout for unary gRPC requests.
     grpc_request_timeout: Duration,
+    /// Maximum idle time for a ByteStream download before the stream is retried.
+    bytestream_progress_timeout: Duration,
 }
 
 struct InstanceName(Option<String>);
@@ -616,6 +621,10 @@ impl REClientBuilder {
             opts.grpc_request_timeout_secs
                 .unwrap_or(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
         );
+        let bytestream_progress_timeout = Duration::from_secs(
+            opts.bytestream_progress_timeout_secs
+                .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -707,6 +716,7 @@ impl REClientBuilder {
                 retries,
                 retry_max_delay_ms,
                 grpc_request_timeout,
+                bytestream_progress_timeout,
             },
             grpc_clients,
             capabilities,
@@ -2274,6 +2284,25 @@ fn convert_t_action_result2(t_action_result: &TActionResult2) -> anyhow::Result<
     Ok(action_result)
 }
 
+async fn read_with_progress_timeout(
+    reader: &mut Pin<Box<dyn AsyncRead + Unpin + Send>>,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    match tokio::time::timeout(timeout, reader.read(buffer)).await {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => Err(REClientError {
+            code: TCode::DEADLINE_EXCEEDED,
+            message: format!(
+                "ByteStream read made no progress for {}s",
+                timeout.as_secs()
+            ),
+            group: TCodeReasonGroup::RE_CONNECTION,
+        }
+        .into()),
+    }
+}
+
 async fn download_impl<Byt, BytRet, Cas, RetryFut>(
     opts: &RERuntimeOpts,
     instance_name: &InstanceName,
@@ -2286,10 +2315,14 @@ async fn download_impl<Byt, BytRet, Cas, RetryFut>(
 ) -> anyhow::Result<DownloadResponse>
 where
     Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
-    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
+    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send + 'static,
     Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
     RetryFut: Future<Output = ()>,
 {
+    let retries = opts.retries;
+    let retry_max_delay = Duration::from_millis(opts.retry_max_delay_ms);
+    let bystream_progress_timeout = opts.bytestream_progress_timeout;
+
     fn resource_name(
         instance_name: &InstanceName,
         compressor: Option<Compressor>,
@@ -2313,12 +2346,12 @@ where
         }
     }
 
-    let bystream_fut = |digest: TDigest| async move {
+    let bystream_reader = |digest: TDigest, read_offset: i64| async move {
         let resource_name = resource_name(instance_name, bystream_compressor, &digest);
 
         bystream_fut(ReadRequest {
             resource_name: resource_name.clone(),
-            read_offset: 0,
+            read_offset,
             read_limit: 0,
         })
         .await
@@ -2446,23 +2479,69 @@ where
     let mut inlined_blobs = vec![];
     for digest in inlined_digests {
         let data = if digest.size_in_bytes as usize >= max_total_batch_size {
-            retry(|| async {
-                let mut accum = vec![];
-                let result = async {
-                    let mut reader = bystream_fut(digest.clone()).await?;
-                    tokio::io::copy(&mut reader, &mut accum).await?;
+            let mut accum = vec![];
+            let restart_from_zero = bystream_compressor.is_some();
+            let mut retry_attempt = 0usize;
+            let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+            loop {
+                if restart_from_zero {
+                    accum.clear();
+                }
+                let read_offset = if restart_from_zero {
+                    0
+                } else {
+                    i64::try_from(accum.len()).with_context(|| {
+                        format!("Downloaded blob is too large to resume on this platform: {digest}")
+                    })?
+                };
+
+                let read_result: anyhow::Result<()> = async {
+                    let mut reader = bystream_reader(digest.clone(), read_offset).await?;
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    loop {
+                        let read_bytes = read_with_progress_timeout(
+                            &mut reader,
+                            &mut buffer,
+                            bystream_progress_timeout,
+                        )
+                        .await
+                        .with_context(|| format!("Error reading chunk of: {digest}"))?;
+                        if read_bytes == 0 {
+                            break;
+                        }
+                        accum.extend_from_slice(&buffer[..read_bytes]);
+                    }
                     anyhow::Ok(())
                 }
                 .await;
-                if let Err(err) = &result
-                    && is_broken_connection_error(err)
-                {
-                    bystream_retry_hook().await;
+
+                match read_result {
+                    Ok(()) => break accum,
+                    Err(err) if retry_attempt < retries && is_retryable_grpc_error(&err) => {
+                        if is_broken_connection_error(&err) {
+                            bystream_retry_hook().await;
+                        }
+                        let delay = grpc_error_retry_delay(&err)
+                            .map(|delay| std::cmp::min(delay, retry_max_delay))
+                            .unwrap_or_else(|| jittered_retry_delay(next_delay));
+                        tracing::debug!(
+                            digest = %digest,
+                            retry_attempt = retry_attempt + 1,
+                            retries,
+                            read_offset,
+                            delay_ms = delay.as_millis(),
+                            "Retrying ByteStream read"
+                        );
+                        tokio::time::sleep(delay).await;
+                        retry_attempt += 1;
+                        next_delay = std::cmp::min(next_delay.saturating_mul(2), retry_max_delay);
+                    }
+                    Err(err) => {
+                        return Err(normalize_re_error(err)
+                            .context(format!("Error downloading digest `{digest}`")));
+                    }
                 }
-                result?;
-                Ok(accum)
-            })
-            .await?
+            }
         } else {
             get(&digest)?
         };
@@ -2500,21 +2579,87 @@ where
                     .await
                     .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
             } else {
-                let result = async {
-                    let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
-                    tokio::io::copy(&mut reader, &mut file)
-                        .await
-                        .with_context(|| {
-                            format!("Error writing chunk of: {}", req.named_digest.digest)
-                        })
+                let restart_from_zero = bystream_compressor.is_some();
+                let mut copied_bytes = 0usize;
+                let mut retry_attempt = 0usize;
+                let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+                loop {
+                    if restart_from_zero {
+                        copied_bytes = 0;
+                        file.set_len(0).await.with_context(|| {
+                            format!("Error truncating: {}", req.named_digest.digest)
+                        })?;
+                        file.seek(SeekFrom::Start(0)).await.with_context(|| {
+                            format!("Error seeking: {}", req.named_digest.digest)
+                        })?;
+                    }
+
+                    let read_offset = if restart_from_zero {
+                        0
+                    } else {
+                        i64::try_from(copied_bytes).with_context(|| {
+                            format!(
+                                "Downloaded blob is too large to resume on this platform: {}",
+                                req.named_digest.digest
+                            )
+                        })?
+                    };
+
+                    let read_result: anyhow::Result<()> = async {
+                        let mut reader =
+                            bystream_reader(req.named_digest.digest.clone(), read_offset).await?;
+                        let mut buffer = vec![0u8; 64 * 1024];
+                        loop {
+                            let read_bytes = read_with_progress_timeout(
+                                &mut reader,
+                                &mut buffer,
+                                bystream_progress_timeout,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("Error reading chunk of: {}", req.named_digest.digest)
+                            })?;
+                            if read_bytes == 0 {
+                                break;
+                            }
+                            copied_bytes += read_bytes;
+                            file.write_all(&buffer[..read_bytes])
+                                .await
+                                .with_context(|| {
+                                    format!("Error writing chunk of: {}", req.named_digest.digest)
+                                })?;
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    match read_result {
+                        Ok(()) => break,
+                        Err(err) if retry_attempt < retries && is_retryable_grpc_error(&err) => {
+                            if is_broken_connection_error(&err) {
+                                bystream_retry_hook().await;
+                            }
+                            let delay = grpc_error_retry_delay(&err)
+                                .map(|delay| std::cmp::min(delay, retry_max_delay))
+                                .unwrap_or_else(|| jittered_retry_delay(next_delay));
+                            tracing::debug!(
+                                digest = %req.named_digest.digest,
+                                retry_attempt = retry_attempt + 1,
+                                retries,
+                                read_offset,
+                                delay_ms = delay.as_millis(),
+                                "Retrying ByteStream file download"
+                            );
+                            tokio::time::sleep(delay).await;
+                            retry_attempt += 1;
+                            next_delay =
+                                std::cmp::min(next_delay.saturating_mul(2), retry_max_delay);
+                        }
+                        Err(err) => {
+                            return Err(normalize_re_error(err));
+                        }
+                    }
                 }
-                .await;
-                if let Err(err) = &result
-                    && is_broken_connection_error(err)
-                {
-                    bystream_retry_hook().await;
-                }
-                result?;
             }
             file.flush().await.context("Error flushing")?;
             anyhow::Ok(())
@@ -3517,6 +3662,9 @@ mod tests {
             retries: DEFAULT_RETRIES,
             retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MILLIS,
             grpc_request_timeout: Duration::from_secs(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
+            bytestream_progress_timeout: Duration::from_secs(
+                DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS,
+            ),
         }
     }
 
@@ -4883,6 +5031,74 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
     }
+
+    #[tokio::test]
+    async fn test_download_large_inlined_resumes_bystream_after_error() -> anyhow::Result<()> {
+        let blob_data = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ];
+        let digest = &TDigest {
+            hash: "aa".repeat(32),
+            size_in_bytes: blob_data.len() as i64,
+            ..Default::default()
+        };
+
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![digest.clone()]),
+            ..Default::default()
+        };
+
+        let mut opts = test_re_runtime_opts();
+        opts.retries = 1;
+        opts.retry_max_delay_ms = 1;
+        let attempts = AtomicU16::new(0);
+        let reconnects = AtomicU16::new(0);
+        let res = download_impl(
+            &opts,
+            &InstanceName(None),
+            req,
+            None,
+            10,
+            |_req| async { Ok(BatchReadBlobsResponse { responses: vec![] }) },
+            |req| {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                let digest = digest.clone();
+                let blob_data = blob_data.clone();
+                async move {
+                    assert_eq!(req.resource_name, format!("blobs/{}/18", digest.hash));
+                    let responses = if attempt == 0 {
+                        assert_eq!(req.read_offset, 0);
+                        vec![
+                            Ok(ReadResponse {
+                                data: blob_data[..10].to_vec(),
+                            }),
+                            Err(tonic::Status::unavailable(
+                                "transport error: connection reset",
+                            )),
+                        ]
+                    } else {
+                        assert_eq!(req.read_offset, 10);
+                        vec![Ok(ReadResponse {
+                            data: blob_data[10..].to_vec(),
+                        })]
+                    };
+                    anyhow::Ok(Box::pin(futures::stream::iter(responses)))
+                }
+            },
+            || {
+                reconnects.fetch_add(1, Ordering::Relaxed);
+                async {}
+            },
+        )
+        .await?;
+
+        let inlined_blobs = res.inlined_blobs.unwrap();
+        assert_eq!(inlined_blobs[0].blob, blob_data);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(reconnects.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -4942,7 +5158,6 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         .read_to_end(&mut compressed_data)
         .await
         .unwrap();
-    let compressed_data_ref = &compressed_data;
 
     let d_resp = download_impl(
         &tests::test_re_runtime_opts(),
@@ -4959,12 +5174,15 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         Some(Compressor::Zstd),
         10,
         |_req| async { panic!("not called") },
-        |_req| async move {
-            Ok(Box::pin(futures::stream::iter(
-                compressed_data_ref
+        |_req| {
+            let compressed_data = compressed_data.clone();
+            async move {
+                let responses = compressed_data
                     .chunks(10)
-                    .map(|d| Result::Ok(ReadResponse { data: d.to_vec() })),
-            )))
+                    .map(|d| Result::Ok(ReadResponse { data: d.to_vec() }))
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures::stream::iter(responses)))
+            }
         },
         || async {},
     )

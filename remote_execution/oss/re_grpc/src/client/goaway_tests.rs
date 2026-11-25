@@ -79,6 +79,18 @@ impl GoawayServer {
         Self::start_with(FirstRequest::Serve, true).await
     }
 
+    /// Refuses nothing, and serves every request.
+    async fn serving() -> Self {
+        Self::start_with(FirstRequest::Serve, false).await
+    }
+
+    /// Answers the first `ByteStream.Read` with `BROKEN_READ_SIZE` bytes of the
+    /// blob, then sends GOAWAY and closes the connection, as a proxy that
+    /// shuts down in the middle of a response does.
+    async fn breaking_first_read() -> Self {
+        Self::start_with(FirstRequest::BreakRead, false).await
+    }
+
     async fn start_with(first: FirstRequest, leave_running: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -102,6 +114,9 @@ impl GoawayServer {
                                 refuse_after,
                                 goaway_sent.clone(),
                             ));
+                        }
+                        FirstRequest::BreakRead if !goaway_sent.swap(true, Ordering::SeqCst) => {
+                            tokio::spawn(break_first_read(tcp, served.clone()));
                         }
                         _ => {
                             tokio::spawn(serve(tcp, served.clone(), leave_running));
@@ -130,6 +145,8 @@ impl GoawayServer {
 enum FirstRequest {
     /// Refused with a GOAWAY once more than this many bytes of its body arrived.
     Refuse(usize),
+    /// A `ByteStream.Read` broken by a GOAWAY and a closed connection.
+    BreakRead,
     /// Served like any other.
     Serve,
 }
@@ -326,6 +343,50 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>, leave_r
 }
 
 /// How much of the first `ByteStream.Read` `break_first_read` sends.
+const BROKEN_READ_SIZE: usize = 60_000;
+
+/// Sends `BROKEN_READ_SIZE` bytes of the first request, a `ByteStream.Read`,
+/// then GOAWAY, and then closes the connection before the read is complete.
+async fn break_first_read(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
+    let mut connection = h2::server::handshake(tcp).await.unwrap();
+    let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+    let answer = async {
+        let method = request.uri().path().to_owned();
+        assert_eq!(method, READ);
+        let mut body = request.into_body();
+        let mut data = Vec::new();
+        while let Some(chunk) = body.data().await {
+            data.extend_from_slice(&chunk.unwrap());
+        }
+        let request = ReadRequest::decode(grpc_messages(&data)[0]).unwrap();
+        let blob = read_blob(&request);
+        served.lock().unwrap().push((method, BROKEN_READ_SIZE));
+
+        let headers = http::Response::builder()
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let mut stream = respond.send_response(headers, false).unwrap();
+        let response = ReadResponse {
+            data: blob[..BROKEN_READ_SIZE].to_vec(),
+        };
+        stream
+            .send_data(grpc_frame(&response.encode_to_vec()), false)
+            .unwrap();
+        // The connection sends it while it's polled below.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream
+    };
+    let stream = tokio::select! {
+        stream = answer => stream,
+        _ = std::future::poll_fn(|cx| connection.poll_closed(cx)) => panic!("Connection closed"),
+    };
+    connection.graceful_shutdown();
+    let flush = std::future::poll_fn(|cx| connection.poll_closed(cx));
+    let _unused = tokio::time::timeout(Duration::from_millis(100), flush).await;
+    drop(stream);
+}
+
 /// Splits a gRPC body into its length-prefixed messages.
 fn grpc_messages(mut body: &[u8]) -> Vec<&[u8]> {
     let mut messages = Vec::new();
@@ -682,6 +743,33 @@ async fn test_client_execute_after_goaway() -> anyhow::Result<()> {
 /// GOAWAY breaks it, and the client resumes it from where it stopped.
 /// A `BatchReadBlobs` the server refused, as in facebook/buck2#1294, is sent
 /// again by the `retry_grpc_request` around it, as in `REClient::download`.
+#[tokio::test]
+async fn test_client_resumes_a_read_a_goaway_broke() -> anyhow::Result<()> {
+    let server = GoawayServer::breaking_first_read().await;
+    let engine = GoawayServer::serving().await;
+    let client = client(&server, &engine, false).await?;
+    let request = DownloadRequest {
+        inlined_digests: Some(vec![ones_digest(LARGE_BLOB_SIZE)]),
+        ..Default::default()
+    };
+
+    let download = client.download(&RemoteExecutionMetadata::default(), request);
+    let response = tokio::time::timeout(Duration::from_secs(60), download).await??;
+
+    assert_eq!(
+        response.inlined_blobs.unwrap()[0].blob,
+        vec![1; LARGE_BLOB_SIZE]
+    );
+    assert_eq!(
+        server.served(),
+        [
+            (READ.to_owned(), BROKEN_READ_SIZE),
+            (READ.to_owned(), LARGE_BLOB_SIZE - BROKEN_READ_SIZE),
+        ]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_batch_read_after_goaway() -> anyhow::Result<()> {
     let server = GoawayServer::refusing_first_request().await;
