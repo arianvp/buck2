@@ -586,31 +586,9 @@ impl TenantState {
         let fs = paths.project_root().clone();
         let cells = &legacy_cells.cell_resolver;
 
-        let default_digest_algorithm =
-            buck2_env!("BUCK_DEFAULT_DIGEST_ALGORITHM", type=DigestAlgorithmFamily)?;
-
-        let default_digest_algorithm = default_digest_algorithm.unwrap_or_else(|| {
-            if is_open_source() {
-                DigestAlgorithmFamily::Sha256
-            } else {
-                DigestAlgorithmFamily::Sha1
-            }
-        });
-
-        let digest_algorithms = init_ctx
-            .daemon_startup_config
-            .startup_options
-            .digest_algorithms
-            .as_ref()
-            .map(|algos| {
-                algos
-                    .split(',')
-                    .map(DigestAlgorithmFamily::from_str)
-                    .collect::<Result<_, _>>()
-            })
-            .transpose()
-            .buck_error_context("Invalid digest_algorithms")?
-            .unwrap_or_else(|| vec![default_digest_algorithm])
+        let digest_algorithm_families =
+            configured_digest_algorithm_families(&init_ctx.daemon_startup_config)?;
+        let digest_algorithms = digest_algorithm_families
             .into_iter()
             .map(convert_algorithm_kind)
             .collect::<Result<Vec<_>, _>>()?;
@@ -2589,6 +2567,10 @@ impl DaemonState {
                 10,
                 Arc::new(RemoteExecutionStaticMetadata::from_legacy_config(
                     root_config,
+                    configured_digest_algorithm_families(&init_ctx.daemon_startup_config)?
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
                 )?),
                 Some(invocation_paths.re_logs_dir()?),
                 invocation_paths.daemon_working_dir()?,
@@ -2860,6 +2842,35 @@ impl DaemonState {
 
         Ok(())
     }
+}
+
+fn configured_digest_algorithm_families(
+    daemon_startup_config: &DaemonStartupConfig,
+) -> buck2_error::Result<Vec<DigestAlgorithmFamily>> {
+    let default_digest_algorithm =
+        buck2_env!("BUCK_DEFAULT_DIGEST_ALGORITHM", type=DigestAlgorithmFamily)?;
+
+    let default_digest_algorithm = default_digest_algorithm.unwrap_or_else(|| {
+        if is_open_source() {
+            DigestAlgorithmFamily::Sha256
+        } else {
+            DigestAlgorithmFamily::Sha1
+        }
+    });
+
+    Ok(daemon_startup_config
+        .startup_options
+        .digest_algorithms
+        .as_ref()
+        .map(|algos| {
+            algos
+                .split(',')
+                .map(DigestAlgorithmFamily::from_str)
+                .collect::<Result<_, _>>()
+        })
+        .transpose()
+        .buck_error_context("Invalid digest_algorithms")?
+        .unwrap_or_else(|| vec![default_digest_algorithm]))
 }
 
 fn convert_algorithm_kind(kind: DigestAlgorithmFamily) -> buck2_error::Result<DigestAlgorithm> {
