@@ -495,7 +495,9 @@ async fn upload(
         &InstanceName(None),
         request,
         None,
+        None,
         max_total_batch_size,
+        DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
         None,
         |re_request| async move {
             retry_grpc_request(DEFAULT_RETRIES, retry_max_delay, || {
